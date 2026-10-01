@@ -13,12 +13,16 @@ the MacBook) and by OpenClaw's coding workers:
   magehand run --container [--no-build] [-- CMD...]
                                 build the repo's Dockerfile and run the image as
                                 its pod runs (read-only, non-root, no capabilities)
-  magehand doctor               check GitHub access, VPN/LAN reach, login, Docker
+  magehand setup [--undo]       once per machine: GitHub, Docker, *.lab names, sign-in
+  magehand doctor               check GitHub access, homelab reach, login, Docker
   magehand version              this version (upgrade: uv tool upgrade magehand)
 
-Private by design: it talks only to GitHub and *.lab (on the LAN or over the
-VPN), never to a public homelab endpoint. Its OpenBao role `dev` can only read
-the LiteLLM keys of agent apps (homelab platform/openbao/policies/dev-read.hcl).
+Private by design: it talks only to GitHub and the private *.lab network,
+never to a public homelab endpoint. Everyday commands assume they can
+connect; `magehand setup` checks that once per machine and, if needed, points
+this Mac's *.lab lookups at the homelab's DNS. Its OpenBao role `dev` can
+only read the LiteLLM keys of agent apps (homelab
+platform/openbao/policies/dev-read.hcl).
 """
 import base64
 import http.client
@@ -53,6 +57,8 @@ KEYCHAIN_SERVICE = 'magehand'
 CALLBACK = 'http://localhost:8250/oidc/callback'
 PROXY_PORT = int(os.environ.get('MAGEHAND_PROXY_PORT', '8080'))
 # Block type -> the Secret its chart hands over (platform/building-blocks/*).
+NOT_SET_UP = "this machine isn't set up for the homelab: run `magehand setup`"
+RESOLVER = pathlib.Path('/etc/resolver') / LAB
 SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}'}
 
 
@@ -185,7 +191,7 @@ def bao(method, path, token=None, body=None):
     except urllib.error.HTTPError as error:
         return error.code, None
     except OSError:
-        die(f'cannot reach {OPENBAO}: on the home network or the VPN? (`magehand doctor`)')
+        die(f'cannot reach {OPENBAO}: {NOT_SET_UP}')
 
 
 def store_token(token, identity):
@@ -512,7 +518,7 @@ def lab_hosts(env):
         try:
             address = socket.gethostbyname(host)
         except OSError:
-            die(f'cannot resolve {host}: on the home network or Teleport? (`magehand doctor`)')
+            die(f'cannot resolve {host}: {NOT_SET_UP}')
         out.append(f'{host}:{"host-gateway" if address.startswith("127.") else address}')
     return out
 
@@ -595,24 +601,93 @@ def cmd_doctor(_args):
         reach = urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
     except (OSError, urllib.error.HTTPError):
         reach = False
-    host = urllib.parse.urlparse(OPENBAO).hostname
-    try:
-        address = socket.gethostbyname(host)
-    except OSError:
-        address = None
-    if not reach and address == '127.0.0.1':
-        # Public DNS answers 127.0.0.1 for *.lab; only the home gateway (or the
-        # Studio itself) knows better. On Teleport the Mac keeps public DNS.
-        check(f'resolve {host}', False, 'public DNS answered 127.0.0.1: send *.lab lookups to the gateway once, '
-              '`echo "nameserver <gateway LAN IP>" | sudo tee /etc/resolver/lab.davidlarrimore.com` '
-              '(magehand guide local-dev)')
-    else:
-        check(f'reach {OPENBAO}', reach, f'resolved to {address or "nothing"}: on the home network or Teleport?')
+    check(f'reach {OPENBAO}', reach, NOT_SET_UP)
     token = saved_token()
     check('signed in to OpenBao', bool(reach and token and bao('GET', 'auth/token/lookup-self', token)[0] == 200),
           '`magehand login`')
     check('docker (for postgres/redis blocks)', bool(shutil.which('docker')), 'install Docker Desktop or OrbStack')
     sys.exit(0 if ok else 1)
+
+
+# --- setup: once per machine ---------------------------------------------------------
+
+def lab_address(host):
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return None
+
+
+def dns_answer(server, host):
+    """What `server` answers for `host` (A record), or None. Uses dig (macOS)."""
+    if not shutil.which('dig'):
+        return None
+    out = subprocess.run(['dig', '+short', '+time=3', '+tries=1', f'@{server}', host],  # nosec B603 B607
+                         capture_output=True, text=True)
+    lines = [line for line in out.stdout.split() if line and line[0].isdigit()]
+    return lines[0] if out.returncode == 0 and lines else None
+
+
+def reachable():
+    try:
+        return urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
+    except (OSError, urllib.error.HTTPError):
+        return False
+
+
+def sudo_write_resolver(server):
+    """/etc/resolver/<lab domain>: macOS asks `server` for *.lab names only."""
+    print(f'Pointing *.{LAB} lookups (only those) at {server}; macOS asks for your password once.')
+    subprocess.run(['sudo', 'mkdir', '-p', str(RESOLVER.parent)], check=True)  # nosec B603 B607
+    subprocess.run(['sudo', 'tee', str(RESOLVER)], input=f'nameserver {server}\n', text=True,  # nosec B603 B607
+                   stdout=subprocess.DEVNULL, check=True)
+    subprocess.run(['sudo', 'killall', '-HUP', 'mDNSResponder'], check=False)  # nosec B603 B607
+
+
+def cmd_setup(args):
+    host = urllib.parse.urlparse(OPENBAO).hostname
+    if '--undo' in args:
+        if RESOLVER.exists():
+            subprocess.run(['sudo', 'rm', '-f', str(RESOLVER)], check=True)  # nosec B603 B607
+            print(f'removed {RESOLVER}')
+        return
+    print('1/4 GitHub')
+    try:
+        github_token()
+        print('    ok')
+    except SystemExit:
+        die('sign in to GitHub first: `gh auth login`, then run `magehand setup` again')
+    print('2/4 Docker (only for apps with database blocks)')
+    print('    ok' if shutil.which('docker') else '    not found: install Docker Desktop or OrbStack when you need it')
+    print(f'3/4 the homelab network (*.{LAB})')
+    if reachable():
+        print(f'    ok: {host} -> {lab_address(host)}')
+    elif sys.platform != 'darwin':
+        die(f'{host} is not reachable and only macOS is set up automatically')
+    else:
+        current = lab_address(host)
+        print(f'    {host} resolves to {current or "nothing"} here, which is not the homelab.')
+        server = args[args.index('--dns') + 1] if '--dns' in args else \
+            input('    Homelab DNS address (your home gateway, e.g. 192.168.1.1): ').strip()
+        answer = dns_answer(server, host)
+        if not answer or answer.startswith('127.'):
+            die(f'{server} did not answer for {host} with a homelab address ({answer or "no answer"}); '
+                'is it the right address, and can this Mac reach it right now?')
+        sudo_write_resolver(server)
+        for _ in range(10):
+            if reachable():
+                break
+            time.sleep(1)
+        else:
+            die(f'{host} now resolves via {server} but https still fails; is this Mac on a network that reaches it?')
+        print(f'    ok: {host} -> {lab_address(host)} (undo: magehand setup --undo)')
+    print('4/4 sign in')
+    token = saved_token()
+    if token and bao('GET', 'auth/token/lookup-self', token)[0] == 200:
+        print('    ok (already signed in)')
+    else:
+        cmd_login([])
+    print('Done. Try `magehand app <name>` or, in an app repo, `magehand run -- <command>`.')
 
 
 def cmd_version(_args):
@@ -624,7 +699,7 @@ def cmd_version(_args):
 
 
 COMMANDS = {'guide': cmd_guide, 'app': cmd_app, 'login': cmd_login, 'dev': cmd_dev, 'run': cmd_run,
-            'doctor': cmd_doctor, 'version': cmd_version}
+            'doctor': cmd_doctor, 'setup': cmd_setup, 'version': cmd_version}
 
 
 def main():

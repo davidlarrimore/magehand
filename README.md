@@ -7,7 +7,7 @@ never deploys: changes go through pull requests.
 
 It is public because it holds nothing sensitive. Every command needs access
 that only the owner has: the private homelab repos on GitHub, the private
-`*.lab` network (home LAN or UniFi Teleport), and an authentik passkey for
+`*.lab` network, and an authentik passkey for
 OpenBao.
 
 ## Install
@@ -15,12 +15,15 @@ OpenBao.
 ```sh
 brew install uv            # once
 uv tool install magehand
-magehand doctor
+magehand setup             # once per machine
 ```
 
-Upgrade with `uv tool upgrade magehand`. You also need `gh auth login`, and
-Docker Desktop or OrbStack for database blocks. Away from home, `*.lab` needs
-Teleport and a one-time resolver file (`magehand doctor` prints it).
+`magehand setup` checks GitHub (`gh auth login` first) and Docker (Docker
+Desktop or OrbStack, for database blocks), makes sure the homelab's `*.lab`
+names resolve (if they don't, it asks for the homelab's DNS address, your home
+gateway, and points only `*.lab` lookups at it; `magehand setup --undo`
+reverses that), then signs you in. Every other command assumes this is done.
+Upgrade with `uv tool upgrade magehand`.
 
 ## Commands
 
@@ -32,6 +35,7 @@ Teleport and a one-time resolver file (`magehand doctor` prints it).
 | `magehand dev up\|down\|status` | Docker containers for the app's `postgres`/`redis` blocks (the blocks' own pinned images) on a per-app network, and local values for `secret` blocks |
 | `magehand run [--no-proxy] -- CMD` | Runs CMD with the env the app's pod gets: values from its Deployment, the LLM key from OpenBao, databases from `dev up`. Precedence: manifest < the repo's `.magehand.env` (committed, non-secret overrides such as `WEB_DIR=./web`) < your shell < secrets. A proxy on `127.0.0.1:8080` adds the `X-authentik-*` headers Traefik would, as you |
 | `magehand run --container [--no-build] [-- CMD]` | Builds the repo's Dockerfile and runs the image as its pod runs: read-only, `/tmp` tmpfs, the pod's user, no capabilities, exactly the pod's env. Secrets go in as `-e NAME` only, never in the image, argv or on disk |
+| `magehand setup [--undo] [--dns ADDRESS]` | Once per machine: GitHub, Docker, `*.lab` name resolution (the only step that may ask for your password), sign-in |
 | `magehand doctor` | Checks GitHub access, that `openbao.lab` is reachable, the sign-in and Docker |
 | `magehand version` | The installed version |
 
