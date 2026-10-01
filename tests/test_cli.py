@@ -141,16 +141,14 @@ class Container(unittest.TestCase):
 
 
 class Doctor(unittest.TestCase):
-    def test_lab_resolving_to_localhost_suggests_the_resolver(self):
+    def test_unreachable_lab_points_to_setup(self):
         import contextlib
         import io
-        saved = (magehand.urllib.request.urlopen, magehand.socket.gethostbyname, magehand.github_token,
-                 magehand.github_file, magehand.saved_token)
+        saved = (magehand.urllib.request.urlopen, magehand.github_token, magehand.github_file, magehand.saved_token)
 
         def no_route(*_a, **_k):
             raise OSError('connection refused')
         magehand.urllib.request.urlopen = no_route
-        magehand.socket.gethostbyname = lambda _h: '127.0.0.1'
         magehand.github_token = lambda: 't'
         magehand.github_file = lambda *_a, **_k: 'x'
         magehand.saved_token = lambda: None
@@ -159,9 +157,58 @@ class Doctor(unittest.TestCase):
             with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
                 magehand.cmd_doctor([])
         finally:
-            (magehand.urllib.request.urlopen, magehand.socket.gethostbyname, magehand.github_token,
-             magehand.github_file, magehand.saved_token) = saved
-        self.assertIn('/etc/resolver/lab.davidlarrimore.com', out.getvalue())
+            (magehand.urllib.request.urlopen, magehand.github_token, magehand.github_file,
+             magehand.saved_token) = saved
+        self.assertIn('magehand setup', out.getvalue())
+
+
+class Setup(unittest.TestCase):
+    def setUp(self):
+        self.names = ('reachable', 'lab_address', 'dns_answer', 'sudo_write_resolver', 'github_token',
+                      'saved_token', 'cmd_login', 'shutil')
+        self.saved = {n: getattr(magehand, n) for n in self.names}
+        self.saved_platform = magehand.sys.platform
+        magehand.sys.platform = 'darwin'
+        magehand.github_token = lambda: 't'
+        magehand.saved_token = lambda: None
+        self.logins = []
+        magehand.cmd_login = lambda _a: self.logins.append(1)
+        magehand.lab_address = lambda _h: '127.0.0.1'
+        self.written = []
+        magehand.sudo_write_resolver = lambda server: self.written.append(server)
+        self.saved_sleep = magehand.time.sleep
+        magehand.time.sleep = lambda _s: None
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(magehand, n, v)
+        magehand.sys.platform = self.saved_platform
+        magehand.time.sleep = self.saved_sleep
+
+    def run_setup(self, args):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            magehand.cmd_setup(args)
+
+    def test_already_reachable_changes_nothing(self):
+        magehand.reachable = lambda: True
+        self.run_setup([])
+        self.assertEqual(self.written, [])
+        self.assertEqual(self.logins, [1])
+
+    def test_points_lab_lookups_at_the_given_dns(self):
+        magehand.reachable = lambda: bool(self.written)
+        magehand.dns_answer = lambda server, host: '192.0.2.10'
+        self.run_setup(['--dns', '192.0.2.1'])
+        self.assertEqual(self.written, ['192.0.2.1'])
+
+    def test_refuses_a_dns_that_does_not_know_the_lab(self):
+        magehand.reachable = lambda: False
+        magehand.dns_answer = lambda server, host: '127.0.0.1'
+        with self.assertRaises(SystemExit):
+            self.run_setup(['--dns', '192.0.2.1'])
+        self.assertEqual(self.written, [])
 
 
 class ProxyHeaders(unittest.TestCase):
