@@ -136,15 +136,54 @@ def current_app():
     return name
 
 
-def load_app(name):
-    spec = yaml.safe_load(github_file(APPS_REPO, f'apps/{name}/app.yaml')) or {}
-    services = spec.get('services') or {}
-    docs = list(yaml.safe_load_all(github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml')))
-    deployment = next((d for d in docs if isinstance(d, dict) and d.get('kind') == 'Deployment'), None)
-    if not deployment:
-        die(f'apps/{name}/base/deployment.yaml has no Deployment')
+# An app repo with deploy/app.yaml keeps its deployment config there:
+# deploy/app.yaml (its block requests) and deploy/base/ (its Kustomize base).
+# Merging copies them into homelab-apps apps/<app>/ (homelab app deploy-dev).
+DEPLOY = 'deploy'
+
+
+def deploy_dir(root):
+    """root/deploy if the checkout at `root` keeps its deployment config there, else None."""
+    path = pathlib.Path(root) / DEPLOY
+    return path if (path / 'app.yaml').is_file() else None
+
+
+def repo_root(name):
+    """The top of this git checkout if it is app `name`'s repo, else None."""
+    out = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)  # nosec B603 B607
+    remote = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True)  # nosec B603 B607
+    if out.returncode != 0 or remote.returncode != 0:
+        return None
+    repo = remote.stdout.strip().rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
+    return pathlib.Path(out.stdout.strip()) if repo in (name, name + '.git') else None
+
+
+def load_app(name, root=None):
+    """The app's block requests and pod spec: from `root`/deploy/ when that checkout has one, else from
+    homelab-apps apps/<name>/. `where` says which."""
+    local = deploy_dir(root) if root else None
+    if local:
+        where = DEPLOY
+        spec = yaml.safe_load((local / 'app.yaml').read_text()) or {}
+        files = [(f'{DEPLOY}/base/{f.name}', f.read_text()) for f in sorted((local / 'base').glob('*.y*ml'))]
+    else:
+        where = f'homelab-apps apps/{name}'
+        files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
+        spec = yaml.safe_load(github_file(APPS_REPO, f'apps/{name}/app.yaml')) or {}
+    found = [(path, d) for path, text in files for d in yaml.safe_load_all(text)
+             if isinstance(d, dict) and d.get('kind') == 'Deployment']
+    if not found:
+        die(f'{where}/base has no Deployment')
+    path, deployment = found[0]
     pod = deployment['spec']['template']['spec']
-    return {'name': name, 'spec': spec, 'services': services, 'container': pod['containers'][0], 'pod': pod}
+    return {'name': name, 'spec': spec, 'services': spec.get('services') or {}, 'container': pod['containers'][0],
+            'pod': pod, 'where': where, 'deployment_file': path, 'root': local.parent if local else None}
+
+
+def app_here(name=None):
+    """load_app for `name` (default: this checkout's app), from this checkout's deploy/ when it is that app's repo."""
+    name = name or current_app()
+    return load_app(name, repo_root(name))
 
 
 def block_of(app, secret_name):
@@ -361,9 +400,9 @@ def cmd_guide(a):
 
 
 def cmd_app(a):
-    app = load_app(a.app_flag or a.app or current_app())
+    app = app_here(a.app_flag or a.app)
     name = app['name']
-    source = (app['spec'].get('source') or {}).get('repo')
+    source = (app['spec'].get('source') or {}).get('repo') or (name if app['root'] else None)
     if a.json:
         env = []
         for entry in env_plan(app):
@@ -373,19 +412,22 @@ def cmd_app(a):
                 env.append({'name': entry[0], 'secret': entry[2]})
             else:
                 env.append({'name': entry[0], 'block': entry[1], 'type': entry[2], 'key': entry[3]})
-        print(json.dumps({'name': name, 'code': f'davidlarrimore/{source}' if source else f'homelab-apps apps/{name}/image',
-                          'deployment': f'homelab-apps apps/{name}', 'dev_url': f'https://{name}-dev.{LAB}',
+        print(json.dumps({'name': name, 'code': f'davidlarrimore/{source}' if source or app['root'] else f'homelab-apps apps/{name}/image',
+                          'deployment': app['where'], 'dev_url': f'https://{name}-dev.{LAB}',
                           'port': app_port(app), 'blocks': app['services'], 'env': env}, indent=1))
         return
+    deployment = ('deploy/ in this repo (merging copies it to homelab-apps apps/%s)' % name if app['root']
+                  else app['where'])
     print(f'{name}  (code: {"davidlarrimore/" + source if source else "homelab-apps apps/" + name + "/image"};'
-          f' deployment: homelab-apps apps/{name})')
+          f' deployment: {deployment})')
     print(f'  dev:      https://{name}-dev.{LAB}')
     for preview in github_dir(APPS_REPO, f'previews/{name}'):
         if preview.endswith('.yaml'):
             print(f'  preview:  https://{name}-dev-{preview[:-5]}.{LAB}')
     print('Blocks (app.yaml services:):')
     if not app['services']:
-        print('  none; request one with a PR to homelab-apps apps/%s/app.yaml (`magehand guide blocks`)' % name)
+        print('  none; request one in ' + ('deploy/app.yaml' if app['root'] else 'homelab-apps apps/%s/app.yaml' % name)
+              + ' (`magehand guide blocks`)')
     for block, svc in app['services'].items():
         opts = ', '.join(f'{k}={v}' for k, v in (svc or {}).items() if k != 'type')
         print(f'  {block}: {(svc or {}).get("type")}{"  (" + opts + ")" if opts else ""}')
@@ -564,7 +606,7 @@ def block_image(kind, svc):
 
 def cmd_dev(a):
     action = a.action
-    app = load_app(a.app_flag or a.app or current_app())
+    app = app_here(a.app_flag or a.app)
     state = local_state(app['name'])
     network = f'magehand-{app["name"]}'
     contained = [b for b, svc in app['services'].items() if (svc or {}).get('type') in ('postgres', 'redis')]
@@ -775,7 +817,7 @@ def cmd_run(a):
     args = a.cmd[1:] if a.cmd[:1] == ['--'] else a.cmd
     if not args and not container:
         usage('run', 'give the command after --, e.g. magehand run -- python app.py (or --container)')
-    app = load_app(a.app_flag or current_app())
+    app = app_here(a.app_flag)
     env = resolve_env(app, container=container)
     print(f'magehand: {app["name"]} env: {", ".join(sorted(env))}', file=sys.stderr)
     if proxy:
@@ -891,7 +933,11 @@ def block_spec(catalog, kind):
 def check_manifests(app, catalog):
     """Rules for homelab-apps apps/<app>/: the blocks requested and the pod's env."""
     found = []
-    where = f"homelab-apps apps/{app['name']}"
+    where = app.get('where') or f"homelab-apps apps/{app['name']}"
+    deployment_file = app.get('deployment_file') or f'{where}/base/deployment.yaml'
+    if where == DEPLOY and 'source' in app['spec']:
+        found.append(finding('error', f'{where}/app.yaml', 'source: is added by the copy in homelab-apps; '
+                             'remove it here', 'README "How an app is put together"'))
     blocks = (catalog or {}).get('blocks') or {}
     models = {m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict)}
     for name, svc in app['services'].items():
@@ -915,8 +961,13 @@ def check_manifests(app, catalog):
                                      'blocks "Web search"'))
     container = app['container']
     image = container.get('image') or ''
-    if not re.fullmatch(r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name']) + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
-        found.append(finding('error', f'{where}/base/deployment.yaml', f'image {image or "(none)"}: an app runs only '
+    own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name'])
+    if where == DEPLOY and not re.fullmatch(own + r'(@sha256:[0-9a-f]{64})?', image):
+        found.append(finding('error', deployment_file, f'image {image or "(none)"}: write the app\'s own image '
+                             f'without a digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}); merging pins '
+                             'the build of that commit', 'README "How an app is put together"'))
+    elif where != DEPLOY and not re.fullmatch(own + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
+        found.append(finding('error', deployment_file, f'image {image or "(none)"}: an app runs only '
                              f'its own image, pinned by digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...)',
                              'README "How an app is put together"'))
     for item in container.get('env') or []:
@@ -928,28 +979,57 @@ def check_manifests(app, catalog):
         if not block and secret in app.get('provided', ()):
             continue  # the app's own ExternalSecret (homelab-apps AGENTS.md "Secrets")
         if not block:
-            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: Secret {secret!r} is neither '
+            found.append(finding('error', deployment_file, f'env {var}: Secret {secret!r} is neither '
                                  'a block\'s nor made by an ExternalSecret in the app\'s manifests, so the pod would '
                                  'wait for it forever. Request a block in app.yaml (type secret for a generated value)',
                                  'blocks'))
             continue
         if ref.get('optional'):
-            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: optional: true on a block key. '
+            found.append(finding('error', deployment_file, f'env {var}: optional: true on a block key. '
                                  'The pod would start with an empty value and keep it for its whole life; use a plain '
                                  'secretKeyRef (the pod waits until the block is ready)', 'blocks'))
         spec = block_spec(catalog, kind)
         if spec['keys'] and key not in spec['keys']:
-            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: block {block} ({kind}) has no '
+            found.append(finding('error', deployment_file, f'env {var}: block {block} ({kind}) has no '
                                  f'key {key!r}; keys: {", ".join(spec["keys"])}', 'blocks'))
         option = spec['key_options'].get(key)
         if option and (app['services'].get(block) or {}).get(option) is not True:
-            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: key {key} exists only with '
+            found.append(finding('error', deployment_file, f'env {var}: key {key} exists only with '
                                  f'`{option}: true` on block {block}; without it the pod waits forever',
                                  'blocks "Web search"' if option == 'search' else 'blocks'))
     for source in container.get('envFrom') or []:
-        found.append(finding('warning', f'{where}/base/deployment.yaml', f'envFrom {source}: map each variable with '
+        found.append(finding('warning', deployment_file, f'envFrom {source}: map each variable with '
                              'env + secretKeyRef instead, so `magehand app` and `magehand run` can see it', 'blocks'))
     return found
+
+
+def check_deploy_files(root):
+    """deploy/ holds app.yaml and base/*.yaml only: merging copies exactly those and refuses anything else."""
+    local = deploy_dir(root)
+    if not local:
+        return []
+    found = []
+    for path in sorted(local.rglob('*')):
+        rel = path.relative_to(local)
+        if path.is_file() and not (rel.as_posix() == 'app.yaml' or (len(rel.parts) == 2 and rel.parts[0] == 'base'
+                                                                    and rel.suffix in ('.yaml', '.yml'))):
+            found.append(finding('error', f'{DEPLOY}/{rel.as_posix()}', 'not deployed: deploy/ holds app.yaml and '
+                                 'base/*.yaml only, and a merge with anything else is not deployed',
+                                 'README "How an app is put together"'))
+    if not any((local / 'base').glob('*.y*ml')):
+        found.append(finding('error', f'{DEPLOY}/base', 'missing: the Kustomize base (Deployment, Service, ...) goes here',
+                             'README "How an app is put together"'))
+    return found
+
+
+def requested_models(app, catalog):
+    """Models the app's llm blocks request (a block without `models` gets the catalog's default)."""
+    default = [m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict) and m.get('default')]
+    out = set()
+    for svc in app['services'].values():
+        if (svc or {}).get('type') == 'llm':
+            out.update((svc or {}).get('models') or default)
+    return out
 
 
 def code_files(root):
@@ -967,9 +1047,13 @@ def line_of(text, index):
     return text.count('\n', 0, index) + 1
 
 
-def check_code(root, app):
+def check_code(root, app, catalog=None):
     """Rules for the app's code (the repo checkout); `app` is None before it has a deployment."""
     found = []
+    models = {m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict) and m.get('id')}
+    model_re = re.compile(r'["\'](' + '|'.join(re.escape(m) for m in sorted(models, key=len, reverse=True)) + r')["\']') \
+        if models else None
+    requested = requested_models(app, catalog) if app else set()
     pod_env = {item.get('name') for item in (app['container'].get('env') or [])} if app else set()
     for name in ('Dockerfile', 'ui-check.yaml'):
         if not (root / name).is_file():
@@ -993,9 +1077,19 @@ def check_code(root, app):
             elif app and var not in pod_env and var not in RUNTIME_ENV and var not in reported:
                 reported.add(var)
                 found.append(finding('warning', where, f'reads {var}, which the pod doesn\'t set, so the code\'s '
-                                     f'default applies in the cluster. Set it in homelab-apps apps/{app["name"]}/base/'
-                                     'deployment.yaml env (or drop it); local-only values go in .magehand.env',
+                                     f'default applies in the cluster. Set it in {app.get("deployment_file") or "homelab-apps apps/" + app["name"] + "/base/deployment.yaml"} '
+                                     'env (or drop it); local-only values go in .magehand.env',
                                      'README "What the platform provides"'))
+        for match in model_re.finditer(text) if model_re and app else ():
+            model = match.group(1)
+            if model in requested:
+                continue
+            fallback = any(start <= match.start() <= end for start, end in defaults)
+            found.append(finding('warning' if fallback else 'error', f'{rel}:{line_of(text, match.start())}',
+                                 f'model {model} is not requested by an llm block in {app.get("where") or "app.yaml"}'
+                                 f'/app.yaml (requested: {", ".join(sorted(requested)) or "none"}): LiteLLM refuses '
+                                 'it (403). Add it to the block\'s models' + (', or drop this fallback' if fallback else ''),
+                                 'blocks "Models"'))
         for host in PROVIDER_HOSTS:
             for match in re.finditer(re.escape(host), text):
                 found.append(finding('error', f'{rel}:{line_of(text, match.start())}', f'calls {host} directly: '
@@ -1021,32 +1115,37 @@ def check_code(root, app):
     return found
 
 
-def provided_secrets(name):
-    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets) in base/ and dev/."""
-    names = set()
-    for part in ('base', 'dev'):
+def provided_secrets(name, root=None):
+    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets): in base/ (the
+    checkout's deploy/base/ when `root` has one, else homelab-apps') and in homelab-apps dev/."""
+    local = deploy_dir(root) if root else None
+    texts = [f.read_text() for f in sorted((local / 'base').glob('*.y*ml'))] if local else []
+    for part in ('dev',) if local else ('base', 'dev'):
         for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
-            if not file.endswith(('.yaml', '.yml')):
-                continue
-            try:
-                docs = list(yaml.safe_load_all(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or ''))
-            except yaml.YAMLError:
-                continue
-            for doc in docs:
-                if isinstance(doc, dict) and doc.get('kind') == 'ExternalSecret':
-                    names.add(((doc.get('spec') or {}).get('target') or {}).get('name')
-                              or (doc.get('metadata') or {}).get('name'))
-                elif isinstance(doc, dict) and doc.get('kind') == 'Secret':
-                    names.add((doc.get('metadata') or {}).get('name'))
+            if file.endswith(('.yaml', '.yml')):
+                texts.append(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or '')
+    names = set()
+    for text in texts:
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            continue
+        for doc in docs:
+            if isinstance(doc, dict) and doc.get('kind') == 'ExternalSecret':
+                names.add(((doc.get('spec') or {}).get('target') or {}).get('name')
+                          or (doc.get('metadata') or {}).get('name'))
+            elif isinstance(doc, dict) and doc.get('kind') == 'Secret':
+                names.add((doc.get('metadata') or {}).get('name'))
     return names - {None}
 
 
-def try_load_app(name):
-    """load_app (with the Secrets its manifests make), or None when homelab-apps has no deployment for it yet."""
-    if github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
+def try_load_app(name, root=None):
+    """load_app (with the Secrets its manifests make): from `root`'s deploy/ when it has one, else homelab-apps';
+    None when neither has a deployment for it yet."""
+    if not deploy_dir(root or '.') and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
-    app = load_app(name)
-    app['provided'] = provided_secrets(name)
+    app = load_app(name, root)
+    app['provided'] = provided_secrets(name, root)
     return app
 
 
@@ -1057,19 +1156,19 @@ def cmd_check(a):
         APPS_DIR = a.apps_dir
     name = a.app_flag or a.app or current_app()
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
-    app = try_load_app(name)
     root = pathlib.Path(a.code)
+    app = try_load_app(name, None if manifests_only else root)
     found = check_manifests(app, catalog) if app else []
     if not manifests_only:
-        found += check_code(root, app)
+        found += check_deploy_files(root) + check_code(root, app, catalog)
     errors = sum(f['level'] == 'error' for f in found)
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
-                          'deployment': f'homelab-apps apps/{name}' if app else None, 'errors': errors,
+                          'deployment': app['where'] if app else None, 'errors': errors,
                           'findings': sorted(found, key=lambda f: (f['level'] != 'error', f['where']))}, indent=1))
         sys.exit(1 if errors else 0)
     print(f'magehand check {name}: code {"(skipped)" if manifests_only else root.resolve()}, deployment '
-          + (f'homelab-apps apps/{name}' if app else 'none yet (code rules only)'))
+          + (app['where'] if app else 'none yet (code rules only)'))
     for f in sorted(found, key=lambda f: (f['level'] != 'error', f['where'])):
         see = f['see'] if f['see'].startswith('homelab-apps') else f"magehand guide {f['see']}"
         print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> {see}")
@@ -1092,7 +1191,9 @@ ask the platform, with magehand (installed with `uv tool install magehand`).
 
 1. Before designing or changing behavior: `magehand app` (in the app's repo).
    It lists the app's blocks, every env var its pod gets and where each comes
-   from, and its URLs. Code reads exactly those variables.
+   from, and its URLs. Code reads exactly those variables. If the repo has
+   `deploy/`, that is the app's deployment: `deploy/app.yaml` requests blocks
+   and models, `deploy/base/` is its Kubernetes manifests; edit them there.
 2. Any "how do I ... on the homelab" question, before answering or coding:
    `magehand guide search <words>` (e.g. `web search`, `database`,
    `who is the user`, `env var`, `production`). Read the sections it prints
@@ -1109,7 +1210,8 @@ Facts that override habits: no direct calls to AI or search providers (the
 llm block's base_url and search_url); no own login or passwords (authentik
 adds X-authentik-* headers); the root filesystem is read-only (state goes in
 a block); a block key is never `optional: true`; merging code deploys dev by
-itself (never pin images by hand).
+itself, `deploy/` included (never pin images by hand); the code calls only
+models its llm block requests.
 """
 
 

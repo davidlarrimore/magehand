@@ -37,8 +37,8 @@ COMMAND`) explains one, with examples.
 | --- | --- |
 | `magehand guide [TOPIC ["SECTION"]]` | The app platform guide, live from homelab-apps `docs/platform/`: `magehand guide` (overview), `guide recipes`, `guide blocks "Web search"` (one section), `guide catalog` (blocks and models) |
 | `magehand guide search WORDS` | The guide sections (`docs/platform/` and homelab-apps `AGENTS.md`) that best answer a question, e.g. `magehand guide search web search` |
-| `magehand app [APP] [--json]` | The app's blocks, every env var its pod gets and where it comes from, its URLs |
-| `magehand check [APP] [--code DIR] [--apps-dir DIR] [--manifests-only] [--json]` | The platform's rules for the app's code and its homelab-apps deployment: block keys and options, `optional: true` keys, Secrets nothing makes, the image, env the code reads but the pod doesn't set, direct AI/search provider calls, own login, database files. Each finding names the guide section; exit 1 on errors. Run before every push; CI runs it too (`--apps-dir`) |
+| `magehand app [APP] [--json]` | The app's blocks, every env var its pod gets and where it comes from, its URLs. In an app repo with `deploy/app.yaml` they come from the checkout's `deploy/` (the app's deployment config, which merging copies into homelab-apps); otherwise from homelab-apps `apps/<app>/` |
+| `magehand check [APP] [--code DIR] [--apps-dir DIR] [--manifests-only] [--json]` | The platform's rules for the app's code and its deployment (`deploy/` in the checkout when it has one, else homelab-apps): block keys and options, `optional: true` keys, Secrets nothing makes, the image, files in `deploy/` a merge won't deploy, env the code reads but the pod doesn't set, models the code names that its llm block doesn't request, direct AI/search provider calls, own login, database files. Each finding names the guide section; exit 1 on errors. Run before every push; CI runs it too (`--apps-dir`) |
 
 **Run an app locally**
 
