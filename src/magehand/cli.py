@@ -22,7 +22,9 @@ the MacBook) and by OpenClaw's coding workers:
                                 the homelab-app skill for coding agents
   magehand skill [--install]    that skill (when Claude Code and Codex use magehand)
   magehand doctor               check GitHub access, homelab reach, login, Docker
-  magehand version              this version (upgrade: uv tool upgrade magehand)
+  magehand upgrade              upgrade magehand (uv, pipx or pip, as installed) and its skill;
+                                any command says once a day when a new version is out
+  magehand version              this version, and whether a newer one exists
 
 Private by design: it talks only to GitHub and the private *.lab network,
 never to a public homelab endpoint. Everyday commands assume they can
@@ -1082,16 +1084,130 @@ def cmd_setup(args):
     print('Done. Try `magehand app <name>` or, in an app repo, `magehand run -- <command>`.')
 
 
-def cmd_version(_args):
+# --- staying current -------------------------------------------------------------
+# Releases are the repo's vX.Y.Z tags (the release workflow publishes each to
+# PyPI), so the version check asks GitHub, like every other call here. Upgrading
+# is one command the user runs, never automatic: a release runs on their Mac.
+
+MAGEHAND_REPO = 'davidlarrimore/magehand'
+LATEST_CACHE = STATE / 'latest.json'
+
+
+def installed_version():
     try:
-        print(package_version('magehand'))
+        return package_version('magehand')
     except PackageNotFoundError:
-        print('unknown (not installed as a package)')
-    print('upgrade: uv tool upgrade magehand')
+        return None
+
+
+def version_tuple(text):
+    parts = (text or '').lstrip('v').split('.')
+    return tuple(int(p) for p in parts) if len(parts) == 3 and all(p.isdigit() for p in parts) else None
+
+
+def newest_tag(names):
+    """The highest vX.Y.Z among tag names, without the v; None if there is none."""
+    versions = [v for v in (version_tuple(n) for n in names if n.startswith('v')) if v]
+    return '.'.join(map(str, max(versions))) if versions else None
+
+
+def latest_version(max_age=86400):
+    """The newest released version (cached for a day); None when GitHub can't be asked."""
+    try:
+        cached = json.loads(LATEST_CACHE.read_text())
+        if time.time() - cached['checked'] < max_age:
+            return cached['version']
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'magehand'}
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    req = urllib.request.Request(f'https://api.github.com/repos/{MAGEHAND_REPO}/tags?per_page=100', headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:  # nosec B310  # fixed https URL
+            latest = newest_tag([t.get('name', '') for t in json.load(resp) if isinstance(t, dict)])
+    except (OSError, ValueError):
+        return None
+    try:
+        LATEST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        LATEST_CACHE.write_text(json.dumps({'checked': time.time(), 'version': latest}))
+    except OSError:
+        pass
+    return latest
+
+
+def install_method(prefix=None, base_prefix=None):
+    """How this copy was installed: uv, pipx, venv, managed (OpenClaw's VM pins it) or unknown."""
+    prefix = str(prefix or sys.prefix)
+    base_prefix = str(base_prefix or getattr(sys, 'base_prefix', sys.prefix))
+    if prefix.startswith('/opt/magehand'):
+        return 'managed'
+    if '/uv/tools/' in prefix + '/':
+        return 'uv'
+    if '/pipx/venvs/' in prefix + '/':
+        return 'pipx'
+    return 'venv' if prefix != base_prefix else 'unknown'
+
+
+def update_notice():
+    """One line on stderr when a newer magehand exists; quiet in CI, scripts and the managed copy."""
+    if os.environ.get('CI') or os.environ.get('MAGEHAND_NO_UPDATE_CHECK') or not sys.stderr.isatty() \
+            or install_method() == 'managed':
+        return
+    current, latest = installed_version(), latest_version()
+    if current and latest and version_tuple(latest) > (version_tuple(current) or ()):
+        print(f'magehand {latest} is available (you have {current}): magehand upgrade', file=sys.stderr)
+
+
+UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'upgrade', 'magehand'], 'pipx': ['pipx', 'upgrade', 'magehand'],
+                    'venv': [sys.executable, '-m', 'pip', 'install', '--upgrade', 'magehand']}
+
+
+def cmd_upgrade(_args):
+    method = install_method()
+    if method == 'managed':
+        die('this copy is pinned by the platform (homelab platform/openclaw/vm/versions.env); '
+            'a PR there upgrades it')
+    if method not in UPGRADE_COMMANDS:
+        die('not installed with uv, pipx or a venv; reinstall with `uv tool install magehand`')
+    current, latest = installed_version(), latest_version(max_age=0)
+    if current and latest and version_tuple(latest) <= (version_tuple(current) or ()):
+        print(f'magehand {current} is the latest')
+    else:
+        cmd = UPGRADE_COMMANDS[method]
+        print(f'magehand {current or "?"} -> {latest or "latest"}: {" ".join(cmd)}', flush=True)
+        if subprocess.run(cmd).returncode != 0:  # nosec B603  # fixed commands above
+            die('the upgrade failed (see above)')
+    # The new version, from this install's own bin (not whatever is first on PATH).
+    exe = pathlib.Path(sys.executable).with_name('magehand')
+    if not exe.is_file():
+        print('upgraded; run `magehand skill --install` if you use the skill')
+        return
+    # Its skill text, only where the user installed the skill (magehand setup).
+    if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
+        if subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL).returncode == 0:  # nosec B603
+            print('refreshed the homelab-app skill')
+    out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603
+    print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}')
+
+
+def cmd_version(_args):
+    current = installed_version()
+    print(current or 'unknown (not installed as a package)')
+    if install_method() == 'managed':  # no network call: provisioning runs this on every sync
+        print('pinned by the platform (homelab platform/openclaw/vm/versions.env)')
+        return
+    latest = latest_version()
+    if current and latest and version_tuple(latest) > (version_tuple(current) or ()):
+        print(f'{latest} is available: magehand upgrade')
+    else:
+        print('upgrade: magehand upgrade')
 
 
 COMMANDS = {'guide': cmd_guide, 'app': cmd_app, 'check': cmd_check, 'login': cmd_login, 'dev': cmd_dev,
-            'run': cmd_run, 'doctor': cmd_doctor, 'setup': cmd_setup, 'skill': cmd_skill, 'version': cmd_version}
+            'run': cmd_run, 'doctor': cmd_doctor, 'setup': cmd_setup, 'skill': cmd_skill, 'version': cmd_version,
+            'upgrade': cmd_upgrade}
 
 
 def main():
@@ -1100,6 +1216,8 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__.split('Private by design')[0].strip())
         sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help', 'help') else 2)
+    if sys.argv[1] not in ('upgrade', 'version'):
+        update_notice()
     COMMANDS[sys.argv[1]](sys.argv[2:])
 
 

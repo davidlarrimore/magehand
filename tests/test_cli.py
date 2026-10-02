@@ -404,3 +404,52 @@ class Skill(unittest.TestCase):
                     os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
             self.assertEqual(paths, [claude / 'skills/homelab-app/SKILL.md', codex / 'skills/homelab-app/SKILL.md'])
             self.assertTrue(paths[0].read_text().startswith('---\nname: homelab-app\n'))
+
+
+class StayingCurrent(unittest.TestCase):
+    def test_newest_tag(self):
+        self.assertEqual(magehand.newest_tag(['v0.1.1', 'v0.10.0', 'v0.9.3', 'latest', 'v1.0']), '0.10.0')
+        self.assertIsNone(magehand.newest_tag(['nightly']))
+
+    def test_install_method(self):
+        home = '/Users/x'
+        self.assertEqual(magehand.install_method(f'{home}/.local/share/uv/tools/magehand', '/usr'), 'uv')
+        self.assertEqual(magehand.install_method(f'{home}/.local/pipx/venvs/magehand', '/usr'), 'pipx')
+        self.assertEqual(magehand.install_method('/opt/magehand', '/usr'), 'managed')
+        self.assertEqual(magehand.install_method(f'{home}/src/magehand/.venv', '/usr'), 'venv')
+        self.assertEqual(magehand.install_method('/usr', '/usr'), 'unknown')
+
+    def test_latest_version_uses_a_fresh_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            saved, magehand.LATEST_CACHE = magehand.LATEST_CACHE, pathlib.Path(tmp) / 'latest.json'
+            try:
+                magehand.LATEST_CACHE.write_text(json.dumps({'checked': magehand.time.time(), 'version': '9.9.9'}))
+                self.assertEqual(magehand.latest_version(), '9.9.9')  # no network: the cache is fresh
+            finally:
+                magehand.LATEST_CACHE = saved
+
+    def test_notice_only_when_newer_and_interactive(self):
+        import contextlib
+        import io
+        saved = (magehand.installed_version, magehand.latest_version, magehand.install_method)
+        magehand.installed_version, magehand.latest_version = (lambda: '0.2.0'), (lambda: '0.3.0')
+        magehand.install_method = lambda: 'uv'
+        env = os.environ.pop('CI', None)
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        try:
+            for stream, expect in ((Tty(), True), (io.StringIO(), False)):
+                with contextlib.redirect_stderr(stream):
+                    magehand.update_notice()
+                self.assertEqual('magehand upgrade' in stream.getvalue(), expect)
+            magehand.latest_version = lambda: '0.2.0'
+            stream = Tty()
+            with contextlib.redirect_stderr(stream):
+                magehand.update_notice()
+            self.assertEqual(stream.getvalue(), '')
+        finally:
+            magehand.installed_version, magehand.latest_version, magehand.install_method = saved
+            if env is not None:
+                os.environ['CI'] = env
