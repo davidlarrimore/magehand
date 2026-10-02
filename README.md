@@ -23,7 +23,7 @@ Desktop or OrbStack, for database blocks), makes sure the homelab's `*.lab`
 names resolve (if they don't, it asks for the homelab's DNS address, your home
 gateway, and points only `*.lab` lookups at it; `magehand setup --undo`
 reverses that), then signs you in and installs the `homelab-app` skill for Claude Code (and Codex). Every other command assumes this is done.
-Upgrade with `uv tool upgrade magehand`.
+Upgrade with `magehand upgrade` (any command says, at most once a day, when a new version is out).
 
 ## Commands
 
@@ -40,7 +40,8 @@ Upgrade with `uv tool upgrade magehand`.
 | `magehand setup [--undo] [--dns ADDRESS]` | Once per machine: GitHub, Docker, `*.lab` name resolution (the only step that may ask for your password), sign-in |
 | `magehand skill [--install]` | The `homelab-app` skill: tells Claude Code and Codex to use `app`, `guide search` and `check` while working on app code. `setup` installs it (`$CLAUDE_CONFIG_DIR` or `~/.claude`, and `$CODEX_HOME` or `~/.codex` if Codex is installed) |
 | `magehand doctor` | Checks GitHub access, that `openbao.lab` is reachable, the sign-in and Docker |
-| `magehand version` | The installed version |
+| `magehand upgrade` | Upgrades magehand the way it was installed (`uv tool upgrade`, `pipx upgrade` or pip in its venv) and refreshes the `homelab-app` skill if you installed it. Never automatic: a release runs on your Mac, so you run it. Every other command prints a one-line notice (stderr, at most once a day, never in CI or scripts) when a newer version is tagged on GitHub; `MAGEHAND_NO_UPDATE_CHECK=1` turns it off. OpenClaw's VM refuses it: its version is pinned in homelab `platform/openclaw/vm/versions.env` |
+| `magehand version` | The installed version, and whether a newer one exists |
 
 ## Development
 
