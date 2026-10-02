@@ -165,8 +165,10 @@ class Doctor(unittest.TestCase):
 class Setup(unittest.TestCase):
     def setUp(self):
         self.names = ('reachable', 'lab_address', 'dns_answer', 'sudo_write_resolver', 'github_token',
-                      'saved_token', 'cmd_login', 'shutil')
+                      'saved_token', 'cmd_login', 'shutil', 'install_skill')
         self.saved = {n: getattr(magehand, n) for n in self.names}
+        self.skills = []  # never the real ~/.claude
+        magehand.install_skill = lambda: self.skills.append(1) or []
         self.saved_platform = magehand.sys.platform
         magehand.sys.platform = 'darwin'
         magehand.github_token = lambda: 't'
@@ -196,6 +198,7 @@ class Setup(unittest.TestCase):
         self.run_setup([])
         self.assertEqual(self.written, [])
         self.assertEqual(self.logins, [1])
+        self.assertEqual(self.skills, [1])
 
     def test_points_lab_lookups_at_the_given_dns(self):
         magehand.reachable = lambda: bool(self.written)
