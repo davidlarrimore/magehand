@@ -1,33 +1,8 @@
 """magehand: build homelab apps from anywhere, the same way everywhere.
 
 The developer CLI for apps on the homelab, used by the owner (Claude Code on
-the MacBook) and by OpenClaw's coding workers:
-
-  magehand guide [topic ["section"]]
-                                the platform guide for apps (live from homelab-apps)
-  magehand guide search WORDS   the guide sections that answer a question
-  magehand app [name]           this app's blocks, env vars and URLs
-  magehand check [name] [--code DIR] [--apps-dir DIR] [--manifests-only]
-                                the platform's rules for this app's code and
-                                deployment (run before every push; CI runs it too)
-  magehand login                sign in to OpenBao through authentik (passkey)
-  magehand dev up|down|status   local containers for the app's postgres/redis blocks
-  magehand run [--no-proxy] -- CMD...
-                                run CMD with the env the app's pod gets; secrets
-                                come from OpenBao and local containers, never disk
-  magehand run --container [--no-build] [-- CMD...]
-                                build the repo's Dockerfile and run the image as
-                                its pod runs (read-only, non-root, no capabilities)
-  magehand setup [--undo]       once per machine: GitHub, container runtime, *.lab names, sign-in,
-                                the homelab-app skill for coding agents
-  magehand skill [--install]    that skill (when Claude Code and Codex use magehand)
-  magehand runtime [use docker|podman|none | auto]
-                                the container runtime for local blocks and --container
-                                (detected: Docker Desktop, OrbStack, Colima, Rancher, Podman)
-  magehand doctor               check GitHub access, homelab reach, login, container runtime
-  magehand upgrade              upgrade magehand (uv, pipx or pip, as installed) and its skill;
-                                any command says once a day when a new version is out
-  magehand version              this version, and whether a newer one exists
+the MacBook) and by OpenClaw's coding workers. `magehand --help` lists the
+commands; `magehand COMMAND --help` explains each, with examples.
 
 Private by design: it talks only to GitHub and the private *.lab network,
 never to a public homelab endpoint. Everyday commands assume they can
@@ -36,7 +11,9 @@ this Mac's *.lab lookups at the homelab's DNS. Its OpenBao role `dev` can
 only read the LiteLLM keys of agent apps (homelab
 platform/openbao/policies/dev-read.hcl).
 """
+import argparse
 import base64
+import difflib
 import http.client
 import http.server
 import json
@@ -340,7 +317,8 @@ def guide_pages(topics):
     return pages
 
 
-def cmd_guide(args):
+def cmd_guide(a):
+    args = ([a.topic] if a.topic else []) + a.rest
     topics = [n[:-3] for n in github_dir(APPS_REPO, 'docs/platform') if n.endswith('.md')]
     if not topics:  # before docs/platform exists
         print(github_file(APPS_REPO, 'AGENTS.md'))
@@ -348,7 +326,7 @@ def cmd_guide(args):
     topic = args[0] if args else 'README'
     if topic == 'search':
         if len(args) < 2:
-            die('usage: magehand guide search WORDS  (e.g. magehand guide search web search)')
+            usage('guide', 'search needs words, e.g. magehand guide search web search')
         hits = search_sections(guide_pages(topics), ' '.join(args[1:]))
         if not hits:
             die('nothing in the guide matches; try other words, `magehand guide` for the topics, or ask the owner '
@@ -364,7 +342,9 @@ def cmd_guide(args):
         print(github_file(APPS_REPO, 'catalog.yaml'))
         return
     if topic not in topics:
-        die(f'no topic {topic!r}; topics: {", ".join(topics)}, catalog; or magehand guide search WORDS')
+        close = difflib.get_close_matches(topic, topics + ['catalog', 'search'], n=1)
+        usage('guide', f'no topic {topic!r}' + (f"; did you mean '{close[0]}'?" if close else '')
+              + f' (topics: {", ".join(topics)}, catalog; or: magehand guide search WORDS)')
     text = github_file(APPS_REPO, f'docs/platform/{topic}.md')
     if len(args) > 1:  # one section: magehand guide blocks "Web search"
         want = ' '.join(args[1:]).lower()
@@ -380,10 +360,23 @@ def cmd_guide(args):
               'catalog), or magehand guide search WORDS')
 
 
-def cmd_app(args):
-    app = load_app(args[0] if args else current_app())
+def cmd_app(a):
+    app = load_app(a.app_flag or a.app or current_app())
     name = app['name']
     source = (app['spec'].get('source') or {}).get('repo')
+    if a.json:
+        env = []
+        for entry in env_plan(app):
+            if entry[1] == 'value':
+                env.append({'name': entry[0], 'value': entry[2]})
+            elif entry[1] == 'unknown':
+                env.append({'name': entry[0], 'secret': entry[2]})
+            else:
+                env.append({'name': entry[0], 'block': entry[1], 'type': entry[2], 'key': entry[3]})
+        print(json.dumps({'name': name, 'code': f'davidlarrimore/{source}' if source else f'homelab-apps apps/{name}/image',
+                          'deployment': f'homelab-apps apps/{name}', 'dev_url': f'https://{name}-dev.{LAB}',
+                          'port': app_port(app), 'blocks': app['services'], 'env': env}, indent=1))
+        return
     print(f'{name}  (code: {"davidlarrimore/" + source if source else "homelab-apps apps/" + name + "/image"};'
           f' deployment: homelab-apps apps/{name})')
     print(f'  dev:      https://{name}-dev.{LAB}')
@@ -409,7 +402,7 @@ def cmd_app(args):
 # --- the container runtime: what runs local blocks and `run --container` -------------
 # magehand drives a docker-compatible CLI: `docker` (Docker Desktop, OrbStack,
 # Colima, Rancher Desktop with dockerd) or `podman`. Detection only runs
-# `<cli> info`, as the user (no sudo). `magehand runtime use ...` pins the choice;
+# `<cli> info`, as the user (no sudo). `magehand runtime docker|podman|none` pins the choice;
 # `none` means no containers: `magehand run` still works for apps whose blocks
 # are llm and secret only.
 
@@ -460,7 +453,7 @@ def detect_runtimes():
 
 
 def configured_runtime():
-    """The user's choice (MAGEHAND_RUNTIME, else `magehand runtime use`), or None for automatic."""
+    """The user's choice (MAGEHAND_RUNTIME, else `magehand runtime NAME`), or None for automatic."""
     value = os.environ.get('MAGEHAND_RUNTIME')
     if not value:
         try:
@@ -468,7 +461,7 @@ def configured_runtime():
         except (OSError, ValueError, AttributeError):
             value = None
     if value and value not in RUNTIMES + ('none',):
-        die(f'unknown container runtime {value!r} (MAGEHAND_RUNTIME or `magehand runtime use`): '
+        die(f'unknown container runtime {value!r} (MAGEHAND_RUNTIME or `magehand runtime NAME`): '
             f'{", ".join(RUNTIMES)} or none')
     return value
 
@@ -520,30 +513,34 @@ def save_config(**changes):
 def runtime_lines(found, configured, chosen):
     lines = [f"  {f['cli']:7} {f['product']}: {'running' if f['running'] else 'not running -> ' + f['hint']}"
              for f in found] or ['  none found']
-    how = f'set with `magehand runtime use {configured}`' if configured else 'automatic'
+    how = f'set with `magehand runtime {configured}`' if configured else 'automatic'
     lines.append(f"Using: {chosen or 'none (no containers)'} ({how})")
     return lines
 
 
-def cmd_runtime(args):
-    if args[:1] == ['use'] and len(args) == 2 and args[1] in RUNTIMES + ('none',):
-        if args[1] != 'none' and not shutil.which(args[1]):
-            die(f'{args[1]} is not installed here')
-        save_config(runtime=args[1])
-        print(f'container runtime: {args[1]}' + (' (local postgres/redis blocks and run --container are off)'
-                                                 if args[1] == 'none' else ''))
-        return
-    if args == ['auto']:
+def cmd_runtime(a):
+    choice = a.runtime
+    if choice == 'auto':
         save_config(runtime=None)
         print('container runtime: automatic (the first running of docker, podman)')
         return
-    if args:
-        die(f'usage: magehand runtime [use {"|".join(RUNTIMES)}|none | auto]')
+    if choice:
+        if choice != 'none' and not shutil.which(choice):
+            die(f'{choice} is not installed here. Install one of {SUPPORTED} first; '
+                '`magehand runtime` shows what this machine has')
+        save_config(runtime=choice)
+        print(f'container runtime: {choice}' + (' (local postgres/redis blocks and run --container are off)'
+                                               if choice == 'none' else ''))
+        return
     configured = configured_runtime()
     found = detect_runtimes()
+    if a.json:
+        print(json.dumps({'using': choose_runtime(configured, found), 'configured': configured,
+                          'found': found, 'supported': list(RUNTIMES)}, indent=1))
+        return
     print('Container runtimes (for local postgres/redis blocks and run --container):')
     print('\n'.join(runtime_lines(found, configured, choose_runtime(configured, found))))
-    print(f'Supported: {SUPPORTED}. Change: magehand runtime use docker|podman|none, or magehand runtime auto.')
+    print(f'Supported: {SUPPORTED}. Change: magehand runtime docker|podman|none|auto')
 
 
 def local_state(app_name):
@@ -565,9 +562,9 @@ def block_image(kind, svc):
     return values['image']
 
 
-def cmd_dev(args):
-    action = args[0] if args else 'status'
-    app = load_app(args[1] if len(args) > 1 else current_app())
+def cmd_dev(a):
+    action = a.action
+    app = load_app(a.app_flag or a.app or current_app())
     state = local_state(app['name'])
     network = f'magehand-{app["name"]}'
     contained = [b for b, svc in app['services'].items() if (svc or {}).get('type') in ('postgres', 'redis')]
@@ -612,16 +609,15 @@ def cmd_dev(args):
         port = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
         state[block]['port'] = port
         print(f'{block} ({kind}): 127.0.0.1:{port}')
+    if not contained and action in ('up', 'status'):
+        print(f"{app['name']} has no postgres/redis blocks: nothing runs locally "
+              '(llm keys come from OpenBao when the app runs)')
     if action == 'up':
         save_local_state(app['name'], state)
-        if not contained:
-            print('no postgres/redis blocks: nothing to start (llm keys come from OpenBao when the app runs)')
     elif action == 'down':
         (STATE / f'{app["name"]}.json').unlink(missing_ok=True)
         if cli:
             engine('network', 'rm', network, check=False)
-    elif action != 'status':
-        die('usage: magehand dev up|down|status [app]')
 
 
 def local_connection(kind, block, local, app_name=None):
@@ -774,19 +770,12 @@ def container_args(app, env, image, port, hosts, extra):
     return args
 
 
-def cmd_run(args):
-    proxy = '--no-proxy' not in args
-    container = '--container' in args
-    build = '--no-build' not in args
-    args = [a for a in args if a not in ('--no-proxy', '--container', '--no-build')]
-    name = None
-    if args and args[0] == '--app':
-        name, args = args[1], args[2:]
-    if args and args[0] == '--':
-        args = args[1:]
+def cmd_run(a):
+    proxy, container, build = not a.no_proxy, a.container, not a.no_build
+    args = a.cmd[1:] if a.cmd[:1] == ['--'] else a.cmd
     if not args and not container:
-        die('usage: magehand run [--no-proxy] [--app NAME] -- CMD...   or   magehand run --container [--no-build]')
-    app = load_app(name or current_app())
+        usage('run', 'give the command after --, e.g. magehand run -- python app.py (or --container)')
+    app = load_app(a.app_flag or current_app())
     env = resolve_env(app, container=container)
     print(f'magehand: {app["name"]} env: {", ".join(sorted(env))}', file=sys.stderr)
     if proxy:
@@ -815,13 +804,16 @@ def cmd_run(args):
 
 # --- doctor and update ---------------------------------------------------------------
 
-def cmd_doctor(_args):
+def cmd_doctor(a):
     ok = True
+    results = []
 
     def check(label, passed, hint=''):
         nonlocal ok
         ok = ok and passed
-        print(f'{"ok  " if passed else "FAIL"} {label}{"" if passed else "  -> " + hint}')
+        results.append({'check': label, 'ok': bool(passed), 'hint': '' if passed else hint})
+        if not a.json:
+            print(f'{"ok  " if passed else "FAIL"} {label}{"" if passed else "  -> " + hint}')
 
     try:
         github_token()
@@ -840,9 +832,12 @@ def cmd_doctor(_args):
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
     # Not a failure without one: only postgres/redis blocks and run --container need it.
-    print(f'{"ok  " if chosen else "--  "} container runtime: {chosen or "none"}'
-          + ('' if chosen else f' (needed only for local postgres/redis blocks and run --container: {SUPPORTED};'
-                               ' `magehand runtime`)'))
+    if a.json:
+        print(json.dumps({'ok': ok, 'checks': results, 'runtime': chosen}, indent=1))
+    else:
+        print(f'{"ok  " if chosen else "--  "} container runtime: {chosen or "none"}'
+              + ('' if chosen else f' (needed only for local postgres/redis blocks and run --container: '
+                                   f'{SUPPORTED}; `magehand runtime`)'))
     sys.exit(0 if ok else 1)
 
 
@@ -1055,37 +1050,29 @@ def try_load_app(name):
     return app
 
 
-def cmd_check(args):
+def cmd_check(a):
     global APPS_DIR
-    opts = {'--code': '.', '--apps-dir': None}
-    names, manifests_only = [], False
-    rest = list(args)
-    while rest:
-        arg = rest.pop(0)
-        if arg in opts and rest:
-            opts[arg] = rest.pop(0)
-        elif arg == '--manifests-only':
-            manifests_only = True
-        elif arg.startswith('-'):
-            die(f'check: unknown option {arg}; usage: magehand check [NAME] [--code DIR] [--apps-dir DIR] '
-                '[--manifests-only]')
-        else:
-            names.append(arg)
-    if opts['--apps-dir']:
-        APPS_DIR = opts['--apps-dir']
-    name = names[0] if names else current_app()
+    manifests_only = a.manifests_only
+    if a.apps_dir:
+        APPS_DIR = a.apps_dir
+    name = a.app_flag or a.app or current_app()
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     app = try_load_app(name)
-    root = pathlib.Path(opts['--code'])
+    root = pathlib.Path(a.code)
     found = check_manifests(app, catalog) if app else []
     if not manifests_only:
         found += check_code(root, app)
+    errors = sum(f['level'] == 'error' for f in found)
+    if a.json:
+        print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
+                          'deployment': f'homelab-apps apps/{name}' if app else None, 'errors': errors,
+                          'findings': sorted(found, key=lambda f: (f['level'] != 'error', f['where']))}, indent=1))
+        sys.exit(1 if errors else 0)
     print(f'magehand check {name}: code {"(skipped)" if manifests_only else root.resolve()}, deployment '
           + (f'homelab-apps apps/{name}' if app else 'none yet (code rules only)'))
     for f in sorted(found, key=lambda f: (f['level'] != 'error', f['where'])):
         see = f['see'] if f['see'].startswith('homelab-apps') else f"magehand guide {f['see']}"
         print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> {see}")
-    errors = sum(f['level'] == 'error' for f in found)
     print(f'{len(found)} finding(s), {errors} error(s)' if found else 'no findings')
     sys.exit(1 if errors else 0)
 
@@ -1146,8 +1133,8 @@ def install_skill():
     return paths
 
 
-def cmd_skill(args):
-    if args[:1] == ['--install']:
+def cmd_skill(a):
+    if a.install:
         for path in install_skill():
             print(f'installed {path}')
         return
@@ -1189,9 +1176,9 @@ def sudo_write_resolver(server):
     subprocess.run(['sudo', 'killall', '-HUP', 'mDNSResponder'], check=False)  # nosec B603 B607
 
 
-def cmd_setup(args):
+def cmd_setup(a):
     host = urllib.parse.urlparse(OPENBAO).hostname
-    if '--undo' in args:
+    if a.undo:
         if RESOLVER.exists():
             subprocess.run(['sudo', 'rm', '-f', str(RESOLVER)], check=True)  # nosec B603 B607
             print(f'removed {RESOLVER}')
@@ -1207,7 +1194,7 @@ def cmd_setup(args):
     found = detect_runtimes()
     for line in runtime_lines(found, configured, choose_runtime(configured, found)):
         print('  ' + line)
-    print(f'    Supported: {SUPPORTED}. Change: magehand runtime use docker|podman|none')
+    print(f'    Supported: {SUPPORTED}. Change: magehand runtime docker|podman|none')
     print(f'3/5 the homelab network (*.{LAB})')
     if reachable():
         print(f'    ok: {host} -> {lab_address(host)}')
@@ -1216,8 +1203,10 @@ def cmd_setup(args):
     else:
         current = lab_address(host)
         print(f'    {host} resolves to {current or "nothing"} here, which is not the homelab.')
-        server = args[args.index('--dns') + 1] if '--dns' in args else \
-            input('    Homelab DNS address (your home gateway, e.g. 192.168.1.1): ').strip()
+        if not a.dns and not sys.stdin.isatty():  # prompt only in a terminal
+            die(f'{host} does not resolve to the homelab here: run `magehand setup --dns ADDRESS` '
+                '(the homelab\'s DNS, your home gateway)')
+        server = a.dns or input('    Homelab DNS address (your home gateway, e.g. 192.168.1.1): ').strip()
         answer = dns_answer(server, host)
         if not answer or answer.startswith('127.'):
             die(f'{server} did not answer for {host} with a homelab address ({answer or "no answer"}); '
@@ -1235,7 +1224,7 @@ def cmd_setup(args):
     if token and bao('GET', 'auth/token/lookup-self', token)[0] == 200:
         print('    ok (already signed in)')
     else:
-        cmd_login([])
+        cmd_login(None)
     print('5/5 the homelab-app skill for coding agents (Claude Code, Codex)')
     for path in install_skill():
         print(f'    ok: {path}')
@@ -1322,7 +1311,7 @@ UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'upgrade', 'magehand'], 'pipx': ['pipx'
                     'venv': [sys.executable, '-m', 'pip', 'install', '--upgrade', 'magehand']}
 
 
-def cmd_upgrade(_args):
+def cmd_upgrade(_a):
     method = install_method()
     if method == 'managed':
         die('this copy is pinned by the platform (homelab platform/openclaw/vm/versions.env); '
@@ -1350,7 +1339,7 @@ def cmd_upgrade(_args):
     print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}')
 
 
-def cmd_version(_args):
+def cmd_version(_a):
     current = installed_version()
     print(current or 'unknown (not installed as a package)')
     if install_method() == 'managed':  # no network call: provisioning runs this on every sync
@@ -1363,20 +1352,189 @@ def cmd_version(_args):
         print('upgrade: magehand upgrade')
 
 
-COMMANDS = {'guide': cmd_guide, 'app': cmd_app, 'check': cmd_check, 'login': cmd_login, 'dev': cmd_dev,
-            'run': cmd_run, 'doctor': cmd_doctor, 'setup': cmd_setup, 'skill': cmd_skill, 'version': cmd_version,
-            'upgrade': cmd_upgrade, 'runtime': cmd_runtime}
+# --- the command line ----------------------------------------------------------------
+# Conventions (clig.dev, POSIX, the Heroku CLI style guide; AGENTS.md "CLI
+# conventions"): -h/--help on every command, -V/--version; usage errors on stderr
+# with exit 2 and a suggestion; failures exit 1; data on stdout, messages on
+# stderr; --json where a script or agent reads the result; one flag name per
+# idea (-a/--app); flag > environment > config file; prompts only in a terminal.
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        match = re.search(r"argument (\S+): invalid choice: '([^']*)' \(choose from (.*)\)", message)
+        if match:
+            choices = re.findall(r"'([^']*)'", match.group(3))
+            close = difflib.get_close_matches(match.group(2), choices, n=1)
+            hint = f"; did you mean '{close[0]}'?" if close else ''
+            if match.group(1) == 'COMMAND':  # 13 choices: point to the list instead of printing it
+                message = f"unknown command '{match.group(2)}'{hint} (magehand --help lists them)"
+            else:
+                message += hint
+        self.print_usage(sys.stderr)
+        self.exit(2, f'{self.prog}: error: {message}\n')
 
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-V'):
-        sys.argv[1] = 'version'
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print(__doc__.split('Private by design')[0].strip())
-        sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help', 'help') else 2)
-    if sys.argv[1] not in ('upgrade', 'version'):
+# The root help groups commands by task, most used first (each line from the
+# command's short help).
+GROUPS = (('learn the platform and check an app', ('guide', 'app', 'check')),
+          ('run an app locally', ('run', 'dev', 'runtime', 'login')),
+          ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
+SHORT = {}
+
+
+class RootParser(Parser):
+    def format_help(self):
+        lines = [self.format_usage().rstrip(), '', self.description, '']
+        for title, names in GROUPS:
+            lines.append(f'{title}:')
+            lines += [f'  {name:9} {SHORT[name]}' for name in names]
+            lines.append('')
+        lines += ['options:', '  -h, --help     show this help and exit', '  -V, --version  print the version and exit',
+                  '', self.epilog, '']
+        return '\n'.join(lines)
+
+
+SUBPARSERS = {}
+ROOT = []
+
+
+def usage(command, message):
+    """A usage error found inside a command: reported like argparse's (stderr, exit 2)."""
+    SUBPARSERS[command].error(message)
+
+
+def build_parser():
+    root = RootParser(prog='magehand', formatter_class=argparse.RawDescriptionHelpFormatter,
+                  description="build apps on the homelab: learn the platform, check an app, run it locally",
+                  epilog='Run `magehand COMMAND --help` for its options and examples. '
+                         'Docs: https://github.com/davidlarrimore/magehand')
+    root.add_argument('-V', '--version', action='store_true', help='print the version and exit')
+    sub = root.add_subparsers(dest='command', metavar='COMMAND', title='commands', parser_class=Parser)
+
+    def command(name, func, short, text, epilog=''):
+        SHORT[name] = short
+        p = sub.add_parser(name, help=short, description=text, epilog=epilog,
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
+        p.set_defaults(func=func)
+        SUBPARSERS[name] = p
+        return p
+
+    def app_option(p, positional=True):
+        if positional:
+            p.add_argument('app', nargs='?', metavar='APP', help='the app (default: the app repo you are in)')
+        p.add_argument('-a', '--app', dest='app_flag', metavar='APP',
+                       help='the app (default: the app repo you are in)')
+
+    def json_option(p):
+        p.add_argument('--json', action='store_true', help='print JSON (for scripts and agents)')
+
+    def runtime_option(p):
+        p.add_argument('--runtime', dest='runtime_flag', choices=RUNTIMES + ('none',),
+                       help='container runtime for this run (else MAGEHAND_RUNTIME, then `magehand runtime`)')
+
+    # learn the platform and check an app
+    p = command('guide', cmd_guide, 'read the platform guide: search it, recipes, a topic', 'read the platform guide for apps (live from homelab-apps docs/platform)',
+                'examples:\n'
+                '  magehand guide                       the overview and its topics\n'
+                '  magehand guide search web search     the sections that answer a question\n'
+                '  magehand guide recipes               steps for common changes\n'
+                '  magehand guide blocks "Web search"   one section of a topic\n'
+                '  magehand guide catalog               block types and models')
+    p.add_argument('topic', nargs='?', metavar='TOPIC', help='a topic, `search` or `catalog`')
+    p.add_argument('rest', nargs='*', metavar='WORDS', help='a section of the topic, or what to search for')
+    p = command('app', cmd_app, "an app's blocks, env vars and URLs", "show an app's blocks, the env vars its pod gets (and from where), its URLs",
+                'examples:\n  magehand app                   in an app repo\n  magehand app scavenger-hunt\n'
+                '  magehand app --json')
+    app_option(p)
+    json_option(p)
+    p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
+                'Run it before every push; CI runs the same check. Each finding names the guide section\n'
+                'that explains it. Exit status 1 when there are errors; fix warnings or explain them in the PR.\n\n'
+                'examples:\n  magehand check                          in an app repo\n'
+                '  magehand check --json\n'
+                '  magehand check -a demo --code apps/demo/image --apps-dir .   in a homelab-apps checkout')
+    app_option(p)
+    p.add_argument('--code', default='.', metavar='DIR', help="the app's code (default: .)")
+    p.add_argument('--apps-dir', metavar='DIR', help='read this homelab-apps checkout instead of GitHub (CI)')
+    p.add_argument('--manifests-only', action='store_true', help='check the deployment only, not the code')
+    json_option(p)
+    # run it locally
+    command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, up to 8h)')
+    p = command('dev', cmd_dev, 'local postgres/redis blocks: up, down, status', "start, stop or show local containers for the app's postgres/redis blocks",
+                'Also makes local values for secret blocks. llm keys need nothing here: they come from\n'
+                'OpenBao when the app runs.\n\n'
+                'examples:\n  magehand dev up\n  magehand dev            (status)\n'
+                '  magehand dev down       (deletes the local data)')
+    p.add_argument('action', nargs='?', default='status', choices=('up', 'down', 'status'),
+                   help='up, down or status (default)')
+    app_option(p)
+    runtime_option(p)
+    p = command('run', cmd_run, "run a command or the app's image with its pod's env", "run a command, or the app's image, with the env the app's pod gets",
+                'Secrets come from OpenBao and local containers, never from disk. A proxy on 127.0.0.1:8080\n'
+                'adds the X-authentik-* headers Traefik would, as you.\n\n'
+                'examples:\n  magehand run -- python -B app.py\n  magehand run --no-proxy -- npm run dev\n'
+                '  magehand run --container        build the Dockerfile and run the image as its pod runs')
+    app_option(p, positional=False)
+    p.add_argument('--no-proxy', action='store_true', help='no identity proxy; use the app port directly')
+    p.add_argument('--container', action='store_true',
+                   help="build the repo's Dockerfile and run the image as its pod runs")
+    p.add_argument('--no-build', action='store_true', help='with --container: reuse the last build')
+    runtime_option(p)
+    p.add_argument('cmd', nargs=argparse.REMAINDER, metavar='-- CMD', help='the command to run')
+    p = command('runtime', cmd_runtime, 'show or set the container runtime', 'show or set the container runtime for local blocks and run --container',
+                f'Supported: {SUPPORTED}. Detection runs `<cli> info` as you (no sudo).\n'
+                'Precedence: --runtime > MAGEHAND_RUNTIME > this setting > automatic.\n\n'
+                'examples:\n  magehand runtime           what this machine has, and which one is used\n'
+                '  magehand runtime docker    always use docker (or podman)\n'
+                '  magehand runtime none      no containers\n'
+                '  magehand runtime auto      the first running one (the default)')
+    p.add_argument('runtime', nargs='?', choices=RUNTIMES + ('none', 'auto'), metavar='RUNTIME',
+                   help=f'{", ".join(RUNTIMES)}, none or auto; omit it to show')
+    json_option(p)
+    # this machine
+    p = command('setup', cmd_setup, 'set this machine up (once)', 'set this machine up once: GitHub, container runtime, *.lab names, '
+                'sign-in, the skill')
+    p.add_argument('--dns', metavar='ADDRESS', help="the homelab's DNS address, if *.lab doesn't resolve "
+                   '(else it asks, in a terminal)')
+    p.add_argument('--undo', action='store_true', help='remove the *.lab name resolution setup added')
+    p = command('doctor', cmd_doctor, 'check access, sign-in and the container runtime', 'check GitHub access, homelab reach, sign-in and the container runtime')
+    json_option(p)
+    p = command('skill', cmd_skill, 'print or install the homelab-app skill for coding agents', 'print the homelab-app skill for coding agents, or install it')
+    p.add_argument('--install', action='store_true', help='install it for Claude Code (and Codex, if installed)')
+    command('upgrade', cmd_upgrade, 'upgrade magehand and its skill', 'upgrade magehand the way it was installed, and its skill')
+    command('version', cmd_version, 'print the version', 'print the version, and whether a newer one exists')
+    p = command('help', cmd_help, 'help for magehand or a command', 'show help for magehand or a command')
+    p.add_argument('topic', nargs='?', metavar='COMMAND')
+    ROOT[:] = [root]
+    return root
+
+
+def cmd_help(a):
+    if a.topic and a.topic not in SUBPARSERS:
+        close = difflib.get_close_matches(a.topic, list(SUBPARSERS), n=1)
+        usage('help', f"no command '{a.topic}'" + (f"; did you mean '{close[0]}'?" if close else ''))
+    (SUBPARSERS[a.topic] if a.topic else ROOT[0]).print_help()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:2] == ['runtime', 'use']:  # the 0.4.0 form keeps working
+        del argv[1]
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    if a.version:
+        a.command, a.func = 'version', cmd_version
+    if not a.command:
+        parser.print_help()
+        return
+    if getattr(a, 'runtime_flag', None):  # flag > MAGEHAND_RUNTIME > config file
+        os.environ['MAGEHAND_RUNTIME'] = a.runtime_flag
+    if a.command not in ('upgrade', 'version', 'help'):
         update_notice()
-    COMMANDS[sys.argv[1]](sys.argv[2:])
+    try:
+        a.func(a)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == '__main__':
