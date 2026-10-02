@@ -11,6 +11,8 @@ import urllib.request
 
 from magehand import cli as magehand
 
+os.environ['MAGEHAND_NO_UPDATE_CHECK'] = '1'  # tests never ask GitHub for the latest version
+
 APP = {
     'name': 'demo',
     'pod': {'securityContext': {'runAsUser': 1000, 'runAsGroup': 1000}},
@@ -155,7 +157,7 @@ class Doctor(unittest.TestCase):
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
-                magehand.cmd_doctor([])
+                magehand.main(['doctor'])
         finally:
             (magehand.urllib.request.urlopen, magehand.github_token, magehand.github_file,
              magehand.saved_token) = saved
@@ -191,7 +193,7 @@ class Setup(unittest.TestCase):
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()):
-            magehand.cmd_setup(args)
+            magehand.main(['setup', *args])
 
     def test_already_reachable_changes_nothing(self):
         magehand.reachable = lambda: True
@@ -435,6 +437,7 @@ class StayingCurrent(unittest.TestCase):
         magehand.installed_version, magehand.latest_version = (lambda: '0.2.0'), (lambda: '0.3.0')
         magehand.install_method = lambda: 'uv'
         env = os.environ.pop('CI', None)
+        quiet = os.environ.pop('MAGEHAND_NO_UPDATE_CHECK', None)
 
         class Tty(io.StringIO):
             def isatty(self):
@@ -453,6 +456,8 @@ class StayingCurrent(unittest.TestCase):
             magehand.installed_version, magehand.latest_version, magehand.install_method = saved
             if env is not None:
                 os.environ['CI'] = env
+            if quiet is not None:
+                os.environ['MAGEHAND_NO_UPDATE_CHECK'] = quiet
 
 
 class Runtimes(unittest.TestCase):
@@ -513,15 +518,21 @@ class Runtimes(unittest.TestCase):
         import io
         self.fake({'podman'}, {})
         with contextlib.redirect_stdout(io.StringIO()):
-            magehand.cmd_runtime(['podman'])  # the way people type it
+            magehand.main(['runtime', 'podman'])  # the way people type it
             self.assertEqual(magehand.configured_runtime(), 'podman')
-            magehand.cmd_runtime(['use', 'none'])  # `use` still works
+            magehand.main(['runtime', 'use', 'none'])  # 0.4.0's form still works
             self.assertEqual(magehand.configured_runtime(), 'none')
-            for bad in (['docker'], ['use', 'docker'], ['kubernetes'], ['podman', 'extra']):
-                with self.assertRaises(SystemExit):
-                    magehand.cmd_runtime(bad)  # docker isn't installed in this fake
+            with contextlib.redirect_stderr(io.StringIO()):
+                for bad, code in ((['docker'], 'magehand: docker is not installed'), (['use', 'docker'], 'magehand: docker'),
+                                  (['kubernetes'], 2), (['podman', 'extra'], 2)):
+                    with self.assertRaises(SystemExit) as raised:
+                        magehand.main(['runtime', *bad])  # docker isn't installed in this fake
+                    if isinstance(code, int):
+                        self.assertEqual(raised.exception.code, code)
+                    else:
+                        self.assertTrue(str(raised.exception.code).startswith(code))
             self.assertEqual(magehand.configured_runtime(), 'none')
-            magehand.cmd_runtime(['auto'])
+            magehand.main(['runtime', 'auto'])
         self.assertIsNone(magehand.configured_runtime())
 
     def test_env_overrides_and_is_validated(self):
@@ -533,3 +544,117 @@ class Runtimes(unittest.TestCase):
             self.assertEqual(magehand.configured_runtime(), 'docker')
         finally:
             os.environ.pop('MAGEHAND_RUNTIME', None)
+
+
+class CommandLine(unittest.TestCase):
+    """The conventions in AGENTS.md "CLI conventions"."""
+
+    def run_main(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                magehand.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else 1
+        return code, out.getvalue(), err.getvalue()
+
+    def test_every_command_has_help(self):
+        magehand.build_parser()
+        for name in magehand.SUBPARSERS:
+            code, out, _ = self.run_main(name, '--help')
+            self.assertEqual(code, 0, name)
+            self.assertIn(f'usage: magehand {name}', out)
+
+    def test_no_arguments_shows_help(self):
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        for name in magehand.SUBPARSERS:  # every command is listed in a group
+            self.assertIn(f'\n  {name} ', out)
+
+    def test_unknown_command_suggests_on_stderr_with_exit_2(self):
+        code, out, err = self.run_main('runtme')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn("did you mean 'runtime'?", err)
+
+    def test_bad_choice_suggests(self):
+        code, _, err = self.run_main('runtime', 'podmn')
+        self.assertEqual(code, 2)
+        self.assertIn("did you mean 'podman'?", err)
+
+    def test_usage_error_inside_a_command(self):
+        saved = magehand.current_app
+        magehand.current_app = lambda: 'demo'
+        try:
+            code, _, err = self.run_main('run')
+        finally:
+            magehand.current_app = saved
+        self.assertEqual(code, 2)
+        self.assertIn('usage: magehand run', err)
+        self.assertIn('give the command after --', err)
+
+    def test_help_command(self):
+        self.assertEqual(self.run_main('help', 'check')[1].splitlines()[0][:20], 'usage: magehand chec')
+        code, _, err = self.run_main('help', 'chek')
+        self.assertEqual(code, 2)
+        self.assertIn("did you mean 'check'?", err)
+
+    def test_version_flag(self):
+        code, out, _ = self.run_main('-V')
+        self.assertEqual(code, 0)
+        self.assertTrue(out.strip())
+
+    def test_app_flag_and_positional_name_the_same_app(self):
+        seen = []
+        saved = magehand.load_app
+        magehand.load_app = lambda name: seen.append(name) or magehand.die('stop')
+        try:
+            self.run_main('app', 'one')
+            self.run_main('app', '-a', 'two')
+            self.run_main('dev', 'up', '--app', 'three')
+            self.run_main('run', '-a', 'four', '--', 'true')
+        finally:
+            magehand.load_app = saved
+        self.assertEqual(seen, ['one', 'two', 'three', 'four'])
+
+    def test_run_passes_the_command_through(self):
+        parser = magehand.build_parser()
+        a = parser.parse_args(['run', '--no-proxy', '--', 'python', '-m', 'http.server', '--bind', '127.0.0.1'])
+        self.assertEqual(a.cmd, ['--', 'python', '-m', 'http.server', '--bind', '127.0.0.1'])
+        self.assertTrue(a.no_proxy)
+
+    def test_runtime_flag_wins(self):
+        saved = magehand.cmd_dev
+        seen = []
+        magehand.cmd_dev = lambda a: seen.append(os.environ.get('MAGEHAND_RUNTIME'))
+        try:
+            self.run_main('dev', 'status', '--runtime', 'podman')
+        finally:
+            magehand.cmd_dev = saved
+            os.environ.pop('MAGEHAND_RUNTIME', None)
+        self.assertEqual(seen, ['podman'])
+
+    def test_check_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, 'app.py').write_text('URL = "https://api.openai.com"\n')
+            saved = magehand.try_load_app, magehand.github_file
+            magehand.try_load_app = lambda name: None
+            magehand.github_file = lambda repo, path, required=True: None
+            try:
+                code, out, _ = self.run_main('check', 'demo', '--code', tmp, '--json')
+            finally:
+                magehand.try_load_app, magehand.github_file = saved
+        result = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(result['app'], 'demo')
+        self.assertEqual(result['errors'], 3)  # the provider call, no Dockerfile, no ui-check.yaml
+
+    def test_ctrl_c_exits_130(self):
+        saved = magehand.cmd_version
+        magehand.cmd_version = lambda a: (_ for _ in ()).throw(KeyboardInterrupt())
+        try:
+            self.assertEqual(self.run_main('version')[0], 130)
+        finally:
+            magehand.cmd_version = saved

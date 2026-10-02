@@ -28,22 +28,53 @@ Upgrade with `magehand upgrade` (any command says, at most once a day, when a ne
 
 ## Commands
 
+`magehand --help` lists them; `magehand COMMAND --help` (or `magehand help
+COMMAND`) explains one, with examples.
+
+**Learn the platform and check an app**
+
 | Command | What it does |
 | --- | --- |
-| `magehand guide [topic ["section"]]` | The app platform guide, live from homelab-apps `docs/platform/`; `magehand guide catalog` for blocks and models |
-| `magehand guide search WORDS` | The guide sections (homelab-apps `docs/platform/` and `AGENTS.md`) that best match a question, e.g. `magehand guide search web search` |
-| `magehand app [name]` | The app's blocks, every env var its pod gets and where it comes from, its URLs. In an app repo the name is the repo's |
-| `magehand check [name] [--code DIR] [--apps-dir DIR] [--manifests-only]` | The platform's rules for the app's code and its homelab-apps deployment: block keys and options, `optional: true` keys, Secrets that aren't blocks, the image, env the code reads but the pod doesn't set, direct AI/search provider calls, own login, database files. Each finding names the guide section; exit 1 on errors. Run before every push; CI (homelab-apps `build-app.yaml`) runs it too, with `--apps-dir` |
-| `magehand login` | Sign in to OpenBao through authentik (passkey) with role `dev`: read-only access to agent apps' LiteLLM keys, 1h (8h max). The token is kept in the macOS Keychain |
-| `magehand dev up\|down\|status` | Containers (with the chosen runtime) for the app's `postgres`/`redis` blocks (the blocks' own pinned images) on a per-app network, and local values for `secret` blocks |
-| `magehand run [--no-proxy] -- CMD` | Runs CMD with the env the app's pod gets: values from its Deployment, the LLM key from OpenBao, databases from `dev up`. Precedence: manifest < the repo's `.magehand.env` (committed, non-secret overrides such as `WEB_DIR=./web`) < your shell < secrets. A proxy on `127.0.0.1:8080` adds the `X-authentik-*` headers Traefik would, as you |
+| `magehand guide [TOPIC ["SECTION"]]` | The app platform guide, live from homelab-apps `docs/platform/`: `magehand guide` (overview), `guide recipes`, `guide blocks "Web search"` (one section), `guide catalog` (blocks and models) |
+| `magehand guide search WORDS` | The guide sections (`docs/platform/` and homelab-apps `AGENTS.md`) that best answer a question, e.g. `magehand guide search web search` |
+| `magehand app [APP] [--json]` | The app's blocks, every env var its pod gets and where it comes from, its URLs |
+| `magehand check [APP] [--code DIR] [--apps-dir DIR] [--manifests-only] [--json]` | The platform's rules for the app's code and its homelab-apps deployment: block keys and options, `optional: true` keys, Secrets nothing makes, the image, env the code reads but the pod doesn't set, direct AI/search provider calls, own login, database files. Each finding names the guide section; exit 1 on errors. Run before every push; CI runs it too (`--apps-dir`) |
+
+**Run an app locally**
+
+| Command | What it does |
+| --- | --- |
+| `magehand run [-a APP] [--no-proxy] -- CMD` | Runs CMD with the env the app's pod gets: values from its Deployment, the LLM key from OpenBao, databases from `dev up`. Precedence: manifest < the repo's `.magehand.env` (committed, non-secret overrides such as `WEB_DIR=./web`) < your shell < secrets. A proxy on `127.0.0.1:8080` adds the `X-authentik-*` headers Traefik would, as you |
 | `magehand run --container [--no-build] [-- CMD]` | Builds the repo's Dockerfile and runs the image as its pod runs: read-only, `/tmp` tmpfs, the pod's user, no capabilities, exactly the pod's env. Secrets go in as `-e NAME` only, never in the image, argv or on disk |
-| `magehand setup [--undo] [--dns ADDRESS]` | Once per machine: GitHub, the container runtime, `*.lab` name resolution (the only step that may ask for your password), sign-in |
-| `magehand skill [--install]` | The `homelab-app` skill: tells Claude Code and Codex to use `app`, `guide search` and `check` while working on app code. `setup` installs it (`$CLAUDE_CONFIG_DIR` or `~/.claude`, and `$CODEX_HOME` or `~/.codex` if Codex is installed) |
-| `magehand runtime [docker\|podman\|none\|auto]` | The container runtime for local `postgres`/`redis` blocks and `run --container`. Detected without sudo (`<cli> info`): the `docker` CLI of Docker Desktop, OrbStack, Colima or Rancher Desktop (dockerd), or Podman; Rancher Desktop in containerd mode is explained, not supported. Automatic picks the first running one; `magehand runtime docker` (or `podman`) pins one, `none` turns containers off ( no containers; `magehand run -- CMD` still works for apps whose blocks are llm and secret only); `MAGEHAND_RUNTIME` overrides. Saved in `~/.config/magehand/config.json` |
-| `magehand doctor` | Checks GitHub access, that `openbao.lab` is reachable, the sign-in, and shows the container runtime (missing is fine unless the app has database blocks) |
-| `magehand upgrade` | Upgrades magehand the way it was installed (`uv tool upgrade`, `pipx upgrade` or pip in its venv) and refreshes the `homelab-app` skill if you installed it. Never automatic: a release runs on your Mac, so you run it. Every other command prints a one-line notice (stderr, at most once a day, never in CI or scripts) when a newer version is tagged on GitHub; `MAGEHAND_NO_UPDATE_CHECK=1` turns it off. OpenClaw's VM refuses it: its version is pinned in homelab `platform/openclaw/vm/versions.env` |
-| `magehand version` | The installed version, and whether a newer one exists |
+| `magehand dev [up\|down\|status] [APP]` | Containers for the app's `postgres`/`redis` blocks (the blocks' own pinned images) on a per-app network, and local values for `secret` blocks. `down` deletes the local data |
+| `magehand runtime [docker\|podman\|none\|auto] [--json]` | Shows or sets the container runtime for `dev` and `run --container`. Detected without sudo (`<cli> info`): the `docker` CLI of Docker Desktop, OrbStack, Colima or Rancher Desktop (dockerd), or Podman. `auto` (the default) uses the first running one; `none` means no containers (`magehand run -- CMD` still works for apps whose blocks are only `llm` and `secret`) |
+| `magehand login` | Signs in to OpenBao through authentik (passkey) with role `dev`: read-only access to agent apps' LiteLLM keys, 1h (8h max). The token is kept in the macOS Keychain |
+
+**This machine**
+
+| Command | What it does |
+| --- | --- |
+| `magehand setup [--dns ADDRESS] [--undo]` | Once per machine: GitHub, the container runtime, `*.lab` name resolution (the only step that may ask for your password; without a terminal, pass `--dns`), sign-in, the skill |
+| `magehand doctor [--json]` | Checks GitHub access, that `openbao.lab` is reachable and the sign-in; shows the container runtime (missing is fine unless the app has database blocks) |
+| `magehand upgrade` | Upgrades magehand the way it was installed (`uv tool upgrade`, `pipx upgrade` or pip in its venv) and refreshes the skill if you installed it. Never automatic: you run it when a command tells you (stderr, at most once a day, never in CI or scripts) that a newer version is out. In OpenClaw's VM it refuses: that copy is pinned in homelab `platform/openclaw/vm/versions.env` |
+| `magehand skill [--install]` | The `homelab-app` skill, which tells Claude Code and Codex to use `app`, `guide search` and `check` while working on app code. `setup` installs it (`$CLAUDE_CONFIG_DIR` or `~/.claude`, and `$CODEX_HOME` or `~/.codex` if Codex is installed) |
+| `magehand version`, `magehand -V` | The installed version, and whether a newer one exists |
+
+**Everywhere:** `-a/--app APP` names the app (default: the app repo you're
+in); `--json` prints JSON for scripts and agents; exit status 0 is success,
+1 a failure (or `check` errors), 2 a usage error (with a "did you mean"),
+130 Ctrl-C. Messages go to stderr, results to stdout.
+
+**Settings**, highest first: flags, then environment variables, then
+`~/.config/magehand/config.json` (written by `magehand runtime`).
+
+| Variable | Effect |
+| --- | --- |
+| `MAGEHAND_RUNTIME` | `docker`, `podman` or `none` (overridden by `--runtime`) |
+| `MAGEHAND_NO_UPDATE_CHECK` | Set: no new-version notice |
+| `MAGEHAND_APPS_DIR` | Read this homelab-apps checkout instead of GitHub (`check --apps-dir` sets it) |
+| `MAGEHAND_PROXY_PORT` | The identity proxy's port (default 8080) |
+| `GITHUB_TOKEN`, `GH_TOKEN` | GitHub access (else `gh auth token`) |
 
 ## Development
 
