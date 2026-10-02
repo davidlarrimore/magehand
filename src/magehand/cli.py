@@ -18,10 +18,13 @@ the MacBook) and by OpenClaw's coding workers:
   magehand run --container [--no-build] [-- CMD...]
                                 build the repo's Dockerfile and run the image as
                                 its pod runs (read-only, non-root, no capabilities)
-  magehand setup [--undo]       once per machine: GitHub, Docker, *.lab names, sign-in,
+  magehand setup [--undo]       once per machine: GitHub, container runtime, *.lab names, sign-in,
                                 the homelab-app skill for coding agents
   magehand skill [--install]    that skill (when Claude Code and Codex use magehand)
-  magehand doctor               check GitHub access, homelab reach, login, Docker
+  magehand runtime [use docker|podman|none | auto]
+                                the container runtime for local blocks and --container
+                                (detected: Docker Desktop, OrbStack, Colima, Rancher, Podman)
+  magehand doctor               check GitHub access, homelab reach, login, container runtime
   magehand upgrade              upgrade magehand (uv, pipx or pip, as installed) and its skill;
                                 any command says once a day when a new version is out
   magehand version              this version, and whether a newer one exists
@@ -403,12 +406,144 @@ def cmd_app(args):
             print(f'  {entry[0]} <- block {entry[1]} ({entry[2]}) key {entry[3]}')
 
 
-# --- local containers -------------------------------------------------------------
+# --- the container runtime: what runs local blocks and `run --container` -------------
+# magehand drives a docker-compatible CLI: `docker` (Docker Desktop, OrbStack,
+# Colima, Rancher Desktop with dockerd) or `podman`. Detection only runs
+# `<cli> info`, as the user (no sudo). `magehand runtime use ...` pins the choice;
+# `none` means no containers: `magehand run` still works for apps whose blocks
+# are llm and secret only.
 
-def docker(*args, check=True):
-    if not shutil.which('docker'):
-        die('docker is required for local blocks (Docker Desktop, OrbStack or colima)')
-    return subprocess.run(['docker', *args], capture_output=True, text=True, check=check)  # nosec B603 B607
+RUNTIMES = ('docker', 'podman')
+CONFIG = pathlib.Path(os.environ.get('XDG_CONFIG_HOME', HOME / '.config')) / 'magehand' / 'config.json'
+DOCKER_PRODUCTS = (('orbstack', 'OrbStack'), ('colima', 'Colima'), ('rancher-desktop', 'Rancher Desktop'),
+                   ('desktop-linux', 'Docker Desktop'))
+SUPPORTED = 'Docker Desktop, OrbStack, Colima, Rancher Desktop (dockerd) or Podman'
+_runtime = []  # memo: [cli or None]
+
+
+def quiet(cmd, timeout=10):
+    """A read-only probe; None if the command is missing or hangs."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603  # fixed probes
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def docker_product(context, os_name=''):
+    for key, label in DOCKER_PRODUCTS:
+        if key in context:
+            return label
+    return 'Docker Desktop' if 'Docker Desktop' in os_name else 'Docker'
+
+
+def detect_runtimes():
+    """[{cli, product, running, hint}] for the container CLIs on PATH."""
+    found = []
+    if shutil.which('docker'):
+        ctx = quiet(['docker', 'context', 'show'])
+        context = ctx.stdout.strip() if ctx and ctx.returncode == 0 else ''
+        info = quiet(['docker', 'info', '--format', '{{.OperatingSystem}}'])
+        running = bool(info and info.returncode == 0)
+        product = docker_product(context, info.stdout if running else '')
+        hint = {'Colima': '`colima start`', 'Rancher Desktop': 'start Rancher Desktop, with Preferences > '
+                'Container Engine set to dockerd (moby)'}.get(product, f'start {product}')
+        found.append({'cli': 'docker', 'product': product, 'running': running, 'hint': '' if running else hint})
+    if shutil.which('podman'):
+        info = quiet(['podman', 'info', '--format', '{{.Version.Version}}'])
+        running = bool(info and info.returncode == 0)
+        found.append({'cli': 'podman', 'product': 'Podman', 'running': running,
+                      'hint': '' if running else '`podman machine start`'})
+    if shutil.which('nerdctl') and not shutil.which('docker'):
+        found.append({'cli': 'nerdctl', 'product': 'Rancher Desktop (containerd)', 'running': False,
+                      'hint': 'not supported: set Rancher Desktop > Preferences > Container Engine to dockerd (moby)'})
+    return found
+
+
+def configured_runtime():
+    """The user's choice (MAGEHAND_RUNTIME, else `magehand runtime use`), or None for automatic."""
+    value = os.environ.get('MAGEHAND_RUNTIME')
+    if not value:
+        try:
+            value = json.loads(CONFIG.read_text()).get('runtime')
+        except (OSError, ValueError, AttributeError):
+            value = None
+    if value and value not in RUNTIMES + ('none',):
+        die(f'unknown container runtime {value!r} (MAGEHAND_RUNTIME or `magehand runtime use`): '
+            f'{", ".join(RUNTIMES)} or none')
+    return value
+
+
+def choose_runtime(configured, found):
+    """The CLI to use: the configured one, else the first running supported one; None means no containers."""
+    if configured == 'none':
+        return None
+    if configured:
+        return configured
+    return next((f['cli'] for f in found if f['running'] and f['cli'] in RUNTIMES), None)
+
+
+def runtime():
+    if not _runtime:
+        configured = configured_runtime()
+        _runtime.append(choose_runtime(configured, [] if configured else detect_runtimes()))
+    return _runtime[0]
+
+
+def no_runtime(what):
+    configured = configured_runtime()
+    reason = 'set to none (`magehand runtime`)' if configured == 'none' else 'none is running'
+    return (f'{what} needs a container runtime, and {reason}. Supported: {SUPPORTED}; '
+            '`magehand runtime` shows what this machine has. Without one, `magehand run -- CMD` works for apps '
+            'whose blocks are llm and secret only.')
+
+
+def engine(*args, check=True):
+    cli = runtime()
+    if not cli:
+        die(no_runtime('this'))
+    if not shutil.which(cli):
+        die(f'container runtime {cli} is configured but not installed: `magehand runtime auto` or install it')
+    return subprocess.run([cli, *args], capture_output=True, text=True, check=check)  # nosec B603  # docker/podman
+
+
+def save_config(**changes):
+    try:
+        data = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data.update(changes)
+    data = {k: v for k, v in data.items() if v is not None}
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(data, indent=1) + '\n')
+
+
+def runtime_lines(found, configured, chosen):
+    lines = [f"  {f['cli']:7} {f['product']}: {'running' if f['running'] else 'not running -> ' + f['hint']}"
+             for f in found] or ['  none found']
+    how = f'set with `magehand runtime use {configured}`' if configured else 'automatic'
+    lines.append(f"Using: {chosen or 'none (no containers)'} ({how})")
+    return lines
+
+
+def cmd_runtime(args):
+    if args[:1] == ['use'] and len(args) == 2 and args[1] in RUNTIMES + ('none',):
+        if args[1] != 'none' and not shutil.which(args[1]):
+            die(f'{args[1]} is not installed here')
+        save_config(runtime=args[1])
+        print(f'container runtime: {args[1]}' + (' (local postgres/redis blocks and run --container are off)'
+                                                 if args[1] == 'none' else ''))
+        return
+    if args == ['auto']:
+        save_config(runtime=None)
+        print('container runtime: automatic (the first running of docker, podman)')
+        return
+    if args:
+        die(f'usage: magehand runtime [use {"|".join(RUNTIMES)}|none | auto]')
+    configured = configured_runtime()
+    found = detect_runtimes()
+    print('Container runtimes (for local postgres/redis blocks and run --container):')
+    print('\n'.join(runtime_lines(found, configured, choose_runtime(configured, found))))
+    print(f'Supported: {SUPPORTED}. Change: magehand runtime use docker|podman|none, or magehand runtime auto.')
 
 
 def local_state(app_name):
@@ -435,8 +570,12 @@ def cmd_dev(args):
     app = load_app(args[1] if len(args) > 1 else current_app())
     state = local_state(app['name'])
     network = f'magehand-{app["name"]}'
-    if action == 'up':  # blocks and `run --container` share it, like a namespace
-        docker('network', 'create', network, check=False)
+    contained = [b for b, svc in app['services'].items() if (svc or {}).get('type') in ('postgres', 'redis')]
+    cli = runtime() if contained else None
+    if action == 'up' and contained and not cli:
+        die(no_runtime(f'the local {", ".join(contained)} block' + ('s' if len(contained) > 1 else '')))
+    if action == 'up' and cli:  # blocks and `run --container` share it, like a namespace
+        engine('network', 'create', network, check=False)
     for block, svc in app['services'].items():
         kind = (svc or {}).get('type')
         container = f'magehand-{app["name"]}-{block}'
@@ -444,37 +583,43 @@ def cmd_dev(args):
             state.setdefault(block, {'value': secrets.token_urlsafe(36)[:48]})
         if kind not in ('postgres', 'redis'):
             continue
+        if not cli:
+            print(f'{block} ({kind}): no container runtime')
+            continue
         if action == 'down':
-            docker('rm', '-f', '-v', container, check=False)
+            engine('rm', '-f', '-v', container, check=False)
             state.pop(block, None)
             print(f'{block}: removed')
             continue
-        running = docker('inspect', '-f', '{{.State.Running}}', container, check=False).stdout.strip() == 'true'
+        running = engine('inspect', '-f', '{{.State.Running}}', container, check=False).stdout.strip() == 'true'
         if action == 'status':
             print(f'{block} ({kind}): {"running" if running else "not running"}')
             continue
         if not running:
             password = state.get(block, {}).get('password') or secrets.token_urlsafe(24)
-            docker('rm', '-f', container, check=False)
+            engine('rm', '-f', container, check=False)
             if kind == 'postgres':
-                docker('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::5432',
+                engine('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::5432',
                        '-e', 'POSTGRES_USER=app',
                        '-e', 'POSTGRES_DB=app', '-e', f'POSTGRES_PASSWORD={password}', block_image(kind, svc))
             else:
-                docker('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::6379',
+                engine('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::6379',
                        block_image(kind, svc),
                        'valkey-server', '--requirepass', password, '--maxmemory', '200mb',
                        '--maxmemory-policy', 'allkeys-lru', '--appendonly', 'yes')
             state[block] = {'password': password}
         inner = '5432' if kind == 'postgres' else '6379'
-        port = docker('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
+        port = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
         state[block]['port'] = port
         print(f'{block} ({kind}): 127.0.0.1:{port}')
     if action == 'up':
         save_local_state(app['name'], state)
+        if not contained:
+            print('no postgres/redis blocks: nothing to start (llm keys come from OpenBao when the app runs)')
     elif action == 'down':
         (STATE / f'{app["name"]}.json').unlink(missing_ok=True)
-        docker('network', 'rm', network, check=False)
+        if cli:
+            engine('network', 'rm', network, check=False)
     elif action != 'status':
         die('usage: magehand dev up|down|status [app]')
 
@@ -650,15 +795,18 @@ def cmd_run(args):
         print(f'magehand: open http://127.0.0.1:{PROXY_PORT} (signed in as '
               f'{identity().get("email") or "local"}; the app itself listens on {port})', file=sys.stderr)
     if container:
+        cli = runtime()
+        if not cli:
+            die(no_runtime('run --container'))
         image = f'magehand/{app["name"]}:local'
         if build:
-            print(f'magehand: docker build -t {image} .', file=sys.stderr)
-            if subprocess.run(['docker', 'build', '-t', image, '.']).returncode:  # nosec B603 B607
-                die('docker build failed')
-        docker('network', 'create', f'magehand-{app["name"]}', check=False)
-        docker('rm', '-f', f'magehand-{app["name"]}-app', check=False)
+            print(f'magehand: {cli} build -t {image} .', file=sys.stderr)
+            if subprocess.run([cli, 'build', '-t', image, '.']).returncode:  # nosec B603  # docker/podman
+                die(f'{cli} build failed')
+        engine('network', 'create', f'magehand-{app["name"]}', check=False)
+        engine('rm', '-f', f'magehand-{app["name"]}-app', check=False)
         port = int(env.get('PORT') or app_port(app))
-        args = ['docker', *container_args(app, env, image, port, lab_hosts(env), args)]
+        args = [cli, *container_args(app, env, image, port, lab_hosts(env), args)]
     child = subprocess.Popen(args, env={**os.environ, **env})  # nosec B603  # the user's own command
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda s, _f: child.send_signal(s))
@@ -688,7 +836,13 @@ def cmd_doctor(_args):
     token = saved_token()
     check('signed in to OpenBao', bool(reach and token and bao('GET', 'auth/token/lookup-self', token)[0] == 200),
           '`magehand login`')
-    check('docker (for postgres/redis blocks)', bool(shutil.which('docker')), 'install Docker Desktop or OrbStack')
+    configured = configured_runtime()
+    found = [] if configured else detect_runtimes()
+    chosen = choose_runtime(configured, found)
+    # Not a failure without one: only postgres/redis blocks and run --container need it.
+    print(f'{"ok  " if chosen else "--  "} container runtime: {chosen or "none"}'
+          + ('' if chosen else f' (needed only for local postgres/redis blocks and run --container: {SUPPORTED};'
+                               ' `magehand runtime`)'))
     sys.exit(0 if ok else 1)
 
 
@@ -1048,8 +1202,12 @@ def cmd_setup(args):
         print('    ok')
     except SystemExit:
         die('sign in to GitHub first: `gh auth login`, then run `magehand setup` again')
-    print('2/5 Docker (only for apps with database blocks)')
-    print('    ok' if shutil.which('docker') else '    not found: install Docker Desktop or OrbStack when you need it')
+    print('2/5 container runtime (only for local postgres/redis blocks and run --container)')
+    configured = configured_runtime()
+    found = detect_runtimes()
+    for line in runtime_lines(found, configured, choose_runtime(configured, found)):
+        print('  ' + line)
+    print(f'    Supported: {SUPPORTED}. Change: magehand runtime use docker|podman|none')
     print(f'3/5 the homelab network (*.{LAB})')
     if reachable():
         print(f'    ok: {host} -> {lab_address(host)}')
@@ -1207,7 +1365,7 @@ def cmd_version(_args):
 
 COMMANDS = {'guide': cmd_guide, 'app': cmd_app, 'check': cmd_check, 'login': cmd_login, 'dev': cmd_dev,
             'run': cmd_run, 'doctor': cmd_doctor, 'setup': cmd_setup, 'skill': cmd_skill, 'version': cmd_version,
-            'upgrade': cmd_upgrade}
+            'upgrade': cmd_upgrade, 'runtime': cmd_runtime}
 
 
 def main():
