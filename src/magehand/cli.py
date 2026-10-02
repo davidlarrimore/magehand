@@ -21,7 +21,7 @@ the MacBook) and by OpenClaw's coding workers:
   magehand setup [--undo]       once per machine: GitHub, container runtime, *.lab names, sign-in,
                                 the homelab-app skill for coding agents
   magehand skill [--install]    that skill (when Claude Code and Codex use magehand)
-  magehand runtime [use docker|podman|none | auto]
+  magehand runtime [docker|podman|none|auto]
                                 the container runtime for local blocks and --container
                                 (detected: Docker Desktop, OrbStack, Colima, Rancher, Podman)
   magehand doctor               check GitHub access, homelab reach, login, container runtime
@@ -409,7 +409,7 @@ def cmd_app(args):
 # --- the container runtime: what runs local blocks and `run --container` -------------
 # magehand drives a docker-compatible CLI: `docker` (Docker Desktop, OrbStack,
 # Colima, Rancher Desktop with dockerd) or `podman`. Detection only runs
-# `<cli> info`, as the user (no sudo). `magehand runtime use ...` pins the choice;
+# `<cli> info`, as the user (no sudo). `magehand runtime docker|podman|none` pins the choice;
 # `none` means no containers: `magehand run` still works for apps whose blocks
 # are llm and secret only.
 
@@ -460,7 +460,7 @@ def detect_runtimes():
 
 
 def configured_runtime():
-    """The user's choice (MAGEHAND_RUNTIME, else `magehand runtime use`), or None for automatic."""
+    """The user's choice (MAGEHAND_RUNTIME, else `magehand runtime NAME`), or None for automatic."""
     value = os.environ.get('MAGEHAND_RUNTIME')
     if not value:
         try:
@@ -468,7 +468,7 @@ def configured_runtime():
         except (OSError, ValueError, AttributeError):
             value = None
     if value and value not in RUNTIMES + ('none',):
-        die(f'unknown container runtime {value!r} (MAGEHAND_RUNTIME or `magehand runtime use`): '
+        die(f'unknown container runtime {value!r} (MAGEHAND_RUNTIME or `magehand runtime NAME`): '
             f'{", ".join(RUNTIMES)} or none')
     return value
 
@@ -520,30 +520,33 @@ def save_config(**changes):
 def runtime_lines(found, configured, chosen):
     lines = [f"  {f['cli']:7} {f['product']}: {'running' if f['running'] else 'not running -> ' + f['hint']}"
              for f in found] or ['  none found']
-    how = f'set with `magehand runtime use {configured}`' if configured else 'automatic'
+    how = f'set with `magehand runtime {configured}`' if configured else 'automatic'
     lines.append(f"Using: {chosen or 'none (no containers)'} ({how})")
     return lines
 
 
 def cmd_runtime(args):
-    if args[:1] == ['use'] and len(args) == 2 and args[1] in RUNTIMES + ('none',):
-        if args[1] != 'none' and not shutil.which(args[1]):
-            die(f'{args[1]} is not installed here')
-        save_config(runtime=args[1])
-        print(f'container runtime: {args[1]}' + (' (local postgres/redis blocks and run --container are off)'
-                                                 if args[1] == 'none' else ''))
-        return
-    if args == ['auto']:
+    args = args[1:] if args[:1] == ['use'] else args  # `runtime use docker` reads naturally too
+    choice = args[0] if len(args) == 1 else None
+    if len(args) > 1 or (args and choice not in RUNTIMES + ('none', 'auto')):
+        die(f'usage: magehand runtime [{"|".join(RUNTIMES)}|none|auto]  (no argument: show what this machine has)')
+    if choice == 'auto':
         save_config(runtime=None)
         print('container runtime: automatic (the first running of docker, podman)')
         return
-    if args:
-        die(f'usage: magehand runtime [use {"|".join(RUNTIMES)}|none | auto]')
+    if choice:
+        if choice != 'none' and not shutil.which(choice):
+            die(f'{choice} is not installed here. Install one of {SUPPORTED} first; '
+                '`magehand runtime` shows what this machine has')
+        save_config(runtime=choice)
+        print(f'container runtime: {choice}' + (' (local postgres/redis blocks and run --container are off)'
+                                               if choice == 'none' else ''))
+        return
     configured = configured_runtime()
     found = detect_runtimes()
     print('Container runtimes (for local postgres/redis blocks and run --container):')
     print('\n'.join(runtime_lines(found, configured, choose_runtime(configured, found))))
-    print(f'Supported: {SUPPORTED}. Change: magehand runtime use docker|podman|none, or magehand runtime auto.')
+    print(f'Supported: {SUPPORTED}. Change: magehand runtime docker|podman|none|auto')
 
 
 def local_state(app_name):
@@ -1207,7 +1210,7 @@ def cmd_setup(args):
     found = detect_runtimes()
     for line in runtime_lines(found, configured, choose_runtime(configured, found)):
         print('  ' + line)
-    print(f'    Supported: {SUPPORTED}. Change: magehand runtime use docker|podman|none')
+    print(f'    Supported: {SUPPORTED}. Change: magehand runtime docker|podman|none')
     print(f'3/5 the homelab network (*.{LAB})')
     if reachable():
         print(f'    ok: {host} -> {lab_address(host)}')

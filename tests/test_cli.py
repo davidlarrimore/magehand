@@ -513,12 +513,14 @@ class Runtimes(unittest.TestCase):
         import io
         self.fake({'podman'}, {})
         with contextlib.redirect_stdout(io.StringIO()):
-            magehand.cmd_runtime(['use', 'podman'])
+            magehand.cmd_runtime(['podman'])  # the way people type it
             self.assertEqual(magehand.configured_runtime(), 'podman')
-            magehand.cmd_runtime(['use', 'none'])
+            magehand.cmd_runtime(['use', 'none'])  # `use` still works
             self.assertEqual(magehand.configured_runtime(), 'none')
-            with self.assertRaises(SystemExit):
-                magehand.cmd_runtime(['use', 'docker'])  # not installed
+            for bad in (['docker'], ['use', 'docker'], ['kubernetes'], ['podman', 'extra']):
+                with self.assertRaises(SystemExit):
+                    magehand.cmd_runtime(bad)  # docker isn't installed in this fake
+            self.assertEqual(magehand.configured_runtime(), 'none')
             magehand.cmd_runtime(['auto'])
         self.assertIsNone(magehand.configured_runtime())
 
