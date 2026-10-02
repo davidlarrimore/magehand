@@ -249,3 +249,136 @@ class ProxyHeaders(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def check_app(env, services=None, image='ghcr.io/davidlarrimore/homelab-apps/demo@sha256:' + 'a' * 64):
+    return {'name': 'demo', 'spec': {}, 'pod': {},
+            'services': services if services is not None else {'ai': {'type': 'llm', 'models': ['m1']}},
+            'container': {'image': image, 'env': env}}
+
+
+CATALOG = {'blocks': {'postgres': {'sizes': ['1Gi', '2Gi']}, 'redis': {}, 'secret': {}, 'llm': {}},
+           'models': [{'id': 'm1'}]}
+
+
+def ref(var, secret, key, **extra):
+    return {'name': var, 'valueFrom': {'secretKeyRef': dict({'name': secret, 'key': key}, **extra)}}
+
+
+def texts(found, level=None):
+    return [f['text'] for f in found if level in (None, f['level'])]
+
+
+class CheckManifests(unittest.TestCase):
+    def test_clean(self):
+        app = check_app([ref('LLM_KEY', 'ai-connection', 'api_key'), {'name': 'PORT', 'value': '8000'}])
+        self.assertEqual(magehand.check_manifests(app, CATALOG), [])
+
+    def test_search_url_needs_search_true(self):
+        app = check_app([ref('SEARCH', 'ai-connection', 'search_url')])
+        self.assertIn('search: true', texts(magehand.check_manifests(app, CATALOG), 'error')[0])
+        app['services']['ai']['search'] = True
+        self.assertEqual(magehand.check_manifests(app, CATALOG), [])
+
+    def test_optional_block_key(self):
+        app = check_app([ref('LLM_KEY', 'ai-connection', 'api_key', optional=True)])
+        self.assertIn('optional: true', texts(magehand.check_manifests(app, CATALOG), 'error')[0])
+
+    def test_secret_that_is_not_a_block(self):
+        app = check_app([ref('X', 'handmade', 'x')])
+        self.assertIn("not a block's", texts(magehand.check_manifests(app, CATALOG), 'error')[0])
+
+    def test_unknown_key(self):
+        app = check_app([ref('DB', 'db-connection', 'url')], services={'db': {'type': 'postgres'}})
+        self.assertIn("no key 'url'", texts(magehand.check_manifests(app, CATALOG), 'error')[0])
+
+    def test_catalog_keys_win(self):
+        catalog = dict(CATALOG, blocks=dict(CATALOG['blocks'], postgres={'keys': ['url']}))
+        app = check_app([ref('DB', 'db-connection', 'url')], services={'db': {'type': 'postgres'}})
+        self.assertEqual(magehand.check_manifests(app, catalog), [])
+
+    def test_model_type_size_and_image(self):
+        app = check_app([], services={'ai': {'type': 'llm', 'models': ['nope']}, 'db': {'type': 'postgres', 'size': '9Gi'},
+                                      'q': {'type': 'kafka'}}, image='nginx:latest')
+        errors = ' | '.join(texts(magehand.check_manifests(app, CATALOG), 'error'))
+        for part in ("model 'nope'", "size '9Gi'", "unknown type 'kafka'", 'image nginx:latest'):
+            self.assertIn(part, errors)
+
+
+class CheckCode(unittest.TestCase):
+    def run_check(self, files, env=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ('Dockerfile', 'ui-check.yaml'):
+                (root / name).write_text('x')
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            return magehand.check_code(root, check_app(list(env)))
+
+    def test_env_the_pod_does_not_set(self):
+        found = self.run_check({'app.py': 'import os\nA = os.environ.get("PORT")\nB = os.environ["FEATURE_X"]\n'},
+                               env=[{'name': 'PORT', 'value': '1'}])
+        self.assertEqual([f['where'] for f in found], ['app.py:3'])
+        self.assertIn('FEATURE_X', found[0]['text'])
+
+    def test_js_env_and_provider_key(self):
+        found = self.run_check({'src/x.ts': 'const k = process.env.OPENAI_API_KEY;\n'})
+        self.assertEqual(texts(found, 'error')[0][:21], 'reads OPENAI_API_KEY:')
+
+    def test_direct_provider_call(self):
+        found = self.run_check({'app.py': 'URL = "https://api.exa.ai/search"\n'})
+        self.assertIn('calls api.exa.ai directly', texts(found, 'error')[0])
+
+    def test_lab_url_only_outside_env_defaults(self):
+        found = self.run_check({'app.py': 'import os\nB = os.environ.get("BASE", "https://llm.lab.davidlarrimore.com/v1")\n'
+                                          'C = "https://llm.lab.davidlarrimore.com/v1"\n'}, env=[{'name': 'BASE', 'value': 'x'}])
+        self.assertEqual([f['where'] for f in found], ['app.py:3'])
+
+    def test_own_auth_and_local_db(self):
+        found = self.run_check({'app.py': 'import bcrypt\nimport sqlite3\ndb = sqlite3.connect("data.db")\n'
+                                          'mem = sqlite3.connect(":memory:")\n'})
+        self.assertEqual([f['where'] for f in found], ['app.py:1', 'app.py:3'])
+
+    def test_tests_and_dependencies_are_skipped(self):
+        found = self.run_check({'tests/test_app.py': 'URL = "https://api.openai.com"\n',
+                                'node_modules/x/index.js': 'fetch("https://api.openai.com")\n',
+                                'web/app.test.js': 'process.env.NOPE\n'})
+        self.assertEqual(found, [])
+
+    def test_missing_build_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            found = magehand.check_code(pathlib.Path(tmp), None)
+        self.assertEqual(sorted(f['where'] for f in found), ['Dockerfile', 'ui-check.yaml'])
+
+
+class GuideSearch(unittest.TestCase):
+    PAGES = {'blocks': 'Intro about blocks.\n\n## Web search\n\nAdd search: true.\n\n## Models\n\nThe models.\n',
+             'README': '# Guide\n\nApps.\n\n## Who the user is\n\nauthentik headers.\n'}
+
+    def test_sections(self):
+        self.assertEqual(magehand.sections(self.PAGES['blocks']),
+                         [('', 'Intro about blocks.'), ('Web search', 'Add search: true.'), ('Models', 'The models.')])
+
+    def test_best_section_first(self):
+        hits = magehand.search_sections(self.PAGES, 'how do I add web search')
+        self.assertEqual((hits[0][1], hits[0][2]), ('blocks', 'Web search'))
+
+    def test_no_match(self):
+        self.assertEqual(magehand.search_sections(self.PAGES, 'kubernetes operators'), [])
+
+
+class Skill(unittest.TestCase):
+    def test_install_claude_and_codex_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claude, codex = pathlib.Path(tmp) / 'claude', pathlib.Path(tmp) / 'codex'
+            codex.mkdir()
+            old = {k: os.environ.get(k) for k in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME')}
+            os.environ.update(CLAUDE_CONFIG_DIR=str(claude), CODEX_HOME=str(codex))
+            try:
+                paths = magehand.install_skill()
+            finally:
+                for k, v in old.items():
+                    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            self.assertEqual(paths, [claude / 'skills/homelab-app/SKILL.md', codex / 'skills/homelab-app/SKILL.md'])
+            self.assertTrue(paths[0].read_text().startswith('---\nname: homelab-app\n'))

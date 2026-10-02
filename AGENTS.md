@@ -10,5 +10,9 @@
   endpoint.
 - Secrets never touch disk or argv (`-e NAME` for docker, Keychain for the
   token).
+- `check` rules: each is a mistake an app can make about the platform, with a
+  guide section to point at (`see`) and a unit test. Errors only for what
+  certainly breaks; anything heuristic is a warning. When the platform changes
+  a block's keys or options, update `BLOCK_KEYS` (or the catalog's `keys`).
 - Tests: `python -m unittest discover -s tests` (no network, no Docker).
   Update README.md's command table with any command change.
