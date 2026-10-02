@@ -289,7 +289,26 @@ class CheckManifests(unittest.TestCase):
 
     def test_secret_that_is_not_a_block(self):
         app = check_app([ref('X', 'handmade', 'x')])
-        self.assertIn("not a block's", texts(magehand.check_manifests(app, CATALOG), 'error')[0])
+        self.assertIn("neither a block's", texts(magehand.check_manifests(app, CATALOG), 'error')[0])
+
+    def test_secret_from_the_apps_own_externalsecret(self):
+        app = check_app([ref('X', 'handmade', 'x')])
+        app['provided'] = {'handmade'}
+        self.assertEqual(magehand.check_manifests(app, CATALOG), [])
+
+    def test_provided_secrets_reads_base_and_dev(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp) / 'apps/demo/base'
+            base.mkdir(parents=True)
+            (base / 'es.yaml').write_text('kind: ExternalSecret\nmetadata: {name: es}\nspec: {target: {name: api}}\n'
+                                          '---\nkind: Deployment\nmetadata: {name: demo}\n')
+            (pathlib.Path(tmp) / 'apps/demo/dev').mkdir()
+            (pathlib.Path(tmp) / 'apps/demo/dev/s.yaml').write_text('kind: Secret\nmetadata: {name: plain}\n')
+            saved, magehand.APPS_DIR = magehand.APPS_DIR, tmp
+            try:
+                self.assertEqual(magehand.provided_secrets('demo'), {'api', 'plain'})
+            finally:
+                magehand.APPS_DIR = saved
 
     def test_unknown_key(self):
         app = check_app([ref('DB', 'db-connection', 'url')], services={'db': {'type': 'postgres'}})

@@ -774,10 +774,13 @@ def check_manifests(app, catalog):
             continue
         var, secret, key = item.get('name'), ref.get('name'), ref.get('key')
         block, kind = block_of(app, secret)
+        if not block and secret in app.get('provided', ()):
+            continue  # the app's own ExternalSecret (homelab-apps AGENTS.md "Secrets")
         if not block:
-            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: Secret {secret!r} is not a '
-                                 'block\'s, so the pod would wait for it forever. Secrets come only from blocks in '
-                                 'app.yaml (type secret for a generated value)', 'blocks'))
+            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: Secret {secret!r} is neither '
+                                 'a block\'s nor made by an ExternalSecret in the app\'s manifests, so the pod would '
+                                 'wait for it forever. Request a block in app.yaml (type secret for a generated value)',
+                                 'blocks'))
             continue
         if ref.get('optional'):
             found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: optional: true on a block key. '
@@ -861,16 +864,39 @@ def check_code(root, app):
                                  'homelab-apps AGENTS.md "Knowing who the user is"'))
         for match in LOCAL_DB.finditer(text):
             found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', 'a database file: the pod\'s '
-                                 'filesystem is read-only and replaced on every deploy; keep data in a postgres '
-                                 'block (or redis for a cache)', 'blocks'))
+                                 'root filesystem is read-only and replaced on every deploy; keep data in a postgres '
+                                 'block, or on a mounted volume (PVC) if it must be a file',
+                                 'homelab-apps AGENTS.md "Storage and resources"'))
     return found
 
 
+def provided_secrets(name):
+    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets) in base/ and dev/."""
+    names = set()
+    for part in ('base', 'dev'):
+        for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
+            if not file.endswith(('.yaml', '.yml')):
+                continue
+            try:
+                docs = list(yaml.safe_load_all(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or ''))
+            except yaml.YAMLError:
+                continue
+            for doc in docs:
+                if isinstance(doc, dict) and doc.get('kind') == 'ExternalSecret':
+                    names.add(((doc.get('spec') or {}).get('target') or {}).get('name')
+                              or (doc.get('metadata') or {}).get('name'))
+                elif isinstance(doc, dict) and doc.get('kind') == 'Secret':
+                    names.add((doc.get('metadata') or {}).get('name'))
+    return names - {None}
+
+
 def try_load_app(name):
-    """load_app, or None when homelab-apps has no deployment for it yet."""
+    """load_app (with the Secrets its manifests make), or None when homelab-apps has no deployment for it yet."""
     if github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
-    return load_app(name)
+    app = load_app(name)
+    app['provided'] = provided_secrets(name)
+    return app
 
 
 def cmd_check(args):
