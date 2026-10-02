@@ -3,8 +3,13 @@
 The developer CLI for apps on the homelab, used by the owner (Claude Code on
 the MacBook) and by OpenClaw's coding workers:
 
-  magehand guide [topic]        the platform guide for apps (live from homelab-apps)
+  magehand guide [topic ["section"]]
+                                the platform guide for apps (live from homelab-apps)
+  magehand guide search WORDS   the guide sections that answer a question
   magehand app [name]           this app's blocks, env vars and URLs
+  magehand check [name] [--code DIR] [--apps-dir DIR] [--manifests-only]
+                                the platform's rules for this app's code and
+                                deployment (run before every push; CI runs it too)
   magehand login                sign in to OpenBao through authentik (passkey)
   magehand dev up|down|status   local containers for the app's postgres/redis blocks
   magehand run [--no-proxy] -- CMD...
@@ -13,7 +18,9 @@ the MacBook) and by OpenClaw's coding workers:
   magehand run --container [--no-build] [-- CMD...]
                                 build the repo's Dockerfile and run the image as
                                 its pod runs (read-only, non-root, no capabilities)
-  magehand setup [--undo]       once per machine: GitHub, Docker, *.lab names, sign-in
+  magehand setup [--undo]       once per machine: GitHub, Docker, *.lab names, sign-in,
+                                the homelab-app skill for coding agents
+  magehand skill [--install]    that skill (when Claude Code and Codex use magehand)
   magehand doctor               check GitHub access, homelab reach, login, Docker
   magehand version              this version (upgrade: uv tool upgrade magehand)
 
@@ -30,6 +37,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import signal
@@ -60,6 +68,8 @@ PROXY_PORT = int(os.environ.get('MAGEHAND_PROXY_PORT', '8080'))
 NOT_SET_UP = "this machine isn't set up for the homelab: run `magehand setup`"
 RESOLVER = pathlib.Path('/etc/resolver') / LAB
 SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}'}
+# A homelab-apps checkout to read instead of GitHub (CI has one; `magehand check --apps-dir`).
+APPS_DIR = os.environ.get('MAGEHAND_APPS_DIR')
 
 
 def die(msg):
@@ -81,6 +91,13 @@ def github_token():
 
 def github_file(repo, path, required=True):
     """A file on main, cached for offline use; None if it doesn't exist."""
+    if repo == APPS_REPO and APPS_DIR:
+        local = pathlib.Path(APPS_DIR) / path
+        if local.is_file():
+            return local.read_text()
+        if required:
+            die(f'{local} not found')
+        return None
     cached = CACHE / repo / path
     req = urllib.request.Request(
         f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref=main',
@@ -109,6 +126,9 @@ def github_file(repo, path, required=True):
 
 def github_dir(repo, path):
     """Names in a directory on main ([] if it doesn't exist)."""
+    if repo == APPS_REPO and APPS_DIR:
+        local = pathlib.Path(APPS_DIR) / path
+        return sorted(child.name for child in local.iterdir()) if local.is_dir() else []
     req = urllib.request.Request(
         f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref=main',
         headers={'Authorization': f'Bearer {github_token()}', 'Accept': 'application/vnd.github+json',
@@ -278,20 +298,81 @@ def cmd_login(_args):
 
 # --- guide and app --------------------------------------------------------------
 
+STOP_WORDS = {'the', 'and', 'for', 'how', 'can', 'what', 'with', 'app', 'apps', 'does', 'into', 'from', 'this',
+              'that', 'use', 'get', 'add', 'make', 'need', 'want', 'should', 'when', 'why', 'are', 'not', 'you'}
+
+
+def sections(text):
+    """[(heading, body)] of a Markdown page, split at its ## and ### headings (the intro is "")."""
+    out, heading, lines = [], '', []
+    for line in text.splitlines():
+        if re.match(r'#{2,3} ', line):
+            out.append((heading, '\n'.join(lines).strip()))
+            heading, lines = line.lstrip('#').strip(), []
+        else:
+            lines.append(line)
+    out.append((heading, '\n'.join(lines).strip()))
+    return [(h, b) for h, b in out if b]
+
+
+def search_sections(pages, query, limit=3):
+    """The best-matching sections [(score, page, heading, body)] for a free-text query."""
+    terms = [t for t in re.findall(r'[a-z0-9_]+', query.lower()) if len(t) > 2 and t not in STOP_WORDS]
+    scored = []
+    for page, text in pages.items():
+        for heading, body in sections(text):
+            head, low = heading.lower(), body.lower()
+            hits = [t for t in terms if t in head or t in low]
+            if hits:
+                score = len(hits) * 10 + sum(3 * head.count(t) + min(low.count(t), 5) for t in hits)
+                scored.append((score, page, heading, body))
+    return sorted(scored, key=lambda s: -s[0])[:limit]
+
+
+def guide_pages(topics):
+    pages = {t: github_file(APPS_REPO, f'docs/platform/{t}.md') for t in topics}
+    pages['homelab-apps AGENTS.md'] = github_file(APPS_REPO, 'AGENTS.md')
+    return pages
+
+
 def cmd_guide(args):
     topics = [n[:-3] for n in github_dir(APPS_REPO, 'docs/platform') if n.endswith('.md')]
     if not topics:  # before docs/platform exists
         print(github_file(APPS_REPO, 'AGENTS.md'))
         return
     topic = args[0] if args else 'README'
+    if topic == 'search':
+        if len(args) < 2:
+            die('usage: magehand guide search WORDS  (e.g. magehand guide search web search)')
+        hits = search_sections(guide_pages(topics), ' '.join(args[1:]))
+        if not hits:
+            die('nothing in the guide matches; try other words, `magehand guide` for the topics, or ask the owner '
+                '(and say in your PR what you looked for)')
+        for _, page, heading, body in hits:
+            print(f'=== {page}' + (f', "{heading}"' if heading else '') + ' ===')
+            lines = body.splitlines()
+            print('\n'.join(lines[:60]) + (f'\n[... {len(lines) - 60} more lines: magehand guide {page} '
+                                             f'"{heading}"]' if len(lines) > 60 else ''))
+            print()
+        return
     if topic == 'catalog':
         print(github_file(APPS_REPO, 'catalog.yaml'))
         return
     if topic not in topics:
-        die(f'no topic {topic!r}; topics: {", ".join(topics)}, catalog')
-    print(github_file(APPS_REPO, f'docs/platform/{topic}.md'))
+        die(f'no topic {topic!r}; topics: {", ".join(topics)}, catalog; or magehand guide search WORDS')
+    text = github_file(APPS_REPO, f'docs/platform/{topic}.md')
+    if len(args) > 1:  # one section: magehand guide blocks "Web search"
+        want = ' '.join(args[1:]).lower()
+        found = [(h, b) for h, b in sections(text) if h.lower() == want] or \
+                [(h, b) for h, b in sections(text) if want in h.lower()]
+        if not found:
+            die(f'no section {want!r} in {topic}; sections: {", ".join(h for h, _ in sections(text) if h)}')
+        print(f'## {found[0][0]}\n\n{found[0][1]}')
+        return
+    print(text)
     if not args:
-        print(f'\nMore: magehand guide <topic>  ({", ".join(t for t in topics if t != "README")}, catalog)')
+        print(f'\nMore: magehand guide <topic> ["section"]  ({", ".join(t for t in topics if t != "README")}, '
+              'catalog), or magehand guide search WORDS')
 
 
 def cmd_app(args):
@@ -609,6 +690,314 @@ def cmd_doctor(_args):
     sys.exit(0 if ok else 1)
 
 
+# --- check: the platform's rules for an app's code and deployment -------------------
+# Run before every push (the homelab-app skill says so) and in CI (homelab-apps
+# build-app.yaml). Each rule is a mistake an app can make about the platform;
+# every finding names the guide section that explains it. Errors fail (exit 1),
+# warnings are for the author to fix or explain in the PR.
+
+# The keys each block's Secret holds, when catalog.yaml doesn't list them.
+BLOCK_KEYS = {
+    'postgres': {'keys': ['host', 'port', 'username', 'password', 'database', 'uri']},
+    'redis': {'keys': ['host', 'port', 'password', 'uri']},
+    'secret': {'keys': ['value']},
+    'llm': {'keys': ['api_key', 'base_url', 'models', 'search_url'], 'key_options': {'search_url': 'search'}},
+}
+CODE_SUFFIXES = ('.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.go', '.rb', '.php', '.java', '.kt', '.rs')
+SKIP_DIRS = {'.git', 'node_modules', '.venv', 'venv', '__pycache__', 'dist', 'build', '.next', 'vendor', 'target',
+             'tests', 'test', '__tests__', 'spec', 'e2e', 'ui-fixtures', 'fixtures'}
+ENV_READ = re.compile(r'''(?:os\.environ\.get|os\.getenv|environ\.get|os\.Getenv|Deno\.env\.get|ENV\.fetch)\(\s*["']([A-Z][A-Z0-9_]*)["']'''
+                      r'''|(?:os\.environ|process\.env|ENV)\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]'''
+                      r'''|process\.env\.([A-Z][A-Z0-9_]*)''')
+# Set by the runtime or the image, not the pod spec.
+RUNTIME_ENV = {'HOME', 'PATH', 'HOSTNAME', 'USER', 'PWD', 'SHELL', 'LANG', 'LC_ALL', 'TZ', 'TERM', 'TMPDIR',
+               'NODE_ENV', 'PYTHONPATH', 'PYTHONUNBUFFERED', 'CI', 'DEBUG'}
+PROVIDER_HOSTS = ('api.openai.com', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.mistral.ai',
+                  'api.groq.com', 'openrouter.ai', 'api.cohere.com', 'api.cohere.ai', 'api.together.xyz',
+                  'api.perplexity.ai', 'api.deepseek.com', 'api.x.ai', 'api.exa.ai', 'api.tavily.com', 'serpapi.com',
+                  'api.search.brave.com', 'api.bing.microsoft.com', 'customsearch.googleapis.com')
+PROVIDER_KEY = re.compile(r'^(OPENAI|ANTHROPIC|GEMINI|GOOGLE_AI|MISTRAL|GROQ|OPENROUTER|COHERE|TOGETHER|PERPLEXITY|'
+                          r'DEEPSEEK|XAI|EXA|TAVILY|SERPAPI|BRAVE)_[A-Z_]*KEY$')
+OWN_AUTH = re.compile(r'''^\s*(?:import|from)\s+(passlib|bcrypt|argon2|flask_login|flask_security|authlib|jose)\b'''
+                      r'''|require\(\s*["'](bcrypt|bcryptjs|passport[\w-]*|next-auth|jsonwebtoken|express-session)["']\s*\)'''
+                      r'''|from\s+["'](bcrypt|bcryptjs|passport[\w-]*|next-auth|@auth/[\w-]+|jsonwebtoken|express-session)["']''',
+                      re.MULTILINE)
+LOCAL_DB = re.compile(r'''sqlite3\.connect\(\s*(?!["']:memory:)|better-sqlite3|new\s+sqlite3\.Database\(|gorm\.Open\(\s*sqlite''')
+LAB_URL = re.compile(r'https?://[a-z0-9.-]+\.lab\.davidlarrimore\.com')
+
+
+def finding(level, where, text, see):
+    return {'level': level, 'where': where, 'text': text, 'see': see}
+
+
+def block_spec(catalog, kind):
+    """{'keys': [...], 'key_options': {key: option}} for a block type: catalog.yaml's, else built in."""
+    spec = ((catalog or {}).get('blocks') or {}).get(kind) or {}
+    return {'keys': spec.get('keys') or BLOCK_KEYS.get(kind, {}).get('keys') or [],
+            'key_options': spec.get('key_options') or BLOCK_KEYS.get(kind, {}).get('key_options') or {}}
+
+
+def check_manifests(app, catalog):
+    """Rules for homelab-apps apps/<app>/: the blocks requested and the pod's env."""
+    found = []
+    where = f"homelab-apps apps/{app['name']}"
+    blocks = (catalog or {}).get('blocks') or {}
+    models = {m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict)}
+    for name, svc in app['services'].items():
+        svc = svc or {}
+        kind = svc.get('type')
+        if blocks and kind not in blocks:
+            found.append(finding('error', f'{where}/app.yaml', f'block {name}: unknown type {kind!r}; types: '
+                                 f'{", ".join(sorted(blocks))}', 'blocks'))
+            continue
+        options = blocks.get(kind) or {}
+        if svc.get('size') and options.get('sizes') and svc['size'] not in options['sizes']:
+            found.append(finding('error', f'{where}/app.yaml', f'block {name}: size {svc["size"]!r} not offered '
+                                 f'({", ".join(options["sizes"])})', 'blocks'))
+        if kind == 'llm':
+            for model in svc.get('models') or []:
+                if models and model not in models:
+                    found.append(finding('error', f'{where}/app.yaml', f'block {name}: model {model!r} is not in '
+                                         'the catalog (magehand guide catalog)', 'blocks "Models"'))
+            if 'search' in svc and not isinstance(svc['search'], bool):
+                found.append(finding('error', f'{where}/app.yaml', f'block {name}: search must be true or false',
+                                     'blocks "Web search"'))
+    container = app['container']
+    image = container.get('image') or ''
+    if not re.fullmatch(r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name']) + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
+        found.append(finding('error', f'{where}/base/deployment.yaml', f'image {image or "(none)"}: an app runs only '
+                             f'its own image, pinned by digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...)',
+                             'README "How an app is put together"'))
+    for item in container.get('env') or []:
+        ref = ((item.get('valueFrom') or {}).get('secretKeyRef')) or {}
+        if not ref:
+            continue
+        var, secret, key = item.get('name'), ref.get('name'), ref.get('key')
+        block, kind = block_of(app, secret)
+        if not block and secret in app.get('provided', ()):
+            continue  # the app's own ExternalSecret (homelab-apps AGENTS.md "Secrets")
+        if not block:
+            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: Secret {secret!r} is neither '
+                                 'a block\'s nor made by an ExternalSecret in the app\'s manifests, so the pod would '
+                                 'wait for it forever. Request a block in app.yaml (type secret for a generated value)',
+                                 'blocks'))
+            continue
+        if ref.get('optional'):
+            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: optional: true on a block key. '
+                                 'The pod would start with an empty value and keep it for its whole life; use a plain '
+                                 'secretKeyRef (the pod waits until the block is ready)', 'blocks'))
+        spec = block_spec(catalog, kind)
+        if spec['keys'] and key not in spec['keys']:
+            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: block {block} ({kind}) has no '
+                                 f'key {key!r}; keys: {", ".join(spec["keys"])}', 'blocks'))
+        option = spec['key_options'].get(key)
+        if option and (app['services'].get(block) or {}).get(option) is not True:
+            found.append(finding('error', f'{where}/base/deployment.yaml', f'env {var}: key {key} exists only with '
+                                 f'`{option}: true` on block {block}; without it the pod waits forever',
+                                 'blocks "Web search"' if option == 'search' else 'blocks'))
+    for source in container.get('envFrom') or []:
+        found.append(finding('warning', f'{where}/base/deployment.yaml', f'envFrom {source}: map each variable with '
+                             'env + secretKeyRef instead, so `magehand app` and `magehand run` can see it', 'blocks'))
+    return found
+
+
+def code_files(root):
+    for path in sorted(root.rglob('*')):
+        rel = path.relative_to(root)
+        if any(part in SKIP_DIRS or part.startswith('.') for part in rel.parts[:-1]):
+            continue
+        name = rel.name
+        if (path.is_file() and name.endswith(CODE_SUFFIXES) and not name.startswith('test_')
+                and not re.search(r'(_test\.py|\.(test|spec)\.[jt]sx?|_test\.go)$', name)):
+            yield rel, path
+
+
+def line_of(text, index):
+    return text.count('\n', 0, index) + 1
+
+
+def check_code(root, app):
+    """Rules for the app's code (the repo checkout); `app` is None before it has a deployment."""
+    found = []
+    pod_env = {item.get('name') for item in (app['container'].get('env') or [])} if app else set()
+    for name in ('Dockerfile', 'ui-check.yaml'):
+        if not (root / name).is_file():
+            found.append(finding('error', name, 'missing: the build needs it at the repo root',
+                                 'homelab-apps AGENTS.md "Apps with their own repo"'))
+    reported = set()
+    for rel, path in code_files(root):
+        try:
+            text = path.read_text(errors='replace')
+        except OSError:
+            continue
+        defaults = []  # spans of env reads, whose fallback values may name a lab URL
+        for match in ENV_READ.finditer(text):
+            end = text.find(')', match.end())
+            defaults.append((match.start(), end if end != -1 else match.end()))
+            var = next(g for g in match.groups() if g)
+            where = f'{rel}:{line_of(text, match.start())}'
+            if PROVIDER_KEY.match(var):
+                found.append(finding('error', where, f'reads {var}: apps never hold provider keys; AI and web search '
+                                     'go through the llm block (base_url + api_key, search_url)', 'blocks'))
+            elif app and var not in pod_env and var not in RUNTIME_ENV and var not in reported:
+                reported.add(var)
+                found.append(finding('warning', where, f'reads {var}, which the pod doesn\'t set, so the code\'s '
+                                     f'default applies in the cluster. Set it in homelab-apps apps/{app["name"]}/base/'
+                                     'deployment.yaml env (or drop it); local-only values go in .magehand.env',
+                                     'README "What the platform provides"'))
+        for host in PROVIDER_HOSTS:
+            for match in re.finditer(re.escape(host), text):
+                found.append(finding('error', f'{rel}:{line_of(text, match.start())}', f'calls {host} directly: '
+                                     'AI and web search go through the llm block (LiteLLM: base_url, search_url)',
+                                     'blocks'))
+        for match in LAB_URL.finditer(text):
+            if any(start <= match.start() <= end for start, end in defaults):
+                continue
+            found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'hardcoded {match.group(0)}: '
+                                 'read URLs from the env the pod gets (a block\'s base_url/search_url); they differ '
+                                 'locally and in production', 'blocks'))
+        for match in OWN_AUTH.finditer(text):
+            lib = next(g for g in match.groups() if g)
+            found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'{lib}: authentik signs users '
+                                 'in before a request reaches the app; read the X-authentik-* headers instead of '
+                                 'building login, sessions or password storage',
+                                 'homelab-apps AGENTS.md "Knowing who the user is"'))
+        for match in LOCAL_DB.finditer(text):
+            found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', 'a database file: the pod\'s '
+                                 'root filesystem is read-only and replaced on every deploy; keep data in a postgres '
+                                 'block, or on a mounted volume (PVC) if it must be a file',
+                                 'homelab-apps AGENTS.md "Storage and resources"'))
+    return found
+
+
+def provided_secrets(name):
+    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets) in base/ and dev/."""
+    names = set()
+    for part in ('base', 'dev'):
+        for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
+            if not file.endswith(('.yaml', '.yml')):
+                continue
+            try:
+                docs = list(yaml.safe_load_all(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or ''))
+            except yaml.YAMLError:
+                continue
+            for doc in docs:
+                if isinstance(doc, dict) and doc.get('kind') == 'ExternalSecret':
+                    names.add(((doc.get('spec') or {}).get('target') or {}).get('name')
+                              or (doc.get('metadata') or {}).get('name'))
+                elif isinstance(doc, dict) and doc.get('kind') == 'Secret':
+                    names.add((doc.get('metadata') or {}).get('name'))
+    return names - {None}
+
+
+def try_load_app(name):
+    """load_app (with the Secrets its manifests make), or None when homelab-apps has no deployment for it yet."""
+    if github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
+        return None
+    app = load_app(name)
+    app['provided'] = provided_secrets(name)
+    return app
+
+
+def cmd_check(args):
+    global APPS_DIR
+    opts = {'--code': '.', '--apps-dir': None}
+    names, manifests_only = [], False
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg in opts and rest:
+            opts[arg] = rest.pop(0)
+        elif arg == '--manifests-only':
+            manifests_only = True
+        elif arg.startswith('-'):
+            die(f'check: unknown option {arg}; usage: magehand check [NAME] [--code DIR] [--apps-dir DIR] '
+                '[--manifests-only]')
+        else:
+            names.append(arg)
+    if opts['--apps-dir']:
+        APPS_DIR = opts['--apps-dir']
+    name = names[0] if names else current_app()
+    catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
+    app = try_load_app(name)
+    root = pathlib.Path(opts['--code'])
+    found = check_manifests(app, catalog) if app else []
+    if not manifests_only:
+        found += check_code(root, app)
+    print(f'magehand check {name}: code {"(skipped)" if manifests_only else root.resolve()}, deployment '
+          + (f'homelab-apps apps/{name}' if app else 'none yet (code rules only)'))
+    for f in sorted(found, key=lambda f: (f['level'] != 'error', f['where'])):
+        see = f['see'] if f['see'].startswith('homelab-apps') else f"magehand guide {f['see']}"
+        print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> {see}")
+    errors = sum(f['level'] == 'error' for f in found)
+    print(f'{len(found)} finding(s), {errors} error(s)' if found else 'no findings')
+    sys.exit(1 if errors else 0)
+
+
+# --- the skill: when coding agents should ask the platform ------------------------
+
+SKILL_NAME = 'homelab-app'
+SKILL = """---
+name: homelab-app
+description: Use when writing, changing, reviewing or debugging the code or deployment of a homelab app (a repo made from homelab-app-template, with ui-check.yaml and an AGENTS.md pointing to homelab-apps, or homelab-apps apps/<app>/), or when unsure how the homelab gives an app something (database, cache, AI models, web search, secrets, sign-in, env vars, local runs, deploys). Not for tasks that don't touch app code.
+---
+# Building a homelab app
+
+The homelab decides how an app gets databases, AI, web search, secrets,
+sign-in and deploys. Don't rely on habits from other platforms or guess:
+ask the platform, with magehand (installed with `uv tool install magehand`).
+
+1. Before designing or changing behavior: `magehand app` (in the app's repo).
+   It lists the app's blocks, every env var its pod gets and where each comes
+   from, and its URLs. Code reads exactly those variables.
+2. Any "how do I ... on the homelab" question, before answering or coding:
+   `magehand guide search <words>` (e.g. `web search`, `database`,
+   `who is the user`, `env var`, `production`). Read the sections it prints
+   and follow them; `magehand guide` lists the topics.
+3. Before every push: `magehand check`. Fix every error. Fix each warning, or
+   say in the PR why it's fine. Each finding names the guide section to read.
+   CI runs the same check.
+4. Run it as the cluster does: `magehand dev up`, then
+   `magehand run -- <command>` (or `magehand run --container`).
+5. If the guide doesn't answer, say so in the PR or issue (what you searched
+   for) instead of inventing a mechanism; the owner adds it to the guide.
+
+Facts that override habits: no direct calls to AI or search providers (the
+llm block's base_url and search_url); no own login or passwords (authentik
+adds X-authentik-* headers); the root filesystem is read-only (state goes in
+a block); a block key is never `optional: true`; merging code deploys dev by
+itself (never pin images by hand).
+"""
+
+
+def skill_dirs():
+    """Where coding agents on this machine read skills: Claude Code always, Codex if it is installed."""
+    dirs = [pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude') / 'skills']
+    codex = pathlib.Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
+    if codex.is_dir():
+        dirs.append(codex / 'skills')
+    return dirs
+
+
+def install_skill():
+    """Writes the skill (refreshed on every run, so an upgrade of magehand updates it); returns the paths."""
+    paths = []
+    for base in skill_dirs():
+        path = base / SKILL_NAME / 'SKILL.md'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(SKILL)
+        paths.append(path)
+    return paths
+
+
+def cmd_skill(args):
+    if args[:1] == ['--install']:
+        for path in install_skill():
+            print(f'installed {path}')
+        return
+    print(SKILL)
+
+
 # --- setup: once per machine ---------------------------------------------------------
 
 def lab_address(host):
@@ -651,15 +1040,15 @@ def cmd_setup(args):
             subprocess.run(['sudo', 'rm', '-f', str(RESOLVER)], check=True)  # nosec B603 B607
             print(f'removed {RESOLVER}')
         return
-    print('1/4 GitHub')
+    print('1/5 GitHub')
     try:
         github_token()
         print('    ok')
     except SystemExit:
         die('sign in to GitHub first: `gh auth login`, then run `magehand setup` again')
-    print('2/4 Docker (only for apps with database blocks)')
+    print('2/5 Docker (only for apps with database blocks)')
     print('    ok' if shutil.which('docker') else '    not found: install Docker Desktop or OrbStack when you need it')
-    print(f'3/4 the homelab network (*.{LAB})')
+    print(f'3/5 the homelab network (*.{LAB})')
     if reachable():
         print(f'    ok: {host} -> {lab_address(host)}')
     elif sys.platform != 'darwin':
@@ -681,12 +1070,15 @@ def cmd_setup(args):
         else:
             die(f'{host} now resolves via {server} but https still fails; is this Mac on a network that reaches it?')
         print(f'    ok: {host} -> {lab_address(host)} (undo: magehand setup --undo)')
-    print('4/4 sign in')
+    print('4/5 sign in')
     token = saved_token()
     if token and bao('GET', 'auth/token/lookup-self', token)[0] == 200:
         print('    ok (already signed in)')
     else:
         cmd_login([])
+    print('5/5 the homelab-app skill for coding agents (Claude Code, Codex)')
+    for path in install_skill():
+        print(f'    ok: {path}')
     print('Done. Try `magehand app <name>` or, in an app repo, `magehand run -- <command>`.')
 
 
@@ -698,8 +1090,8 @@ def cmd_version(_args):
     print('upgrade: uv tool upgrade magehand')
 
 
-COMMANDS = {'guide': cmd_guide, 'app': cmd_app, 'login': cmd_login, 'dev': cmd_dev, 'run': cmd_run,
-            'doctor': cmd_doctor, 'setup': cmd_setup, 'version': cmd_version}
+COMMANDS = {'guide': cmd_guide, 'app': cmd_app, 'check': cmd_check, 'login': cmd_login, 'dev': cmd_dev,
+            'run': cmd_run, 'doctor': cmd_doctor, 'setup': cmd_setup, 'skill': cmd_skill, 'version': cmd_version}
 
 
 def main():
