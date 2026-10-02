@@ -453,3 +453,81 @@ class StayingCurrent(unittest.TestCase):
             magehand.installed_version, magehand.latest_version, magehand.install_method = saved
             if env is not None:
                 os.environ['CI'] = env
+
+
+class Runtimes(unittest.TestCase):
+    def setUp(self):
+        self.saved = (magehand.shutil.which, magehand.quiet, magehand.CONFIG)
+        os.environ.pop('MAGEHAND_RUNTIME', None)
+        self.tmp = tempfile.TemporaryDirectory()
+        magehand.CONFIG = pathlib.Path(self.tmp.name) / 'config.json'
+
+    def tearDown(self):
+        magehand.shutil.which, magehand.quiet, magehand.CONFIG = self.saved
+        self.tmp.cleanup()
+
+    def fake(self, installed, answers):
+        """installed: CLIs on PATH; answers: {(cli, subcommand): (returncode, stdout)}."""
+        import types
+        magehand.shutil.which = lambda name: f'/usr/bin/{name}' if name in installed else None
+
+        def quiet(cmd, timeout=10):
+            rc, out = answers.get((cmd[0], cmd[1]), (1, ''))
+            return types.SimpleNamespace(returncode=rc, stdout=out)
+        magehand.quiet = quiet
+
+    def test_products(self):
+        self.assertEqual(magehand.docker_product('orbstack'), 'OrbStack')
+        self.assertEqual(magehand.docker_product('colima'), 'Colima')
+        self.assertEqual(magehand.docker_product('rancher-desktop'), 'Rancher Desktop')
+        self.assertEqual(magehand.docker_product('default', 'Docker Desktop'), 'Docker Desktop')
+        self.assertEqual(magehand.docker_product('default', 'Ubuntu 24.04'), 'Docker')
+
+    def test_detects_running_and_stopped(self):
+        self.fake({'docker', 'podman'}, {('docker', 'context'): (0, 'orbstack\n'), ('docker', 'info'): (1, ''),
+                                         ('podman', 'info'): (0, '5.4.0')})
+        found = magehand.detect_runtimes()
+        self.assertEqual([(f['cli'], f['product'], f['running']) for f in found],
+                         [('docker', 'OrbStack', False), ('podman', 'Podman', True)])
+        self.assertEqual(found[0]['hint'], 'start OrbStack')
+        self.assertEqual(magehand.choose_runtime(None, found), 'podman')
+
+    def test_nothing_installed_means_none(self):
+        self.fake(set(), {})
+        self.assertEqual(magehand.detect_runtimes(), [])
+        self.assertIsNone(magehand.choose_runtime(None, []))
+
+    def test_rancher_containerd_is_explained(self):
+        self.fake({'nerdctl'}, {})
+        found = magehand.detect_runtimes()
+        self.assertIn('dockerd (moby)', found[0]['hint'])
+        self.assertIsNone(magehand.choose_runtime(None, found))
+
+    def test_configured_wins_and_none_turns_containers_off(self):
+        found = [{'cli': 'docker', 'product': 'Docker', 'running': True, 'hint': ''}]
+        self.assertEqual(magehand.choose_runtime('podman', found), 'podman')
+        self.assertIsNone(magehand.choose_runtime('none', found))
+
+    def test_use_and_auto(self):
+        import contextlib
+        import io
+        self.fake({'podman'}, {})
+        with contextlib.redirect_stdout(io.StringIO()):
+            magehand.cmd_runtime(['use', 'podman'])
+            self.assertEqual(magehand.configured_runtime(), 'podman')
+            magehand.cmd_runtime(['use', 'none'])
+            self.assertEqual(magehand.configured_runtime(), 'none')
+            with self.assertRaises(SystemExit):
+                magehand.cmd_runtime(['use', 'docker'])  # not installed
+            magehand.cmd_runtime(['auto'])
+        self.assertIsNone(magehand.configured_runtime())
+
+    def test_env_overrides_and_is_validated(self):
+        os.environ['MAGEHAND_RUNTIME'] = 'kubernetes'
+        try:
+            with self.assertRaises(SystemExit):
+                magehand.configured_runtime()
+            os.environ['MAGEHAND_RUNTIME'] = 'docker'
+            self.assertEqual(magehand.configured_runtime(), 'docker')
+        finally:
+            os.environ.pop('MAGEHAND_RUNTIME', None)
