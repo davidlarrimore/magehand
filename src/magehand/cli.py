@@ -1047,6 +1047,11 @@ def line_of(text, index):
     return text.count('\n', 0, index) + 1
 
 
+COMMENT_LINE = re.compile(r'^\s*(#|//|/?\*|--)')
+# A model ID given to a `model` key, argument or constant: certainly the model the code asks for.
+MODEL_ASSIGN = re.compile(r'(?<![a-z])model["\']?\s*[:=]\s*$', re.IGNORECASE)
+
+
 def check_code(root, app, catalog=None):
     """Rules for the app's code (the repo checkout); `app` is None before it has a deployment."""
     found = []
@@ -1082,14 +1087,19 @@ def check_code(root, app, catalog=None):
                                      'README "What the platform provides"'))
         for match in model_re.finditer(text) if model_re and app else ():
             model = match.group(1)
-            if model in requested:
+            line_start = text.rfind('\n', 0, match.start()) + 1
+            before = text[line_start:match.start()]
+            if model in requested or COMMENT_LINE.match(before):
                 continue
             fallback = any(start <= match.start() <= end for start, end in defaults)
-            found.append(finding('warning' if fallback else 'error', f'{rel}:{line_of(text, match.start())}',
+            # A quoted model ID is only certainly a request when it is given to `model`; anywhere else (a
+            # display list, a mapping, a fallback) it is a heuristic match, so a warning.
+            certain = not fallback and MODEL_ASSIGN.search(before)
+            found.append(finding('error' if certain else 'warning', f'{rel}:{line_of(text, match.start())}',
                                  f'model {model} is not requested by an llm block in {app.get("where") or "app.yaml"}'
                                  f'/app.yaml (requested: {", ".join(sorted(requested)) or "none"}): LiteLLM refuses '
-                                 'it (403). Add it to the block\'s models' + (', or drop this fallback' if fallback else ''),
-                                 'blocks "Models"'))
+                                 f'it (403){"" if certain else " if the code calls it"}. Add it to the block\'s models'
+                                 + (', or drop this fallback' if fallback else ''), 'blocks "Models"'))
         for host in PROVIDER_HOSTS:
             for match in re.finditer(re.escape(host), text):
                 found.append(finding('error', f'{rel}:{line_of(text, match.start())}', f'calls {host} directly: '
@@ -1142,7 +1152,7 @@ def provided_secrets(name, root=None):
 def try_load_app(name, root=None):
     """load_app (with the Secrets its manifests make): from `root`'s deploy/ when it has one, else homelab-apps';
     None when neither has a deployment for it yet."""
-    if not deploy_dir(root or '.') and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
+    if not (root and deploy_dir(root)) and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
     app = load_app(name, root)
     app['provided'] = provided_secrets(name, root)
@@ -1157,10 +1167,11 @@ def cmd_check(a):
     name = a.app_flag or a.app or current_app()
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     root = pathlib.Path(a.code)
-    app = try_load_app(name, None if manifests_only else root)
-    found = check_manifests(app, catalog) if app else []
+    # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
+    app = try_load_app(name, root)
+    found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root)
     if not manifests_only:
-        found += check_deploy_files(root) + check_code(root, app, catalog)
+        found += check_code(root, app, catalog)
     errors = sum(f['level'] == 'error' for f in found)
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),

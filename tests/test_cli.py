@@ -449,14 +449,61 @@ class ModelRule(unittest.TestCase):
         self.assertEqual(self.run_check('MODEL = "paid/m2"\n', {'ai': {'type': 'llm', 'models': ['paid/m2']}}), [])
         self.assertEqual(self.run_check("MODEL = 'm1'\n", {'ai': {'type': 'llm'}}), [])
 
-    def test_unrequested_model_is_an_error_a_fallback_a_warning(self):
-        found = self.run_check('import os\nA = "paid/m2"\nB = os.environ.get("M", "paid/m2")\n',
-                               {'ai': {'type': 'llm', 'models': ['m1']}})
-        self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'app.py:2'), ('warning', 'app.py:3')])
-        self.assertIn('LiteLLM refuses it (403)', found[0]['text'])
+    def test_unrequested_model_given_to_model_is_an_error(self):
+        code = ('r = client.chat(model="paid/m2")\nbody = {"model": "paid/m2"}\nCHAT_MODEL = \'paid/m2\'\n'
+                'remodel = "paid/m2"\n')
+        found = self.run_check(code, {'ai': {'type': 'llm', 'models': ['m1']}})
+        self.assertEqual([(f['level'], f['where']) for f in found],
+                         [('error', 'app.py:1'), ('error', 'app.py:2'), ('error', 'app.py:3'), ('warning', 'app.py:4')])
+        self.assertIn('LiteLLM refuses it (403).', found[0]['text'])
+
+    def test_other_mentions_are_warnings_comments_ignored(self):
+        # Heuristic matches are warnings (AGENTS.md): a display list, a fallback; comments are not code.
+        code = ('import os\nCHOICES = ["paid/m2", "m1"]\nB = os.environ.get("M", "paid/m2")\n'
+                '# Previously used "paid/m2"\n    // was "paid/m2"\n')
+        found = self.run_check(code, {'ai': {'type': 'llm', 'models': ['m1']}})
+        self.assertEqual([(f['level'], f['where']) for f in found], [('warning', 'app.py:2'), ('warning', 'app.py:3')])
+        self.assertIn('if the code calls it', found[0]['text'])
+        self.assertIn('drop this fallback', found[1]['text'])
 
     def test_no_llm_block(self):
-        self.assertIn('requested: none', texts(self.run_check('M = "m1"\n', {}), 'error')[0])
+        self.assertIn('requested: none', texts(self.run_check('model = "m1"\n', {}), 'error')[0])
+
+
+class ManifestsOnly(unittest.TestCase):
+    """check --manifests-only: the deployment (the checkout's deploy/ when it has one), not the code."""
+
+    def check(self, root, apps):
+        code, out, _ = CommandLine.run_main(self, 'check', 'demo', '--code', str(root), '--apps-dir', apps,
+                                            '--manifests-only', '--json')
+        return code, json.loads(out)
+
+    def test_local_deploy_without_a_homelab_apps_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as apps:
+            root = deploy_repo(tmp, extra={'deploy/prod/kustomization.yaml': 'x', 'app.py': 'model = "nope"\n'})
+            code, result = self.check(root, apps)
+        self.assertEqual((result['deployment'], result['code']), ('deploy', None))
+        self.assertEqual([f['where'] for f in result['findings'] if f['level'] == 'error'],
+                         ['deploy/prod/kustomization.yaml'])  # deploy/ files checked; app.py (code) not
+        self.assertEqual(code, 1)
+
+    def test_local_deploy_wins_over_the_homelab_apps_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as apps:
+            deploy_repo(pathlib.Path(apps) / 'apps/demo')  # homelab-apps' copy: apps/demo/deploy/... is not it
+            (pathlib.Path(apps) / 'apps/demo/app.yaml').write_text('services: {}\n')
+            (pathlib.Path(apps) / 'apps/demo/base').mkdir()
+            (pathlib.Path(apps) / 'apps/demo/base/deployment.yaml').write_text(DEPLOYMENT)
+            _, result = self.check(deploy_repo(tmp), apps)
+        self.assertEqual(result['deployment'], 'deploy')
+
+    def test_homelab_apps_ci_unchanged(self):
+        # homelab-apps CI: run from its checkout (no deploy/ at the top), the deployment is apps/<app>/.
+        with tempfile.TemporaryDirectory() as apps:
+            (pathlib.Path(apps) / 'apps/demo/base').mkdir(parents=True)
+            (pathlib.Path(apps) / 'apps/demo/app.yaml').write_text('services: {}\n')
+            (pathlib.Path(apps) / 'apps/demo/base/deployment.yaml').write_text(DEPLOYMENT)
+            _, result = self.check(pathlib.Path(apps), apps)
+        self.assertEqual(result['deployment'], 'homelab-apps apps/demo')
 
 
 class GuideSearch(unittest.TestCase):
