@@ -449,25 +449,20 @@ class ModelRule(unittest.TestCase):
         self.assertEqual(self.run_check('MODEL = "paid/m2"\n', {'ai': {'type': 'llm', 'models': ['paid/m2']}}), [])
         self.assertEqual(self.run_check("MODEL = 'm1'\n", {'ai': {'type': 'llm'}}), [])
 
-    def test_unrequested_model_given_to_model_is_an_error(self):
-        code = ('r = client.chat(model="paid/m2")\nbody = {"model": "paid/m2"}\nCHAT_MODEL = \'paid/m2\'\n'
-                'remodel = "paid/m2"\n')
+    def test_unrequested_models_are_warnings_comments_ignored(self):
+        # Text can't prove a call (AGENTS.md: anything heuristic is a warning), so none of these fail check;
+        # whole-line comments aren't reported at all.
+        code = ('import os\nr = client.chat(model="paid/m2")\nDISPLAY = {"model": "paid/m2", "available": False}\n'
+                'B = os.environ.get("M", "paid/m2")\n"""client.chat(model="paid/m2")"""\n'
+                'x = 1  # Previously model="paid/m2"\n# Previously used "paid/m2"\n    // was "paid/m2"\n')
         found = self.run_check(code, {'ai': {'type': 'llm', 'models': ['m1']}})
         self.assertEqual([(f['level'], f['where']) for f in found],
-                         [('error', 'app.py:1'), ('error', 'app.py:2'), ('error', 'app.py:3'), ('warning', 'app.py:4')])
-        self.assertIn('LiteLLM refuses it (403).', found[0]['text'])
-
-    def test_other_mentions_are_warnings_comments_ignored(self):
-        # Heuristic matches are warnings (AGENTS.md): a display list, a fallback; comments are not code.
-        code = ('import os\nCHOICES = ["paid/m2", "m1"]\nB = os.environ.get("M", "paid/m2")\n'
-                '# Previously used "paid/m2"\n    // was "paid/m2"\n')
-        found = self.run_check(code, {'ai': {'type': 'llm', 'models': ['m1']}})
-        self.assertEqual([(f['level'], f['where']) for f in found], [('warning', 'app.py:2'), ('warning', 'app.py:3')])
-        self.assertIn('if the code calls it', found[0]['text'])
-        self.assertIn('drop this fallback', found[1]['text'])
+                         [('warning', f'app.py:{n}') for n in (2, 3, 4, 5, 6)])
+        self.assertIn('LiteLLM refuses it (403) if the code calls it', found[0]['text'])
+        self.assertIn('drop this fallback', found[2]['text'])
 
     def test_no_llm_block(self):
-        self.assertIn('requested: none', texts(self.run_check('model = "m1"\n', {}), 'error')[0])
+        self.assertIn('requested: none', texts(self.run_check('model = "m1"\n', {}), 'warning')[0])
 
 
 class ManifestsOnly(unittest.TestCase):

@@ -1048,8 +1048,6 @@ def line_of(text, index):
 
 
 COMMENT_LINE = re.compile(r'^\s*(#|//|/?\*|--)')
-# A model ID given to a `model` key, argument or constant: certainly the model the code asks for.
-MODEL_ASSIGN = re.compile(r'(?<![a-z])model["\']?\s*[:=]\s*$', re.IGNORECASE)
 
 
 def check_code(root, app, catalog=None):
@@ -1092,13 +1090,12 @@ def check_code(root, app, catalog=None):
             if model in requested or COMMENT_LINE.match(before):
                 continue
             fallback = any(start <= match.start() <= end for start, end in defaults)
-            # A quoted model ID is only certainly a request when it is given to `model`; anywhere else (a
-            # display list, a mapping, a fallback) it is a heuristic match, so a warning.
-            certain = not fallback and MODEL_ASSIGN.search(before)
-            found.append(finding('error' if certain else 'warning', f'{rel}:{line_of(text, match.start())}',
+            # A warning: text can't prove the code calls the model (a docstring, a display list, a trailing
+            # comment look the same), and errors are only for what certainly breaks.
+            found.append(finding('warning', f'{rel}:{line_of(text, match.start())}',
                                  f'model {model} is not requested by an llm block in {app.get("where") or "app.yaml"}'
                                  f'/app.yaml (requested: {", ".join(sorted(requested)) or "none"}): LiteLLM refuses '
-                                 f'it (403){"" if certain else " if the code calls it"}. Add it to the block\'s models'
+                                 'it (403) if the code calls it. Add it to the block\'s models'
                                  + (', or drop this fallback' if fallback else ''), 'blocks "Models"'))
         for host in PROVIDER_HOSTS:
             for match in re.finditer(re.escape(host), text):
