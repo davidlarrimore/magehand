@@ -140,6 +140,7 @@ def current_app():
 # deploy/app.yaml (its block requests) and deploy/base/ (its Kustomize base).
 # Merging copies them into homelab-apps apps/<app>/ (homelab app deploy-dev).
 DEPLOY = 'deploy'
+DEPLOY_DIRS = ('base', 'dev', 'prod')
 
 
 def deploy_dir(root):
@@ -1003,22 +1004,41 @@ def check_manifests(app, catalog):
     return found
 
 
-def check_deploy_files(root):
-    """deploy/ holds app.yaml and base/*.yaml only: merging copies exactly those and refuses anything else."""
+def check_deploy_files(root, name=None):
+    """deploy/ holds app.yaml, base/ (the Kustomize base) and the optional overlays dev/ (namespace <app>-dev)
+    and prod/ (namespace <app>, needed for production releases): merging copies exactly those."""
     local = deploy_dir(root)
     if not local:
         return []
     found = []
     for path in sorted(local.rglob('*')):
         rel = path.relative_to(local)
-        if path.is_file() and not (rel.as_posix() == 'app.yaml' or (len(rel.parts) == 2 and rel.parts[0] == 'base'
+        if path.is_file() and not (rel.as_posix() == 'app.yaml' or (len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
                                                                     and rel.suffix in ('.yaml', '.yml'))):
             found.append(finding('error', f'{DEPLOY}/{rel.as_posix()}', 'not deployed: deploy/ holds app.yaml and '
-                                 'base/*.yaml only, and a merge with anything else is not deployed',
+                                 'base/, dev/, prod/ *.yaml only, and a merge with anything else is not deployed',
                                  'README "How an app is put together"'))
     if not any((local / 'base').glob('*.y*ml')):
         found.append(finding('error', f'{DEPLOY}/base', 'missing: the Kustomize base (Deployment, Service, ...) goes here',
                              'README "How an app is put together"'))
+    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
+        path = local / overlay / 'kustomization.yaml'
+        if not name or not path.is_file():
+            continue
+        try:
+            spec = yaml.safe_load(path.read_text()) or {}
+        except yaml.YAMLError as error:
+            spec = f'not YAML: {error}'
+        if not isinstance(spec, dict):
+            found.append(finding('error', f'{DEPLOY}/{overlay}/kustomization.yaml', 'not a Kustomization (a YAML '
+                                 'mapping with namespace and resources)', 'README "How an app is put together"'))
+            continue
+        if spec.get('namespace') != namespace:
+            found.append(finding('error', f'{DEPLOY}/{overlay}/kustomization.yaml', f'namespace must be {namespace} '
+                                 f'(found {spec.get("namespace")!r})', 'README "How an app is put together"'))
+        if '../base' not in (spec.get('resources') or []):
+            found.append(finding('error', f'{DEPLOY}/{overlay}/kustomization.yaml', 'resources must include ../base',
+                                 'README "How an app is put together"'))
     return found
 
 
@@ -1166,7 +1186,7 @@ def cmd_check(a):
     root = pathlib.Path(a.code)
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
     app = try_load_app(name, root)
-    found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root)
+    found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root, name)
     if not manifests_only:
         found += check_code(root, app, catalog)
     errors = sum(f['level'] == 'error' for f in found)
@@ -1201,7 +1221,9 @@ ask the platform, with magehand (installed with `uv tool install magehand`).
    It lists the app's blocks, every env var its pod gets and where each comes
    from, and its URLs. Code reads exactly those variables. If the repo has
    `deploy/`, that is the app's deployment: `deploy/app.yaml` requests blocks
-   and models, `deploy/base/` is its Kubernetes manifests; edit them there.
+   and models, `deploy/base/` is its Kubernetes manifests, `deploy/dev/` and
+   `deploy/prod/` its overlays; edit them there. Merging deploys dev; the
+   owner's GitHub Release `vX.Y.Z` deploys production.
 2. Any "how do I ... on the homelab" question, before answering or coding:
    `magehand guide search <words>` (e.g. `web search`, `database`,
    `who is the user`, `env var`, `production`). Read the sections it prints

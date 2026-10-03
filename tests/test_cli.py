@@ -426,14 +426,24 @@ class DeployDir(unittest.TestCase):
     def test_source_other_image_and_files_deploy_dev_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = deploy_repo(tmp, 'source: {repo: demo}\nservices: {}\n',
-                               {'deploy/prod/kustomization.yaml': 'x', 'deploy/base/README.md': 'x'})
+                               {'deploy/stage/kustomization.yaml': 'x', 'deploy/base/README.md': 'x'})
             (root / 'deploy/base/deployment.yaml').write_text(DEPLOYMENT.replace('homelab-apps/demo', 'homelab-apps/other'))
             app = magehand.try_load_app('demo', root)
             errors = texts(magehand.check_manifests(app, CATALOG_MODELS), 'error')
             self.assertTrue(any('source: is added by the copy' in e for e in errors))
             self.assertTrue(any('without a digest' in e for e in errors))
             self.assertEqual(sorted(f['where'] for f in magehand.check_deploy_files(root)),
-                             ['deploy/base/README.md', 'deploy/prod/kustomization.yaml'])
+                             ['deploy/base/README.md', 'deploy/stage/kustomization.yaml'])
+
+    def test_overlays_and_their_namespaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp, extra={'deploy/dev/kustomization.yaml': 'namespace: demo-dev\nresources: [../base]\n',
+                                           'deploy/prod/kustomization.yaml': 'namespace: demo\nresources: [../base]\n'})
+            self.assertEqual(magehand.check_deploy_files(root, 'demo'), [])
+            (root / 'deploy/prod/kustomization.yaml').write_text('namespace: demo-dev\nresources: [../other]\n')
+            errors = texts(magehand.check_deploy_files(root, 'demo'), 'error')
+            self.assertEqual(len(errors), 2)
+            self.assertIn('namespace must be demo', errors[0])
 
 
 class ModelRule(unittest.TestCase):
