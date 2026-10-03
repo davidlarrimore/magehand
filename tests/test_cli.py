@@ -376,6 +376,131 @@ class CheckCode(unittest.TestCase):
         self.assertEqual(sorted(f['where'] for f in found), ['Dockerfile', 'ui-check.yaml'])
 
 
+CATALOG_MODELS = dict(CATALOG, models=[{'id': 'm1', 'default': True}, {'id': 'paid/m2'}])
+DEPLOYMENT = ('apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: demo}\nspec:\n  template:\n    spec:\n'
+              '      containers:\n        - name: app\n          image: ghcr.io/davidlarrimore/homelab-apps/demo\n'
+              '          env:\n            - {name: PORT, value: "8000"}\n'
+              '            - name: KEY\n              valueFrom: {secretKeyRef: {name: ai-connection, key: api_key}}\n')
+
+
+def deploy_repo(tmp, app_yaml='services:\n  ai: {type: llm, models: [paid/m2]}\n', extra=None):
+    root = pathlib.Path(tmp)
+    (root / 'deploy/base').mkdir(parents=True)
+    (root / 'deploy/app.yaml').write_text(app_yaml)
+    (root / 'deploy/base/deployment.yaml').write_text(DEPLOYMENT)
+    (root / 'deploy/base/es.yaml').write_text('kind: ExternalSecret\nmetadata: {name: x}\nspec: {target: {name: own}}\n')
+    for name, text in (extra or {}).items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    return root
+
+
+class DeployDir(unittest.TestCase):
+    """An app repo with deploy/: magehand reads the app from the checkout, not homelab-apps."""
+
+    def setUp(self):
+        self.saved = magehand.APPS_DIR
+        self.apps = tempfile.TemporaryDirectory()
+        magehand.APPS_DIR = self.apps.name  # homelab-apps: nothing for demo
+        self.addCleanup(setattr, magehand, 'APPS_DIR', self.saved)
+        self.addCleanup(self.apps.cleanup)
+
+    def test_load_app_from_the_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = magehand.try_load_app('demo', deploy_repo(tmp))
+        self.assertEqual((app['where'], app['deployment_file']), ('deploy', 'deploy/base/deployment.yaml'))
+        self.assertEqual(app['services'], {'ai': {'type': 'llm', 'models': ['paid/m2']}})
+        self.assertEqual(app['provided'], {'own'})
+        self.assertEqual(magehand.env_plan(app)[1], ('KEY', 'ai', 'llm', 'api_key'))
+
+    def test_no_deploy_dir_and_no_homelab_apps_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(magehand.try_load_app('demo', pathlib.Path(tmp)))
+
+    def test_clean_unpinned_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = magehand.try_load_app('demo', deploy_repo(tmp))
+            self.assertEqual(magehand.check_manifests(app, CATALOG_MODELS), [])
+            self.assertEqual(magehand.check_deploy_files(pathlib.Path(tmp)), [])
+
+    def test_source_other_image_and_files_deploy_dev_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp, 'source: {repo: demo}\nservices: {}\n',
+                               {'deploy/prod/kustomization.yaml': 'x', 'deploy/base/README.md': 'x'})
+            (root / 'deploy/base/deployment.yaml').write_text(DEPLOYMENT.replace('homelab-apps/demo', 'homelab-apps/other'))
+            app = magehand.try_load_app('demo', root)
+            errors = texts(magehand.check_manifests(app, CATALOG_MODELS), 'error')
+            self.assertTrue(any('source: is added by the copy' in e for e in errors))
+            self.assertTrue(any('without a digest' in e for e in errors))
+            self.assertEqual(sorted(f['where'] for f in magehand.check_deploy_files(root)),
+                             ['deploy/base/README.md', 'deploy/prod/kustomization.yaml'])
+
+
+class ModelRule(unittest.TestCase):
+    def run_check(self, code, services):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ('Dockerfile', 'ui-check.yaml'):
+                (root / name).write_text('x')
+            (root / 'app.py').write_text(code)
+            return magehand.check_code(root, check_app([{'name': 'M', 'value': 'x'}], services), CATALOG_MODELS)
+
+    def test_requested_model_is_fine_default_counts(self):
+        self.assertEqual(self.run_check('MODEL = "paid/m2"\n', {'ai': {'type': 'llm', 'models': ['paid/m2']}}), [])
+        self.assertEqual(self.run_check("MODEL = 'm1'\n", {'ai': {'type': 'llm'}}), [])
+
+    def test_unrequested_models_are_warnings_comments_ignored(self):
+        # Text can't prove a call (AGENTS.md: anything heuristic is a warning), so none of these fail check;
+        # whole-line comments aren't reported at all.
+        code = ('import os\nr = client.chat(model="paid/m2")\nDISPLAY = {"model": "paid/m2", "available": False}\n'
+                'B = os.environ.get("M", "paid/m2")\n"""client.chat(model="paid/m2")"""\n'
+                'x = 1  # Previously model="paid/m2"\n# Previously used "paid/m2"\n    // was "paid/m2"\n')
+        found = self.run_check(code, {'ai': {'type': 'llm', 'models': ['m1']}})
+        self.assertEqual([(f['level'], f['where']) for f in found],
+                         [('warning', f'app.py:{n}') for n in (2, 3, 4, 5, 6)])
+        self.assertIn('LiteLLM refuses it (403) if the code calls it', found[0]['text'])
+        self.assertIn('drop this fallback', found[2]['text'])
+
+    def test_no_llm_block(self):
+        self.assertIn('requested: none', texts(self.run_check('model = "m1"\n', {}), 'warning')[0])
+
+
+class ManifestsOnly(unittest.TestCase):
+    """check --manifests-only: the deployment (the checkout's deploy/ when it has one), not the code."""
+
+    def check(self, root, apps):
+        code, out, _ = CommandLine.run_main(self, 'check', 'demo', '--code', str(root), '--apps-dir', apps,
+                                            '--manifests-only', '--json')
+        return code, json.loads(out)
+
+    def test_local_deploy_without_a_homelab_apps_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as apps:
+            root = deploy_repo(tmp, extra={'deploy/prod/kustomization.yaml': 'x', 'app.py': 'model = "nope"\n'})
+            code, result = self.check(root, apps)
+        self.assertEqual((result['deployment'], result['code']), ('deploy', None))
+        self.assertEqual([f['where'] for f in result['findings'] if f['level'] == 'error'],
+                         ['deploy/prod/kustomization.yaml'])  # deploy/ files checked; app.py (code) not
+        self.assertEqual(code, 1)
+
+    def test_local_deploy_wins_over_the_homelab_apps_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as apps:
+            deploy_repo(pathlib.Path(apps) / 'apps/demo')  # homelab-apps' copy: apps/demo/deploy/... is not it
+            (pathlib.Path(apps) / 'apps/demo/app.yaml').write_text('services: {}\n')
+            (pathlib.Path(apps) / 'apps/demo/base').mkdir()
+            (pathlib.Path(apps) / 'apps/demo/base/deployment.yaml').write_text(DEPLOYMENT)
+            _, result = self.check(deploy_repo(tmp), apps)
+        self.assertEqual(result['deployment'], 'deploy')
+
+    def test_homelab_apps_ci_unchanged(self):
+        # homelab-apps CI: run from its checkout (no deploy/ at the top), the deployment is apps/<app>/.
+        with tempfile.TemporaryDirectory() as apps:
+            (pathlib.Path(apps) / 'apps/demo/base').mkdir(parents=True)
+            (pathlib.Path(apps) / 'apps/demo/app.yaml').write_text('services: {}\n')
+            (pathlib.Path(apps) / 'apps/demo/base/deployment.yaml').write_text(DEPLOYMENT)
+            _, result = self.check(pathlib.Path(apps), apps)
+        self.assertEqual(result['deployment'], 'homelab-apps apps/demo')
+
+
 class GuideSearch(unittest.TestCase):
     PAGES = {'blocks': 'Intro about blocks.\n\n## Web search\n\nAdd search: true.\n\n## Models\n\nThe models.\n',
              'README': '# Guide\n\nApps.\n\n## Who the user is\n\nauthentik headers.\n'}
@@ -609,7 +734,7 @@ class CommandLine(unittest.TestCase):
     def test_app_flag_and_positional_name_the_same_app(self):
         seen = []
         saved = magehand.load_app
-        magehand.load_app = lambda name: seen.append(name) or magehand.die('stop')
+        magehand.load_app = lambda name, root=None: seen.append(name) or magehand.die('stop')
         try:
             self.run_main('app', 'one')
             self.run_main('app', '-a', 'two')
@@ -640,7 +765,7 @@ class CommandLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pathlib.Path(tmp, 'app.py').write_text('URL = "https://api.openai.com"\n')
             saved = magehand.try_load_app, magehand.github_file
-            magehand.try_load_app = lambda name: None
+            magehand.try_load_app = lambda name, root=None: None
             magehand.github_file = lambda repo, path, required=True: None
             try:
                 code, out, _ = self.run_main('check', 'demo', '--code', tmp, '--json')
