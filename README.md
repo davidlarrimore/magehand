@@ -31,6 +31,12 @@ Upgrade with `magehand upgrade` (any command says, at most once a day, when a ne
 `magehand --help` lists them; `magehand COMMAND --help` (or `magehand help
 COMMAND`) explains one, with examples.
 
+**Start an app**
+
+| Command | What it does |
+| --- | --- |
+| `magehand new APP [--json]` | Creates `davidlarrimore/APP` from `homelab-app-template` (private) with `gh`, as you, and invites OpenClaw's bot `davidlarrimore-bot` with write; OpenClaw accepts by itself. Safe to re-run: on an existing repo it only adds the bot, and warns if the repo is public. Its one write, and to GitHub, never the homelab |
+
 **Learn the platform and check an app**
 
 | Command | What it does |

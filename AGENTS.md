@@ -7,7 +7,8 @@
   `match`, no `X | Y` types).
 - It reads and runs locally; it never deploys or writes to the homelab. Keep
   every network call to GitHub and `*.lab`; never add a public homelab
-  endpoint.
+  endpoint. Its one write is `magehand new`: an app's repo on GitHub, as the
+  owner (through `gh`).
 - Secrets never touch disk or argv (`-e NAME` for docker, Keychain for the
   token).
 - `check` rules: each is a mistake an app can make about the platform, with a

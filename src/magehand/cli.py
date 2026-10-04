@@ -4,6 +4,8 @@ The developer CLI for apps on the homelab, used by the owner (Claude Code on
 the MacBook) and by OpenClaw's coding workers. `magehand --help` lists the
 commands; `magehand COMMAND --help` explains each, with examples.
 
+`magehand new` is its one write: an app's repo on GitHub, as the owner.
+
 Private by design: it talks only to GitHub and the private *.lab network,
 never to a public homelab endpoint. Everyday commands assume they can
 connect; `magehand setup` checks that once per machine and, if needed, points
@@ -500,6 +502,67 @@ def cmd_app(a):
             print(f'  {entry[0]} <- Secret {entry[2]} (not a block; magehand run leaves it unset)')
         else:
             print(f'  {entry[0]} <- block {entry[1]} ({entry[2]}) key {entry[3]}')
+
+
+# --- new: start an app's repo --------------------------------------------------------
+# The one write magehand makes, to GitHub as the owner (never to the homelab): the
+# app's private repo from the template, with OpenClaw's bot as a collaborator.
+
+OWNER = APPS_REPO.split('/')[0]
+TEMPLATE_REPO = f'{OWNER}/homelab-app-template'
+BOT = 'davidlarrimore-bot'
+APP_NAME = re.compile(r'^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$')  # homelab-apps validate.yaml
+# Platform Applications (homelab-apps validate.yaml) and the platform's own repos.
+RESERVED = {'argocd', 'authentik', 'cloudflared', 'external-secrets', 'ingress', 'kyverno', 'litellm', 'monitoring',
+            'openbao', 'openclaw', 'agent-app-groups', 'homelab', 'homelab-apps', 'homelab-app-template',
+            'homelab-events', 'magehand'}
+
+
+def gh_cli(*args):
+    """`gh ARGS` as the signed-in user: (exit status, stdout, stderr)."""
+    if not shutil.which('gh'):
+        die('needs the GitHub CLI: `brew install gh`, then `gh auth login`')
+    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60)  # nosec B603 B607
+    return out.returncode, out.stdout, out.stderr.strip()
+
+
+def cmd_new(a):
+    name = a.name
+    if not APP_NAME.match(name):
+        usage('new', f"bad app name '{name}': lowercase letters, digits and dashes, at most 40, "
+                     'starting and ending with a letter or digit')
+    if name in RESERVED:
+        usage('new', f"'{name}' is reserved for the platform; choose another")
+    repo = f'{OWNER}/{name}'
+    code, out, _ = gh_cli('api', f'repos/{repo}', '--jq', '.private')
+    created = code != 0
+    if created:
+        code, _, err = gh_cli('repo', 'create', repo, '--private', '--template', TEMPLATE_REPO)
+        if code != 0:
+            die(f'cannot create {repo}: {err or "gh repo create failed"} (only the owner can; `gh auth status`)')
+        print(f'{repo}: created (private, from {TEMPLATE_REPO})', file=sys.stderr)
+        private = True
+    else:
+        private = out.strip() == 'true'
+        print(f'{repo}: exists' + ('' if private else
+              f'; it is PUBLIC, app repos are private: gh repo edit {repo} --visibility private '
+              '--accept-visibility-change-consequences'), file=sys.stderr)
+    if gh_cli('api', f'repos/{repo}/collaborators/{BOT}')[0] == 0:
+        bot = 'collaborator'
+        print(f'{BOT}: already a collaborator', file=sys.stderr)
+    else:
+        code, _, err = gh_cli('api', '-X', 'PUT', f'repos/{repo}/collaborators/{BOT}', '-f', 'permission=push')
+        if code != 0:
+            die(f'cannot invite {BOT} to {repo}: {err or "gh api failed"}')
+        bot = 'invited'
+        print(f'{BOT}: invited with write; OpenClaw accepts it within about 5 minutes', file=sys.stderr)
+    if a.json:
+        print(json.dumps({'repo': repo, 'created': created, 'private': private, 'bot': bot}, indent=1))
+        return
+    print(f'Next:\n  gh repo clone {repo} && cd {name}\n'
+          '  write the code and deploy/ (`magehand guide search new app`); mock the LLM for now\n'
+          f'  when deploy/ is on main, OpenClaw registers {name} (ask it, or an issue labelled openclaw '
+          f'in {APPS_REPO}); then it has dev and its own LLM key')
 
 
 # --- the container runtime: what runs local blocks and `run --container` -------------
@@ -1607,7 +1670,8 @@ class Parser(argparse.ArgumentParser):
 
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
-GROUPS = (('learn the platform and check an app', ('guide', 'app', 'check')),
+GROUPS = (('start an app', ('new',)),
+          ('learn the platform and check an app', ('guide', 'app', 'check')),
           ('run an app locally', ('run', 'dev', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
@@ -1663,6 +1727,15 @@ def build_parser():
         p.add_argument('--runtime', dest='runtime_flag', choices=RUNTIMES + ('none',),
                        help='container runtime for this run (else MAGEHAND_RUNTIME, then `magehand runtime`)')
 
+    # start an app
+    p = command('new', cmd_new, "create an app's repo (private, from the template) for OpenClaw too",
+                "create an app's private repo from homelab-app-template and invite OpenClaw's bot (write)",
+                'Uses gh as you (only the owner can create the repo). Safe to re-run: on an existing repo it\n'
+                'only invites the bot if needed, and warns if the repo is public. OpenClaw accepts the\n'
+                'invitation by itself; it registers the app once deploy/ is on main.\n\n'
+                'examples:\n  magehand new elvis\n  magehand new elvis --json')
+    p.add_argument('name', metavar='APP', help='the app name, also the repo name')
+    json_option(p)
     # learn the platform and check an app
     p = command('guide', cmd_guide, 'read the platform guide: search it, recipes, a topic', 'read the platform guide for apps (live from homelab-apps docs/platform)',
                 'examples:\n'
