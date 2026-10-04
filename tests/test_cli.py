@@ -113,6 +113,67 @@ class Resolve(unittest.TestCase):
             magehand.resolve_env(bad)
 
 
+class MissingKey(unittest.TestCase):
+    """No dev key in OpenBao: say why (not registered, not deployed, being created) instead of a bare 404."""
+
+    def setUp(self):
+        self.saved = magehand.APPS_DIR, magehand.bao, magehand.valid_token, magehand.local_state
+        self.apps = tempfile.TemporaryDirectory()
+        magehand.APPS_DIR = self.apps.name
+        magehand.bao = lambda *_a, **_k: (404, None)
+        magehand.valid_token = lambda: 'tok'
+        magehand.local_state = lambda _name: LOCAL
+
+    def tearDown(self):
+        magehand.APPS_DIR, magehand.bao, magehand.valid_token, magehand.local_state = self.saved
+        self.apps.cleanup()
+
+    def register(self, app_yaml):
+        (pathlib.Path(self.apps.name) / 'apps/demo').mkdir(parents=True)
+        (pathlib.Path(self.apps.name) / 'apps/demo/app.yaml').write_text(app_yaml)
+
+    def message(self):
+        with self.assertRaises(SystemExit) as ctx:
+            magehand.resolve_env(APP, container=True)
+        return str(ctx.exception.code)
+
+    def test_not_registered(self):
+        text = self.message()
+        self.assertIn("isn't registered", text)
+        self.assertIn('OpenClaw registers', text)
+        self.assertIn("Never use another app's key", text)
+
+    def test_block_not_deployed_yet(self):
+        self.register('services:\n  db: {type: postgres}\n')
+        self.assertIn('not deployed yet', self.message())
+
+    def test_deployed_key_being_created(self):
+        self.register('services:\n  ai: {type: llm}\n')
+        self.assertIn("hasn't created its key yet", self.message())
+
+    def test_key_states(self):
+        self.assertEqual(magehand.llm_key_state('demo', 'ai', None), 'unregistered')
+        self.assertEqual(magehand.llm_key_state('demo', 'ai', {'services': {}}), 'undeployed')
+        self.assertEqual(magehand.llm_key_state('demo', 'ai', {'services': {'ai': {'type': 'llm'}}}), 'deployed')
+
+
+class RunAsAnotherApp(unittest.TestCase):
+    def test_refuses_another_apps_env_in_an_app_checkout(self):
+        saved = magehand.app_repo_here, magehand.load_app
+        magehand.app_repo_here = lambda: 'elvis'
+        magehand.load_app = lambda name, root=None: magehand.die('loaded ' + name)
+        try:
+            parser = magehand.build_parser()
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.cmd_run(parser.parse_args(['run', '-a', 'demo', '--', 'true']))
+            self.assertIn("would use demo's keys", str(ctx.exception.code))
+            with self.assertRaises(SystemExit) as ctx:  # its own name is fine
+                magehand.cmd_run(parser.parse_args(['run', '-a', 'elvis', '--', 'true']))
+            self.assertIn('loaded elvis', str(ctx.exception.code))
+        finally:
+            magehand.app_repo_here, magehand.load_app = saved
+
+
 class Container(unittest.TestCase):
     def test_hardened_and_secrets_by_name_only(self):
         env = {'LLM_KEY': 'sk-secret', 'PORT': '8000'}
@@ -339,6 +400,14 @@ class CheckCode(unittest.TestCase):
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text(text)
             return magehand.check_code(root, check_app(list(env)))
+
+    def test_dotenv_holds_no_secrets(self):
+        found = self.run_check({'.magehand.env': '# local\nWEB_DIR=./web\nKEY=x\nOPENAI_BASE=sk-abcdefgh1234\n'
+                                                 'API_TOKEN=abc\nEMPTY_TOKEN=\n'},
+                               env=[ref('KEY', 'ai-connection', 'api_key')])
+        got = {(f['level'], f['where']) for f in found if f['where'].startswith('.magehand.env')}
+        self.assertEqual(got, {('error', '.magehand.env:3'), ('error', '.magehand.env:4'),
+                               ('warning', '.magehand.env:5')})
 
     def test_env_the_pod_does_not_set(self):
         found = self.run_check({'app.py': 'import os\nA = os.environ.get("PORT")\nB = os.environ["FEATURE_X"]\n'},
