@@ -632,6 +632,11 @@ class New(unittest.TestCase):
                 return ruleset_status, json.dumps(listed), 'HTTP 403' if ruleset_status else ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets/7'):
                 return 0, json.dumps(existing), ''
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis') and '.default_branch' in args:
+                return 0, 'main\n', ''
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis/rules/branches/main'):
+                covered = existing and existing.get('conditions', {}).get('ref_name', {}).get('include') == ['~DEFAULT_BRANCH']
+                return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}] if covered else []), ''
             if args[:3] == ('api', '-X', 'POST'):
                 return ruleset_status, '', 'HTTP 403' if ruleset_status else ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis'):
@@ -963,7 +968,7 @@ class RepoConformance(unittest.TestCase):
 
         def gh(*args, **kw):
             for suffix, answer in answers.items():
-                if args[1].endswith(suffix):
+                if args[1] == 'repos/o/r' + suffix:
                     return answer
             raise AssertionError(args)
         magehand.gh_cli = gh
@@ -972,9 +977,14 @@ class RepoConformance(unittest.TestCase):
 
     GOOD = dict(magehand.RULESET, id=7)
     LISTED = (0, json.dumps([{'id': 7, 'name': 'main: owner approves'}]), '')
+    APPLIED = (0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]), '')  # rules GitHub applies to main
+
+    def answers(self, detail=None, applied=APPLIED, bot=(0, '', '')):
+        return {'/rulesets': self.LISTED, '/rulesets/7': (0, json.dumps(detail or self.GOOD), ''), '': (0, 'main\n', ''),
+                '/rules/branches/main': applied, BOT_PATH: bot}
 
     def test_repo_state(self):
-        ok = self.with_gh({'/rulesets': self.LISTED, '/rulesets/7': (0, json.dumps(self.GOOD), ''), BOT_PATH: (0, '', '')})
+        ok = self.with_gh(self.answers())
         self.assertEqual((ok['ruleset'], ok['bot']), ('ok', True))
         none = self.with_gh({'/rulesets': (0, '[]', ''), BOT_PATH: (1, '', 'gh: Not Found (HTTP 404)')})
         self.assertEqual((none['ruleset'], none['bot']), ('missing', False))
@@ -984,9 +994,25 @@ class RepoConformance(unittest.TestCase):
                      dict(self.GOOD, conditions={'ref_name': {'include': ['refs/heads/dev']}}),
                      dict(self.GOOD, rules=[]),
                      dict(self.GOOD, rules=[{'type': 'pull_request', 'parameters': {'required_approving_review_count': 0}}])):
-            state = self.with_gh({'/rulesets': self.LISTED, '/rulesets/7': (0, json.dumps(weak), ''), BOT_PATH: (0, '', '')})
+            on_dev = weak['conditions']['ref_name']['include'] == ['refs/heads/dev']
+            state = self.with_gh(self.answers(detail=weak, applied=(0, '[]', '') if on_dev else self.APPLIED))
             self.assertEqual(state['ruleset'], 'weak', weak)
             self.assertTrue(state['ruleset_detail'])
+
+    def test_what_github_applies_to_the_default_branch_decides_coverage(self):
+        # ~ALL but excluding main: GitHub applies nothing to main, whatever the patterns look like.
+        excluded = dict(self.GOOD, conditions={'ref_name': {'include': ['~ALL'], 'exclude': ['refs/heads/main']}})
+        state = self.with_gh(self.answers(detail=excluded, applied=(0, '[]', '')))
+        self.assertEqual(state['ruleset'], 'weak')
+        self.assertIn('default branch (main)', state['ruleset_detail'])
+        # An explicit refs/heads/main include is as good as ~DEFAULT_BRANCH.
+        explicit = dict(self.GOOD, conditions={'ref_name': {'include': ['refs/heads/main'], 'exclude': []}})
+        self.assertEqual(self.with_gh(self.answers(detail=explicit))['ruleset'], 'ok')
+        # A rule from some other ruleset does not count.
+        other = (0, json.dumps([{'type': 'pull_request', 'ruleset_id': 99}]), '')
+        self.assertEqual(self.with_gh(self.answers(applied=other))['ruleset'], 'weak')
+        # Unreadable effective rules are unknown, not weak.
+        self.assertIsNone(self.with_gh(self.answers(applied=(1, '', 'HTTP 500')))['ruleset'])
 
     def test_failures_are_unknown_not_missing(self):
         for code, err in ((1, 'HTTP 403: Resource not accessible'), (1, 'HTTP 500'), (1, 'dial tcp: connection refused'),

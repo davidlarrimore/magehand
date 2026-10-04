@@ -542,13 +542,12 @@ RULESET = {
 
 
 def ruleset_problems(ruleset):
-    """Why a ruleset named like ours would not give the approval pause (a list, empty when it would)."""
+    """Why a ruleset named like ours would not give the approval pause (a list, empty when it would): not
+    active, or no approving review. Whether it applies to the default branch is asked of GitHub
+    (ruleset_status), not worked out from its include/exclude patterns."""
     found = []
     if ruleset.get('enforcement') != 'active':
         found.append(f"enforcement is {ruleset.get('enforcement')!r}, not 'active'")
-    include = ((ruleset.get('conditions') or {}).get('ref_name') or {}).get('include') or []
-    if not {'~DEFAULT_BRANCH', '~ALL'} & set(include):
-        found.append('it does not cover the default branch')
     rules = [r for r in ruleset.get('rules') or [] if r.get('type') == 'pull_request']
     if not rules or int((rules[0].get('parameters') or {}).get('required_approving_review_count') or 0) < 1:
         found.append('it does not require an approving review')
@@ -574,6 +573,19 @@ def ruleset_status(repo):
         problems = ruleset_problems(json.loads(out))
     except ValueError:
         return None, 'unreadable answer from GitHub'
+    # The rules GitHub applies to the default branch today (includes, excludes and ref patterns resolved).
+    code, out, err = gh_probe('api', f'repos/{repo}', '--jq', '.default_branch')
+    branch = out.strip()
+    if code == 0 and branch:
+        code, out, err = gh_probe('api', f'repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe="")}')
+    if code != 0 or not branch:
+        return None, err or 'could not read the default branch'
+    try:
+        applied = [r for r in json.loads(out or '[]') if r.get('ruleset_id') == listed[0]['id']]
+    except ValueError:
+        return None, 'unreadable answer from GitHub'
+    if not any(r.get('type') == 'pull_request' for r in applied):
+        problems.append(f'it does not apply to the default branch ({branch})')
     return ('weak', '; '.join(problems)) if problems else ('ok', '')
 
 
