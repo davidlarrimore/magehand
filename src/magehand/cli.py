@@ -1364,6 +1364,46 @@ def cmd_check(a):
     sys.exit(1 if errors else 0)
 
 
+# --- agents: keep a repo's AGENTS.md current -----------------------------------------
+
+APP_HEADING = '## This app'  # the template's AGENTS.md: platform rules above it, the app's own notes from it down
+
+
+def split_agents(text):
+    """(platform part, app part) of an AGENTS.md, split at its "## This app" line; (text, None) without one."""
+    m = re.search(r'^## This app[ \t]*$', text, re.MULTILINE)
+    return (text[:m.start()], text[m.start():]) if m else (text, None)
+
+
+def cmd_agents(a):
+    path = pathlib.Path(a.code) / 'AGENTS.md'
+    template = github_file(TEMPLATE_REPO, 'AGENTS.md')
+    platform, app = split_agents(template)
+    if app is None:
+        die(f'{TEMPLATE_REPO} AGENTS.md has no "{APP_HEADING}" heading; tell the owner')
+    current = path.read_text() if path.is_file() else None
+    if current is None:
+        new = template
+    else:
+        _, own = split_agents(current)
+        if own is None:
+            die(f'{path} has no "{APP_HEADING}" heading, so magehand can\'t tell the platform rules from this app\'s '
+                f'notes. Put the heading above the app\'s own notes (see {TEMPLATE_REPO}), then run it again')
+        new = platform + own
+    changed = new != current
+    if a.json:
+        print(json.dumps({'path': str(path), 'changed': changed, 'written': changed and not a.check}))
+    elif not changed:
+        print(f'{path}: up to date', file=sys.stderr)
+    elif a.check:
+        print(f'{path}: the platform rules are out of date; run `magehand update-agents`', file=sys.stderr)
+    if changed and not a.check:
+        path.write_text(new)
+        if not a.json:
+            print(f'{path}: updated from {TEMPLATE_REPO}; review the diff and commit it', file=sys.stderr)
+    sys.exit(1 if changed and a.check else 0)
+
+
 # --- the skill: when coding agents should ask the platform ------------------------
 
 SKILL_NAME = 'homelab-app'
@@ -1671,7 +1711,7 @@ class Parser(argparse.ArgumentParser):
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new',)),
-          ('learn the platform and check an app', ('guide', 'app', 'check')),
+          ('learn the platform and check an app', ('guide', 'app', 'check', 'update-agents')),
           ('run an app locally', ('run', 'dev', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
@@ -1682,7 +1722,7 @@ class RootParser(Parser):
         lines = [self.format_usage().rstrip(), '', self.description, '']
         for title, names in GROUPS:
             lines.append(f'{title}:')
-            lines += [f'  {name:9} {SHORT[name]}' for name in names]
+            lines += [f'  {name:14} {SHORT[name]}' for name in names]
             lines.append('')
         lines += ['options:', '  -h, --help     show this help and exit', '  -V, --version  print the version and exit',
                   '', self.epilog, '']
@@ -1761,6 +1801,13 @@ def build_parser():
     p.add_argument('--code', default='.', metavar='DIR', help="the app's code (default: .)")
     p.add_argument('--apps-dir', metavar='DIR', help='read this homelab-apps checkout instead of GitHub (CI)')
     p.add_argument('--manifests-only', action='store_true', help='check the deployment only, not the code')
+    json_option(p)
+    p = command('update-agents', cmd_agents, "update this repo's AGENTS.md from the template", "update the platform rules in this repo's AGENTS.md from homelab-app-template",
+                'Replaces everything above the "## This app" heading with the template\'s current text and keeps\n'
+                "the heading and everything below it (the app's own notes). Writes only AGENTS.md; commit it yourself.\n\n"
+                'examples:\n  magehand update-agents\n  magehand update-agents --check          exit 1 if out of date, writes nothing')
+    p.add_argument('--code', default='.', metavar='DIR', help="the app's repo (default: .)")
+    p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
     json_option(p)
     # run it locally
     command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, up to 8h)')
