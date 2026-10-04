@@ -1396,7 +1396,7 @@ def cmd_agents(a):
     elif not changed:
         print(f'{path}: up to date', file=sys.stderr)
     elif a.check:
-        print(f'{path}: the platform rules are out of date; run `magehand agents`', file=sys.stderr)
+        print(f'{path}: the platform rules are out of date; run `magehand update-agents`', file=sys.stderr)
     if changed and not a.check:
         path.write_text(new)
         if not a.json:
@@ -1711,7 +1711,7 @@ class Parser(argparse.ArgumentParser):
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new',)),
-          ('learn the platform and check an app', ('guide', 'app', 'check', 'agents')),
+          ('learn the platform and check an app', ('guide', 'app', 'check', 'update-agents')),
           ('run an app locally', ('run', 'dev', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
@@ -1722,7 +1722,7 @@ class RootParser(Parser):
         lines = [self.format_usage().rstrip(), '', self.description, '']
         for title, names in GROUPS:
             lines.append(f'{title}:')
-            lines += [f'  {name:9} {SHORT[name]}' for name in names]
+            lines += [f'  {name:14} {SHORT[name]}' for name in names]
             lines.append('')
         lines += ['options:', '  -h, --help     show this help and exit', '  -V, --version  print the version and exit',
                   '', self.epilog, '']
@@ -1802,10 +1802,10 @@ def build_parser():
     p.add_argument('--apps-dir', metavar='DIR', help='read this homelab-apps checkout instead of GitHub (CI)')
     p.add_argument('--manifests-only', action='store_true', help='check the deployment only, not the code')
     json_option(p)
-    p = command('agents', cmd_agents, "update this repo's AGENTS.md from the template", "update the platform rules in this repo's AGENTS.md from homelab-app-template",
+    p = command('update-agents', cmd_agents, "update this repo's AGENTS.md from the template", "update the platform rules in this repo's AGENTS.md from homelab-app-template",
                 'Replaces everything above the "## This app" heading with the template\'s current text and keeps\n'
                 "the heading and everything below it (the app's own notes). Writes only AGENTS.md; commit it yourself.\n\n"
-                'examples:\n  magehand agents\n  magehand agents --check          exit 1 if out of date, writes nothing')
+                'examples:\n  magehand update-agents\n  magehand update-agents --check          exit 1 if out of date, writes nothing')
     p.add_argument('--code', default='.', metavar='DIR', help="the app's repo (default: .)")
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
     json_option(p)

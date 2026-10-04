@@ -824,7 +824,7 @@ class Agents(unittest.TestCase):
             try:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     try:
-                        magehand.main(['agents', '--code', tmp, *argv])
+                        magehand.main(['update-agents', '--code', tmp, *argv])
                     except SystemExit as exit_:
                         code = exit_.code if isinstance(exit_.code, int) else 1
             finally:
