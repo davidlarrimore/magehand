@@ -620,9 +620,13 @@ class New(unittest.TestCase):
         self.calls = []
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
-    def fake(self, exists=None, collaborator=False):
-        def gh(*args):
+    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0):
+        def gh(*args, **kw):
             self.calls.append(args)
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets'):
+                return ruleset_status, 'main: owner approves\n' if ruleset else '', 'HTTP 403' if ruleset_status else ''
+            if args[:3] == ('api', '-X', 'POST'):
+                return ruleset_status, '', 'HTTP 403' if ruleset_status else ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis'):
                 return (1, '', 'Not Found') if exists is None else (0, exists + '\n', '')
             if args[:1] == ('api',) and args[1].endswith('/collaborators/davidlarrimore-bot'):
@@ -644,8 +648,28 @@ class New(unittest.TestCase):
         self.assertIn(('api', '-X', 'PUT', 'repos/davidlarrimore/elvis/collaborators/davidlarrimore-bot',
                        '-f', 'permission=push'), self.calls)
 
+    def test_adds_the_approval_ruleset(self):
+        self.fake()
+        self.run_new('elvis')
+        self.assertIn(('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-'), self.calls)
+
+    def test_a_refused_ruleset_warns_and_does_not_fail(self):
+        import contextlib
+        import io
+        self.fake(exists='true', collaborator=True, ruleset_status=1)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_new('elvis')
+        self.assertIn('without a review', err.getvalue())
+
+    def test_ruleset_matches_homelabs_approval_rule(self):
+        rule = magehand.RULESET['rules'][0]['parameters']
+        self.assertEqual((rule['required_approving_review_count'], rule['dismiss_stale_reviews_on_push'],
+                          rule['require_last_push_approval']), (1, True, True))
+        self.assertEqual(magehand.RULESET['bypass_actors'][0]['bypass_mode'], 'pull_request')
+
     def test_rerun_changes_nothing(self):
-        self.fake(exists='true', collaborator=True)
+        self.fake(exists='true', collaborator=True, ruleset=True)
         self.run_new('elvis')
         self.assertFalse([c for c in self.calls if c[0] == 'repo' or '-X' in c])
 
