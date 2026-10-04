@@ -126,12 +126,10 @@ def github_dir(repo, path):
 
 def current_app():
     """The app this checkout is: an app repo is named after its app."""
-    out = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True)  # nosec B603 B607
-    if out.returncode != 0:
+    if subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True).returncode != 0:  # nosec B603 B607
         die('not in a git checkout; pass the app name')
-    name = out.stdout.strip().rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
-    name = name[:-4] if name.endswith('.git') else name
-    if name in ('homelab', 'homelab-apps'):
+    name = checkout_app()
+    if not name:
         die('this is a platform repo; pass the app name')
     return name
 
@@ -169,8 +167,12 @@ def load_app(name, root=None):
         files = [(f'{DEPLOY}/base/{f.name}', f.read_text()) for f in sorted((local / 'base').glob('*.y*ml'))]
     else:
         where = f'homelab-apps apps/{name}'
+        spec = registration(name)
+        if spec is None:
+            die(f'{name} has no deployment yet: no deploy/app.yaml in this checkout and not registered on the platform '
+                f'(no homelab-apps apps/{name}/). Write deploy/app.yaml and deploy/base/ (`magehand guide search '
+                'deploy`); OpenClaw registers the app (ask it on Telegram or in an issue labelled openclaw)')
         files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
-        spec = yaml.safe_load(github_file(APPS_REPO, f'apps/{name}/app.yaml')) or {}
     found = [(path, d) for path, text in files for d in yaml.safe_load_all(text)
              if isinstance(d, dict) and d.get('kind') == 'Deployment']
     if not found:
@@ -185,6 +187,56 @@ def app_here(name=None):
     """load_app for `name` (default: this checkout's app), from this checkout's deploy/ when it is that app's repo."""
     name = name or current_app()
     return load_app(name, repo_root(name))
+
+
+def registration(name):
+    """The app's spec as deployed (homelab-apps apps/<name>/app.yaml on main), or None if it isn't registered."""
+    text = github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False)
+    return None if text is None else (yaml.safe_load(text) or {})
+
+
+def llm_key_state(name, block, deployed):
+    """Where block's dev key stands, from the deployed spec (None: not registered): 'unregistered',
+    'undeployed' (the block isn't on main yet) or 'deployed' (the key exists or is being created)."""
+    if deployed is None:
+        return 'unregistered'
+    return 'deployed' if ((deployed.get('services') or {}).get(block) or {}).get('type') == 'llm' else 'undeployed'
+
+
+def no_llm_key(name, block, path, status):
+    """Why OpenBao has no dev key at `path`, and what to do instead of borrowing another app's."""
+    state = llm_key_state(name, block, registration(name))
+    if state == 'unregistered':
+        why = (f'{name} isn\'t registered on the platform yet (no homelab-apps apps/{name}/), so it has no dev key. '
+               'OpenClaw registers new apps: ask it on Telegram or in an issue labelled openclaw. Until then run '
+               'without the LLM (mock it, as the tests do)')
+    elif state == 'undeployed':
+        why = (f'block {block} is in deploy/app.yaml but not deployed yet: its key is created when the change is '
+               'merged and dev deploys (`magehand app` shows the state). Until then mock the LLM')
+    else:
+        why = (f'block {block} is deployed, but the key broker hasn\'t created its key yet (about 2 minutes after the '
+               'deploy); try again shortly')
+    return (f'cannot read {path} (HTTP {status}): {why}. Never use another app\'s key: its budget and models '
+            'are that app\'s (`magehand guide local-dev`)')
+
+
+def checkout_app():
+    """The app whose repo this checkout is (named after the app), or None outside an app repo."""
+    out = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True)  # nosec B603 B607
+    if out.returncode != 0:
+        return None
+    name = out.stdout.strip().rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
+    name = name[:-4] if name.endswith('.git') else name
+    return None if name in ('homelab', 'homelab-apps') else name
+
+
+def app_repo_here():
+    """The app whose code this checkout is (an app repo has ui-check.yaml or deploy/app.yaml), or None."""
+    top = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)  # nosec B603 B607
+    if top.returncode != 0:
+        return None
+    root = pathlib.Path(top.stdout.strip())
+    return checkout_app() if (root / 'ui-check.yaml').is_file() or deploy_dir(root) else None
 
 
 def block_of(app, secret_name):
@@ -404,6 +456,9 @@ def cmd_app(a):
     app = app_here(a.app_flag or a.app)
     name = app['name']
     source = (app['spec'].get('source') or {}).get('repo') or (name if app['root'] else None)
+    deployed = registration(name) if app['root'] else app['spec']
+    keys = {block: llm_key_state(name, block, deployed)
+            for block, svc in app['services'].items() if (svc or {}).get('type') == 'llm'}
     if a.json:
         env = []
         for entry in env_plan(app):
@@ -415,13 +470,17 @@ def cmd_app(a):
                 env.append({'name': entry[0], 'block': entry[1], 'type': entry[2], 'key': entry[3]})
         print(json.dumps({'name': name, 'code': f'davidlarrimore/{source}' if source or app['root'] else f'homelab-apps apps/{name}/image',
                           'deployment': app['where'], 'dev_url': f'https://{name}-dev.{LAB}',
-                          'port': app_port(app), 'blocks': app['services'], 'env': env}, indent=1))
+                          'port': app_port(app), 'registered': deployed is not None, 'blocks': app['services'],
+                          'llm_keys': keys, 'env': env}, indent=1))
         return
     deployment = ('deploy/ in this repo (merging copies it to homelab-apps apps/%s)' % name if app['root']
                   else app['where'])
     print(f'{name}  (code: {"davidlarrimore/" + source if source else "homelab-apps apps/" + name + "/image"};'
           f' deployment: {deployment})')
     print(f'  dev:      https://{name}-dev.{LAB}')
+    if deployed is None:
+        print(f'  not registered yet (no homelab-apps apps/{name}/): no dev deploy and no LLM key until OpenClaw '
+              'registers it (ask it on Telegram or in an openclaw issue)')
     for preview in github_dir(APPS_REPO, f'previews/{name}'):
         if preview.endswith('.yaml'):
             print(f'  preview:  https://{name}-dev-{preview[:-5]}.{LAB}')
@@ -431,7 +490,8 @@ def cmd_app(a):
               + ' (`magehand guide blocks`)')
     for block, svc in app['services'].items():
         opts = ', '.join(f'{k}={v}' for k, v in (svc or {}).items() if k != 'type')
-        print(f'  {block}: {(svc or {}).get("type")}{"  (" + opts + ")" if opts else ""}')
+        state = {'undeployed': '  not deployed yet: no key until merged', 'unregistered': '  no key: app not registered'}
+        print(f'  {block}: {(svc or {}).get("type")}{"  (" + opts + ")" if opts else ""}{state.get(keys.get(block), "")}')
     print(f'Env (the pod spec; locally: magehand run, app port {app_port(app)}):')
     for entry in env_plan(app):
         if entry[1] == 'value':
@@ -714,8 +774,10 @@ def resolve_env(app, container=False):
                 token = token or valid_token()
                 path = f'apps/data/{app["name"]}-dev/llm-{block}'
                 status, body = bao('GET', path, token)
+                if status == 404:
+                    die(no_llm_key(app['name'], block, path, status))
                 if status != 200:
-                    die(f'cannot read {path} (HTTP {status}); has the broker created the key? (`magehand app`)')
+                    die(f'cannot read {path} (HTTP {status}); `magehand login` and try again')
                 fetched[block] = body['data']['data']
             else:
                 fetched[block] = local_connection(kind, block, local, app['name'] if container else None)
@@ -818,6 +880,10 @@ def cmd_run(a):
     args = a.cmd[1:] if a.cmd[:1] == ['--'] else a.cmd
     if not args and not container:
         usage('run', 'give the command after --, e.g. magehand run -- python app.py (or --container)')
+    here = app_repo_here()
+    if a.app_flag and here and a.app_flag != here:
+        die(f'this checkout is {here}\'s code: running it as {a.app_flag} would use {a.app_flag}\'s keys and budget. '
+            f'Run it as itself (`magehand run -- CMD`); `magehand app` shows what {here} has')
     app = app_here(a.app_flag)
     env = resolve_env(app, container=container)
     print(f'magehand: {app["name"]} env: {", ".join(sorted(env))}', file=sys.stderr)
@@ -917,6 +983,8 @@ OWN_AUTH = re.compile(r'''^\s*(?:import|from)\s+(passlib|bcrypt|argon2|flask_log
                       r'''|from\s+["'](bcrypt|bcryptjs|passport[\w-]*|next-auth|@auth/[\w-]+|jsonwebtoken|express-session)["']''',
                       re.MULTILINE)
 LOCAL_DB = re.compile(r'''sqlite3\.connect\(\s*(?!["']:memory:)|better-sqlite3|new\s+sqlite3\.Database\(|gorm\.Open\(\s*sqlite''')
+SECRET_NAME_RE = re.compile(r'(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$')
+SECRET_VALUE_RE = re.compile(r'^(sk-|ghp_|github_pat_|xox[bp]-|hvs\.)[A-Za-z0-9_-]{8,}')
 LAB_URL = re.compile(r'https?://[a-z0-9.-]+\.lab\.davidlarrimore\.com')
 
 
@@ -1082,6 +1150,7 @@ def check_code(root, app, catalog=None):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
                                  'homelab-apps AGENTS.md "Apps with their own repo"'))
+    found += check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
         try:
@@ -1139,6 +1208,34 @@ def check_code(root, app, catalog=None):
                                  'root filesystem is read-only and replaced on every deploy; keep data in a postgres '
                                  'block, or on a mounted volume (PVC) if it must be a file',
                                  'homelab-apps AGENTS.md "Storage and resources"'))
+    return found
+
+
+def check_dotenv(root, app):
+    """.magehand.env is committed and holds only non-secret, container-only values (paths)."""
+    path = root / '.magehand.env'
+    if not path.is_file():
+        return []
+    from_secrets = {e[0] for e in env_plan(app) if e[1] != 'value'} if app else set()
+    found = []
+    for number, line in enumerate(path.read_text(errors='replace').splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        var, value = (part.strip() for part in line.split('=', 1))
+        value = value.strip('"\'')
+        where = f'.magehand.env:{number}'
+        if var in from_secrets:
+            found.append(finding('error', where, f'sets {var}, which the pod gets from a Secret: magehand run fills '
+                                 'it from OpenBao or a local block. This file is committed and holds no secrets',
+                                 'local-dev'))
+        elif SECRET_VALUE_RE.match(value):
+            found.append(finding('error', where, f'{var} looks like a key or token: this file is committed and holds '
+                                 'no secrets; an app\'s keys come from its own blocks (never another app\'s)',
+                                 'local-dev'))
+        elif value and SECRET_NAME_RE.search(var):
+            found.append(finding('warning', where, f'{var} looks like a secret: this file is committed and holds only '
+                                 'container-only values such as paths; secrets come from blocks', 'local-dev'))
     return found
 
 
@@ -1232,7 +1329,9 @@ ask the platform, with magehand (installed with `uv tool install magehand`).
    say in the PR why it's fine. Each finding names the guide section to read.
    CI runs the same check.
 4. Run it as the cluster does: `magehand dev up`, then
-   `magehand run -- <command>` (or `magehand run --container`).
+   `magehand run -- <command>` (or `magehand run --container`). A new app
+   has no LLM key until it is registered and deployed (`magehand app` says
+   so): mock the LLM until then. Never use another app's key.
 5. If the guide doesn't answer, say so in the PR or issue (what you searched
    for) instead of inventing a mechanism; the owner adds it to the guide.
 
