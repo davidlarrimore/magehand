@@ -634,7 +634,7 @@ class New(unittest.TestCase):
                 return 0, json.dumps(existing), ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis') and '.default_branch' in args:
                 return 0, 'main\n', ''
-            if args[:2] == ('api', 'repos/davidlarrimore/elvis/rules/branches/main'):
+            if args[0] == 'api' and args[1].startswith('repos/davidlarrimore/elvis/rules/branches/main'):
                 covered = existing and existing.get('conditions', {}).get('ref_name', {}).get('include') == ['~DEFAULT_BRANCH']
                 return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}] if covered else []), ''
             if args[:3] == ('api', '-X', 'POST'):
@@ -968,8 +968,8 @@ class RepoConformance(unittest.TestCase):
 
         def gh(*args, **kw):
             for suffix, answer in answers.items():
-                if args[1] == 'repos/o/r' + suffix:
-                    return answer
+                if args[1].split('?')[0] == 'repos/o/r' + suffix:
+                    return answer(args) if callable(answer) else answer
             raise AssertionError(args)
         magehand.gh_cli = gh
         self.addCleanup(setattr, magehand, 'gh_cli', saved)
@@ -1011,6 +1011,15 @@ class RepoConformance(unittest.TestCase):
         # A rule from some other ruleset does not count.
         other = (0, json.dumps([{'type': 'pull_request', 'ruleset_id': 99}]), '')
         self.assertEqual(self.with_gh(self.answers(applied=other))['ruleset'], 'weak')
+        # Our rule on a later page of GitHub's answer still counts; a page that fails is unknown, not weak.
+        others = [{'type': 'pull_request', 'ruleset_id': 99}] * 100
+
+        def pages(last):
+            def answer(args):
+                return (0, json.dumps(others), '') if args[1].endswith('page=1') else last
+            return answer
+        self.assertEqual(self.with_gh(self.answers(applied=pages(self.APPLIED)))['ruleset'], 'ok')
+        self.assertIsNone(self.with_gh(self.answers(applied=pages((1, '', 'HTTP 502'))))['ruleset'])
         # Unreadable effective rules are unknown, not weak.
         self.assertIsNone(self.with_gh(self.answers(applied=(1, '', 'HTTP 500')))['ruleset'])
 

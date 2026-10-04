@@ -554,6 +554,24 @@ def ruleset_problems(ruleset):
     return found
 
 
+def gh_json_pages(path, per_page=100, max_pages=20):
+    """(items, None) from every page of a GitHub list endpoint, or (None, reason) if any page can't be read
+    (no gh, an HTTP error, bad JSON, or more than max_pages pages: never a partial answer)."""
+    items = []
+    for page in range(1, max_pages + 1):
+        code, out, err = gh_probe('api', f'{path}?per_page={per_page}&page={page}')
+        if code != 0:
+            return None, err or 'gh api failed'
+        try:
+            got = json.loads(out or '[]')
+        except ValueError:
+            return None, 'unreadable answer from GitHub'
+        items += got
+        if len(got) < per_page:
+            return items, None
+    return None, f'more than {max_pages * per_page} entries'
+
+
 def ruleset_status(repo):
     """(state, detail) of the repo's approval ruleset: 'ok', 'missing', 'weak' (detail says why) or None when it
     could not be read (no gh, no admin, rate limit, network: detail has the reason)."""
@@ -577,13 +595,12 @@ def ruleset_status(repo):
     code, out, err = gh_probe('api', f'repos/{repo}', '--jq', '.default_branch')
     branch = out.strip()
     if code == 0 and branch:
-        code, out, err = gh_probe('api', f'repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe="")}')
+        rules, err = gh_json_pages(f'repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe="")}')
+        if rules is None:
+            return None, err
     if code != 0 or not branch:
         return None, err or 'could not read the default branch'
-    try:
-        applied = [r for r in json.loads(out or '[]') if r.get('ruleset_id') == listed[0]['id']]
-    except ValueError:
-        return None, 'unreadable answer from GitHub'
+    applied = [r for r in rules if r.get('ruleset_id') == listed[0]['id']]
     if not any(r.get('type') == 'pull_request' for r in applied):
         problems.append(f'it does not apply to the default branch ({branch})')
     return ('weak', '; '.join(problems)) if problems else ('ok', '')
