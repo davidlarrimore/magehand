@@ -24,7 +24,7 @@ runtime` below), makes sure the homelab's `*.lab`
 names resolve (if they don't, it asks for the homelab's DNS address, your home
 gateway, and points only `*.lab` lookups at it; `magehand setup --undo`
 reverses that), then signs you in and installs the `homelab-app` skill for Claude Code (and Codex). Every other command assumes this is done.
-Upgrade with `magehand upgrade` (any command says, at most once a day, when a new version is out).
+Upgrade with `magehand upgrade` (any command says, at most once a day, when a new version is out). After upgrading, run `magehand update-agents` in each app repo to bring in the template's current `AGENTS.md` rules.
 
 ## Commands
 

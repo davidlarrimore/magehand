@@ -1624,6 +1624,15 @@ ask the platform, with magehand (installed with `uv tool install magehand`).
    so): mock the LLM until then. Never use another app's key.
 5. If the guide doesn't answer, say so in the PR or issue (what you searched
    for) instead of inventing a mechanism; the owner adds it to the guide.
+6. Opening a PR: ready for review (not a draft), then request the reviewer,
+   `gh pr edit N --add-reviewer davidlarrimore-bot`. OpenClaw reviews only
+   when asked: a push starts no review and dismisses the approval, so request
+   it again after pushing fixes. Don't call the PR ready to merge until its
+   review has posted; the owner merges. Base every PR on `main` (the repo's
+   ruleset only guards the default branch).
+7. When `magehand check` warns that AGENTS.md is behind the template, run
+   `magehand update-agents`, review the diff and commit it. Never edit
+   AGENTS.md above its `## This app` heading: that edit is lost.
 
 Facts that override habits: no direct calls to AI or search providers (the
 llm block's base_url and search_url); no own login or passwords (authentik
