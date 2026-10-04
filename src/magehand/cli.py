@@ -541,22 +541,92 @@ RULESET = {
 }
 
 
+def ruleset_problems(ruleset):
+    """Why a ruleset named like ours would not give the approval pause (a list, empty when it would): not
+    active, or no approving review. Whether it applies to the default branch is asked of GitHub
+    (ruleset_status), not worked out from its include/exclude patterns."""
+    found = []
+    if ruleset.get('enforcement') != 'active':
+        found.append(f"enforcement is {ruleset.get('enforcement')!r}, not 'active'")
+    rules = [r for r in ruleset.get('rules') or [] if r.get('type') == 'pull_request']
+    if not rules or int((rules[0].get('parameters') or {}).get('required_approving_review_count') or 0) < 1:
+        found.append('it does not require an approving review')
+    return found
+
+
+def gh_json_pages(path, per_page=100, max_pages=20):
+    """(items, None) from every page of a GitHub list endpoint, or (None, reason) if any page can't be read
+    (no gh, an HTTP error, bad JSON, or more than max_pages pages: never a partial answer)."""
+    items = []
+    for page in range(1, max_pages + 1):
+        code, out, err = gh_probe('api', f'{path}?per_page={per_page}&page={page}')
+        if code != 0:
+            return None, err or 'gh api failed'
+        try:
+            got = json.loads(out or '[]')
+        except ValueError:
+            return None, 'unreadable answer from GitHub'
+        items += got
+        if len(got) < per_page:
+            return items, None
+    return None, f'more than {max_pages * per_page} entries'
+
+
+def ruleset_status(repo):
+    """(state, detail) of the repo's approval ruleset: 'ok', 'missing', 'weak' (detail says why) or None when it
+    could not be read (no gh, no admin, rate limit, network: detail has the reason)."""
+    code, out, err = gh_probe('api', f'repos/{repo}/rulesets')
+    if code != 0:
+        return None, err or 'gh api failed'
+    try:
+        listed = [r for r in json.loads(out or '[]') if r.get('name') == RULESET['name']]
+    except ValueError:
+        return None, 'unreadable answer from GitHub'
+    if not listed:
+        return 'missing', ''
+    code, out, err = gh_probe('api', f"repos/{repo}/rulesets/{listed[0]['id']}")
+    if code != 0:
+        return None, err or 'gh api failed'
+    try:
+        problems = ruleset_problems(json.loads(out))
+    except ValueError:
+        return None, 'unreadable answer from GitHub'
+    # The rules GitHub applies to the default branch today (includes, excludes and ref patterns resolved).
+    code, out, err = gh_probe('api', f'repos/{repo}', '--jq', '.default_branch')
+    branch = out.strip()
+    if code == 0 and branch:
+        rules, err = gh_json_pages(f'repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe="")}')
+        if rules is None:
+            return None, err
+    if code != 0 or not branch:
+        return None, err or 'could not read the default branch'
+    applied = [r for r in rules if r.get('ruleset_id') == listed[0]['id']]
+    if not any(r.get('type') == 'pull_request' for r in applied):
+        problems.append(f'it does not apply to the default branch ({branch})')
+    return ('weak', '; '.join(problems)) if problems else ('ok', '')
+
+
 def ensure_ruleset(repo):
-    """Make sure the repo has the approval ruleset: 'exists', 'created' or 'failed' (a warning, not an error:
-    the owner can add it by hand)."""
-    code, out, err = gh_cli('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
-    if code == 0 and RULESET['name'] in out.splitlines():
+    """Make sure the repo has the approval ruleset: 'exists', 'created', 'weak' or 'failed' (a warning, not an
+    error: the owner can fix it by hand). An existing ruleset is never changed: if it is weaker than ours
+    (disabled, another branch, no approval needed) it says so."""
+    state, detail = ruleset_status(repo)
+    if state == 'ok':
         print(f"{repo}: ruleset '{RULESET['name']}' already there", file=sys.stderr)
         return 'exists'
-    if code == 0:
-        code, _, err = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-', stdin=json.dumps(RULESET))
-    if code != 0:
-        print(f"{repo}: could not add the ruleset '{RULESET['name']}' ({err or 'gh api failed'}); "
-              'PRs can merge without a review until it exists', file=sys.stderr)
-        return 'failed'
-    print(f"{repo}: ruleset '{RULESET['name']}' added (a PR needs one approval; you can bypass it as admin)",
-          file=sys.stderr)
-    return 'created'
+    if state == 'weak':
+        print(f"{repo}: ruleset '{RULESET['name']}' exists but would not pause a merge ({detail}); fix it in the "
+              "repo's Settings > Rules (magehand leaves an existing ruleset alone)", file=sys.stderr)
+        return 'weak'
+    if state == 'missing':
+        code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-', stdin=json.dumps(RULESET))
+        if code == 0:
+            print(f"{repo}: ruleset '{RULESET['name']}' added (a PR needs one approval; you can bypass it as admin)",
+                  file=sys.stderr)
+            return 'created'
+    print(f"{repo}: could not add the ruleset '{RULESET['name']}' ({detail or 'gh api failed'}); "
+          'PRs can merge without a review until it exists', file=sys.stderr)
+    return 'failed'
 
 
 def cmd_new(a):
@@ -1011,6 +1081,44 @@ def cmd_run(a):
 
 # --- doctor and update ---------------------------------------------------------------
 
+def checkout_root(path='.'):
+    """The top of the Git checkout containing `path`, or None outside one."""
+    out = quiet(['git', '-C', str(path), 'rev-parse', '--show-toplevel'])
+    return pathlib.Path(out.stdout.strip()) if out and out.returncode == 0 and out.stdout.strip() else None
+
+
+def current_repo(path='.'):
+    """OWNER/NAME of the app repo whose checkout contains `path` (from its origin remote; works from any
+    subdirectory), or None outside one."""
+    root = checkout_root(path)
+    if not root or not is_app_checkout(root):
+        return None
+    out = quiet(['git', '-C', str(root), 'remote', 'get-url', 'origin'])
+    m = re.search(rf'github\.com[:/]{OWNER}/([\w.-]+?)(?:\.git)?\s*$', out.stdout) if out and out.returncode == 0 else None
+    return f'{OWNER}/{m.group(1)}' if m else None
+
+
+def gh_probe(*args):
+    """gh_cli for a diagnostic: (None, '', reason) when gh is missing or hangs, instead of exiting, so doctor
+    still reports (a machine that signs in with GITHUB_TOKEN has no gh)."""
+    try:
+        return gh_cli(*args)
+    except SystemExit:
+        return None, '', 'the GitHub CLI (gh) is not installed'
+    except (OSError, subprocess.TimeoutExpired):
+        return None, '', 'gh did not answer'
+
+
+def repo_state(repo):
+    """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'bot': True|False|None}: the repo's approval
+    ruleset and whether OpenClaw's bot can write to it. None means unknown (no gh, no admin, rate limit, a
+    server or network error), which is not the same as a confirmed 'missing' or False (HTTP 404)."""
+    ruleset, detail = ruleset_status(repo)
+    code, _, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
+    bot = True if code == 0 else False if code is not None and 'HTTP 404' in err else None
+    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot}
+
+
 def cmd_doctor(a):
     ok = True
     results = []
@@ -1035,6 +1143,22 @@ def cmd_doctor(a):
     token = saved_token()
     check('signed in to OpenBao', bool(reach and token and bao('GET', 'auth/token/lookup-self', token)[0] == 200),
           '`magehand login`')
+    repo = current_repo()
+    if repo:
+        state = repo_state(repo)
+        fix = f'`magehand new {repo.split("/", 1)[1]}` (re-running it is safe)'
+        weak = f'{state["ruleset_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
+        for label, value, hint in ((f"{repo}: OpenClaw's bot can write", state['bot'], fix),
+                                   (f"{repo}: ruleset '{RULESET['name']}'",
+                                    None if state['ruleset'] is None else state['ruleset'] == 'ok',
+                                    weak if state['ruleset'] == 'weak' else fix)):
+            if value is None:  # unknown (no gh, no admin, rate limit, network): a note, never a failure
+                note = 'could not be read (needs gh, and admin for the ruleset)'
+                results.append({'check': label, 'ok': None, 'hint': note})
+                if not a.json:
+                    print(f'--   {label}: {note}')
+            else:
+                check(label, value, hint)
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
@@ -1371,6 +1495,34 @@ def try_load_app(name, root=None):
     return app
 
 
+def is_app_checkout(root):
+    """True for an app's own repo (not a homelab-apps checkout): it has the template's ui-check.yaml or a deploy/app.yaml."""
+    root = pathlib.Path(root)
+    return (root / 'ui-check.yaml').is_file() or (root / DEPLOY / 'app.yaml').is_file()
+
+
+def check_agents_drift(root):
+    """A warning when the repo's AGENTS.md platform rules (above "## This app") differ from the template's:
+    the platform moved on and `magehand update-agents` brings them in. Skipped without a readable template
+    (offline, or CI without access to it) and outside an app's own repo."""
+    path = pathlib.Path(root) / 'AGENTS.md'
+    if not is_app_checkout(root) or not path.is_file():
+        return []
+    try:
+        template = github_file(TEMPLATE_REPO, 'AGENTS.md', required=False)
+    except SystemExit:  # no GitHub token: nothing to compare with
+        return []
+    platform, app = split_agents(template or '')
+    if not template or app is None:
+        return []
+    current, own = split_agents(path.read_text())
+    if own is not None and current == platform:
+        return []
+    why = ('has no "## This app" heading' if own is None else 'the platform rules above "## This app" are out of date')
+    return [finding('warning', 'AGENTS.md', f'{why}: run `magehand update-agents` and commit the diff',
+                    'homelab-apps AGENTS.md')]
+
+
 def cmd_check(a):
     global APPS_DIR
     manifests_only = a.manifests_only
@@ -1383,7 +1535,7 @@ def cmd_check(a):
     app = try_load_app(name, root)
     found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root, name)
     if not manifests_only:
-        found += check_code(root, app, catalog)
+        found += check_code(root, app, catalog) + check_agents_drift(root)
     errors = sum(f['level'] == 'error' for f in found)
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
@@ -1732,7 +1884,7 @@ class Parser(argparse.ArgumentParser):
     def error(self, message):
         match = re.search(r"argument (\S+): invalid choice: '([^']*)' \(choose from (.*)\)", message)
         if match:
-            choices = re.findall(r"'([^']*)'", match.group(3))
+            choices = [c.strip().strip("'") for c in match.group(3).split(', ')]  # quoted before Python 3.14
             close = difflib.get_close_matches(match.group(2), choices, n=1)
             hint = f"; did you mean '{close[0]}'?" if close else ''
             if match.group(1) == 'COMMAND':  # 13 choices: point to the list instead of printing it

@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import socket
+import sys
 import tempfile
 import threading
 import unittest
@@ -620,11 +621,22 @@ class New(unittest.TestCase):
         self.calls = []
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
-    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0):
+    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None):
+        """`existing` is the ruleset already on the repo (default: ours when `ruleset`)."""
+        existing = existing if existing is not None else (dict(magehand.RULESET, id=7) if ruleset else None)
+
         def gh(*args, **kw):
             self.calls.append(args)
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets'):
-                return ruleset_status, 'main: owner approves\n' if ruleset else '', 'HTTP 403' if ruleset_status else ''
+                listed = [{'id': 7, 'name': existing['name']}] if existing else []
+                return ruleset_status, json.dumps(listed), 'HTTP 403' if ruleset_status else ''
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets/7'):
+                return 0, json.dumps(existing), ''
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis') and '.default_branch' in args:
+                return 0, 'main\n', ''
+            if args[0] == 'api' and args[1].startswith('repos/davidlarrimore/elvis/rules/branches/main'):
+                covered = existing and existing.get('conditions', {}).get('ref_name', {}).get('include') == ['~DEFAULT_BRANCH']
+                return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}] if covered else []), ''
             if args[:3] == ('api', '-X', 'POST'):
                 return ruleset_status, '', 'HTTP 403' if ruleset_status else ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis'):
@@ -652,6 +664,21 @@ class New(unittest.TestCase):
         self.fake()
         self.run_new('elvis')
         self.assertIn(('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-'), self.calls)
+
+    def test_a_weakened_ruleset_is_reported_not_called_fine_and_not_changed(self):
+        import contextlib
+        import io
+        for weak, why in ((dict(magehand.RULESET, id=7, enforcement='disabled'), 'enforcement'),
+                          (dict(magehand.RULESET, id=7, conditions={'ref_name': {'include': ['refs/heads/x']}}), 'default branch'),
+                          (dict(magehand.RULESET, id=7, rules=[]), 'approving review')):
+            self.calls.clear()
+            self.fake(exists='true', collaborator=True, existing=weak)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.run_new('elvis')
+            self.assertIn(why, err.getvalue())
+            self.assertNotIn('already there', err.getvalue())
+            self.assertFalse([c for c in self.calls if '-X' in c], why)  # nothing is rewritten
 
     def test_a_refused_ruleset_warns_and_does_not_fail(self):
         import contextlib
@@ -876,6 +903,177 @@ class Agents(unittest.TestCase):
 
     def test_a_repo_without_the_file_gets_the_template(self):
         self.assertEqual(self.run_agents(None), (0, self.TEMPLATE))
+
+
+BOT_PATH = f"/collaborators/{magehand.BOT}"
+
+
+class RepoConformance(unittest.TestCase):
+    """check warns when AGENTS.md has fallen behind the template; doctor reports a repo's ruleset and bot access."""
+    TEMPLATE = '# Rules\n\nnew\n\n## This app\n\n(describe it)\n'
+
+    def repo(self, agents, app_repo=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        if app_repo:
+            (root / 'ui-check.yaml').write_text('web_ui: false\n')
+        if agents is not None:
+            (root / 'AGENTS.md').write_text(agents)
+        return root
+
+    def drift(self, root, template=TEMPLATE):
+        saved = magehand.github_file
+        magehand.github_file = lambda repo, path, required=True: template
+        try:
+            return magehand.check_agents_drift(root)
+        finally:
+            magehand.github_file = saved
+
+    def test_up_to_date_is_quiet_whatever_the_apps_notes_say(self):
+        self.assertEqual(self.drift(self.repo('# Rules\n\nnew\n\n## This app\n\nrun pytest\n')), [])
+
+    def test_out_of_date_warns_and_names_the_fix(self):
+        found = self.drift(self.repo('# Rules\n\nold\n\n## This app\n\nx\n'))
+        self.assertEqual([f['level'] for f in found], ['warning'])
+        self.assertIn('magehand update-agents', found[0]['text'])
+
+    def test_no_heading_warns(self):
+        self.assertIn('no "## This app"', self.drift(self.repo('# Rules\n\nold\n'))[0]['text'])
+
+    def test_skipped_outside_an_app_repo_without_the_file_or_without_the_template(self):
+        self.assertEqual(self.drift(self.repo('old', app_repo=False)), [])
+        self.assertEqual(self.drift(self.repo(None)), [])
+        saved = magehand.github_file
+        magehand.github_file = lambda *a, **k: None  # offline, or no access to the template
+        try:
+            self.assertEqual(magehand.check_agents_drift(self.repo('old')), [])
+        finally:
+            magehand.github_file = saved
+
+    def test_current_repo_from_a_subdirectory(self):
+        root = self.repo(None)
+        sub = root / 'src' / 'pkg'
+        sub.mkdir(parents=True)
+        subprocess = magehand.subprocess
+        subprocess.run(['git', 'init', '-q', str(root)], check=True)
+        subprocess.run(['git', '-C', str(root), 'remote', 'add', 'origin', 'git@github.com:davidlarrimore/elvis.git'], check=True)
+        self.assertEqual(magehand.current_repo(root), 'davidlarrimore/elvis')
+        self.assertEqual(magehand.current_repo(sub), 'davidlarrimore/elvis')  # not only from the repo root
+        self.assertIsNone(magehand.current_repo(tempfile.gettempdir()))
+
+    def with_gh(self, answers):
+        """Run repo_state with gh answering from `answers` {path suffix: (code, out, err)}."""
+        saved = magehand.gh_cli
+
+        def gh(*args, **kw):
+            for suffix, answer in answers.items():
+                if args[1].split('?')[0] == 'repos/o/r' + suffix:
+                    return answer(args) if callable(answer) else answer
+            raise AssertionError(args)
+        magehand.gh_cli = gh
+        self.addCleanup(setattr, magehand, 'gh_cli', saved)
+        return magehand.repo_state('o/r')
+
+    GOOD = dict(magehand.RULESET, id=7)
+    LISTED = (0, json.dumps([{'id': 7, 'name': 'main: owner approves'}]), '')
+    APPLIED = (0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]), '')  # rules GitHub applies to main
+
+    def answers(self, detail=None, applied=APPLIED, bot=(0, '', '')):
+        return {'/rulesets': self.LISTED, '/rulesets/7': (0, json.dumps(detail or self.GOOD), ''), '': (0, 'main\n', ''),
+                '/rules/branches/main': applied, BOT_PATH: bot}
+
+    def test_repo_state(self):
+        ok = self.with_gh(self.answers())
+        self.assertEqual((ok['ruleset'], ok['bot']), ('ok', True))
+        none = self.with_gh({'/rulesets': (0, '[]', ''), BOT_PATH: (1, '', 'gh: Not Found (HTTP 404)')})
+        self.assertEqual((none['ruleset'], none['bot']), ('missing', False))
+
+    def test_a_ruleset_that_would_not_pause_a_merge_is_weak(self):
+        for weak in (dict(self.GOOD, enforcement='disabled'), dict(self.GOOD, enforcement='evaluate'),
+                     dict(self.GOOD, conditions={'ref_name': {'include': ['refs/heads/dev']}}),
+                     dict(self.GOOD, rules=[]),
+                     dict(self.GOOD, rules=[{'type': 'pull_request', 'parameters': {'required_approving_review_count': 0}}])):
+            on_dev = weak['conditions']['ref_name']['include'] == ['refs/heads/dev']
+            state = self.with_gh(self.answers(detail=weak, applied=(0, '[]', '') if on_dev else self.APPLIED))
+            self.assertEqual(state['ruleset'], 'weak', weak)
+            self.assertTrue(state['ruleset_detail'])
+
+    def test_what_github_applies_to_the_default_branch_decides_coverage(self):
+        # ~ALL but excluding main: GitHub applies nothing to main, whatever the patterns look like.
+        excluded = dict(self.GOOD, conditions={'ref_name': {'include': ['~ALL'], 'exclude': ['refs/heads/main']}})
+        state = self.with_gh(self.answers(detail=excluded, applied=(0, '[]', '')))
+        self.assertEqual(state['ruleset'], 'weak')
+        self.assertIn('default branch (main)', state['ruleset_detail'])
+        # An explicit refs/heads/main include is as good as ~DEFAULT_BRANCH.
+        explicit = dict(self.GOOD, conditions={'ref_name': {'include': ['refs/heads/main'], 'exclude': []}})
+        self.assertEqual(self.with_gh(self.answers(detail=explicit))['ruleset'], 'ok')
+        # A rule from some other ruleset does not count.
+        other = (0, json.dumps([{'type': 'pull_request', 'ruleset_id': 99}]), '')
+        self.assertEqual(self.with_gh(self.answers(applied=other))['ruleset'], 'weak')
+        # Our rule on a later page of GitHub's answer still counts; a page that fails is unknown, not weak.
+        others = [{'type': 'pull_request', 'ruleset_id': 99}] * 100
+
+        def pages(last):
+            def answer(args):
+                return (0, json.dumps(others), '') if args[1].endswith('page=1') else last
+            return answer
+        self.assertEqual(self.with_gh(self.answers(applied=pages(self.APPLIED)))['ruleset'], 'ok')
+        self.assertIsNone(self.with_gh(self.answers(applied=pages((1, '', 'HTTP 502'))))['ruleset'])
+        # Unreadable effective rules are unknown, not weak.
+        self.assertIsNone(self.with_gh(self.answers(applied=(1, '', 'HTTP 500')))['ruleset'])
+
+    def test_failures_are_unknown_not_missing(self):
+        for code, err in ((1, 'HTTP 403: Resource not accessible'), (1, 'HTTP 500'), (1, 'dial tcp: connection refused'),
+                          (1, 'HTTP 403: API rate limit exceeded')):
+            state = self.with_gh({'/rulesets': (code, '', err), BOT_PATH: (code, '', err)})
+            self.assertEqual((state['ruleset'], state['bot']), (None, None), err)
+
+    def test_repo_state_without_gh_is_unknown_not_a_crash(self):
+        saved = magehand.gh_cli
+
+        def no_gh(*args, **kw):
+            sys.exit('magehand: needs the GitHub CLI')
+        magehand.gh_cli = no_gh
+        try:
+            self.assertEqual(magehand.repo_state('o/r')['bot'], None)
+            magehand.gh_cli = lambda *a, **k: (_ for _ in ()).throw(magehand.subprocess.TimeoutExpired('gh', 60))
+            self.assertEqual(magehand.repo_state('o/r')['ruleset'], None)
+        finally:
+            magehand.gh_cli = saved
+
+    def test_doctor_json_survives_a_missing_gh_without_touching_the_machine(self):
+        # No OpenBao request, token lookup or container runtime: all mocked.
+        import contextlib
+        import io
+        names = ('gh_cli', 'current_repo', 'github_token', 'github_file', 'saved_token', 'configured_runtime',
+                 'choose_runtime')
+        saved = {n: getattr(magehand, n) for n in names}
+        saved_urlopen = magehand.urllib.request.urlopen
+        calls = []
+
+        def no_network(*a, **k):
+            calls.append(a)
+            raise OSError('no network in tests')
+        magehand.current_repo = lambda *a: 'davidlarrimore/elvis'
+        magehand.github_token = lambda: 't'
+        magehand.github_file = lambda *a, **k: 'x'
+        magehand.saved_token = lambda: None
+        magehand.configured_runtime = lambda: 'none'
+        magehand.choose_runtime = lambda configured, found: None
+        magehand.gh_cli = lambda *a, **k: sys.exit('magehand: needs the GitHub CLI')
+        magehand.urllib.request.urlopen = no_network
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                magehand.cmd_doctor(magehand.build_parser().parse_args(['doctor', '--json']))
+        finally:
+            for n, f in saved.items():
+                setattr(magehand, n, f)
+            magehand.urllib.request.urlopen = saved_urlopen
+        report = json.loads(out.getvalue())
+        self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None, None])
+        self.assertEqual(len(calls), 1)  # only the (mocked, failing) OpenBao health probe was attempted
 
 
 class CommandLine(unittest.TestCase):
