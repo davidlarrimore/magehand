@@ -541,22 +541,63 @@ RULESET = {
 }
 
 
+def ruleset_problems(ruleset):
+    """Why a ruleset named like ours would not give the approval pause (a list, empty when it would)."""
+    found = []
+    if ruleset.get('enforcement') != 'active':
+        found.append(f"enforcement is {ruleset.get('enforcement')!r}, not 'active'")
+    include = ((ruleset.get('conditions') or {}).get('ref_name') or {}).get('include') or []
+    if not {'~DEFAULT_BRANCH', '~ALL'} & set(include):
+        found.append('it does not cover the default branch')
+    rules = [r for r in ruleset.get('rules') or [] if r.get('type') == 'pull_request']
+    if not rules or int((rules[0].get('parameters') or {}).get('required_approving_review_count') or 0) < 1:
+        found.append('it does not require an approving review')
+    return found
+
+
+def ruleset_status(repo):
+    """(state, detail) of the repo's approval ruleset: 'ok', 'missing', 'weak' (detail says why) or None when it
+    could not be read (no gh, no admin, rate limit, network: detail has the reason)."""
+    code, out, err = gh_probe('api', f'repos/{repo}/rulesets')
+    if code != 0:
+        return None, err or 'gh api failed'
+    try:
+        listed = [r for r in json.loads(out or '[]') if r.get('name') == RULESET['name']]
+    except ValueError:
+        return None, 'unreadable answer from GitHub'
+    if not listed:
+        return 'missing', ''
+    code, out, err = gh_probe('api', f"repos/{repo}/rulesets/{listed[0]['id']}")
+    if code != 0:
+        return None, err or 'gh api failed'
+    try:
+        problems = ruleset_problems(json.loads(out))
+    except ValueError:
+        return None, 'unreadable answer from GitHub'
+    return ('weak', '; '.join(problems)) if problems else ('ok', '')
+
+
 def ensure_ruleset(repo):
-    """Make sure the repo has the approval ruleset: 'exists', 'created' or 'failed' (a warning, not an error:
-    the owner can add it by hand)."""
-    code, out, err = gh_cli('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
-    if code == 0 and RULESET['name'] in out.splitlines():
+    """Make sure the repo has the approval ruleset: 'exists', 'created', 'weak' or 'failed' (a warning, not an
+    error: the owner can fix it by hand). An existing ruleset is never changed: if it is weaker than ours
+    (disabled, another branch, no approval needed) it says so."""
+    state, detail = ruleset_status(repo)
+    if state == 'ok':
         print(f"{repo}: ruleset '{RULESET['name']}' already there", file=sys.stderr)
         return 'exists'
-    if code == 0:
-        code, _, err = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-', stdin=json.dumps(RULESET))
-    if code != 0:
-        print(f"{repo}: could not add the ruleset '{RULESET['name']}' ({err or 'gh api failed'}); "
-              'PRs can merge without a review until it exists', file=sys.stderr)
-        return 'failed'
-    print(f"{repo}: ruleset '{RULESET['name']}' added (a PR needs one approval; you can bypass it as admin)",
-          file=sys.stderr)
-    return 'created'
+    if state == 'weak':
+        print(f"{repo}: ruleset '{RULESET['name']}' exists but would not pause a merge ({detail}); fix it in the "
+              "repo's Settings > Rules (magehand leaves an existing ruleset alone)", file=sys.stderr)
+        return 'weak'
+    if state == 'missing':
+        code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-', stdin=json.dumps(RULESET))
+        if code == 0:
+            print(f"{repo}: ruleset '{RULESET['name']}' added (a PR needs one approval; you can bypass it as admin)",
+                  file=sys.stderr)
+            return 'created'
+    print(f"{repo}: could not add the ruleset '{RULESET['name']}' ({detail or 'gh api failed'}); "
+          'PRs can merge without a review until it exists', file=sys.stderr)
+    return 'failed'
 
 
 def cmd_new(a):
@@ -1040,12 +1081,13 @@ def gh_probe(*args):
 
 
 def repo_state(repo):
-    """{'ruleset': True|False|None, 'bot': True|False|None}: the repo has the approval ruleset and OpenClaw's
-    bot can write to it. None means unknown: gh is unavailable, or (the ruleset) it needs admin to read."""
-    code, out, _ = gh_probe('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
-    ruleset = (RULESET['name'] in out.splitlines()) if code == 0 else None
-    code, _, _ = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
-    return {'ruleset': ruleset, 'bot': None if code is None else code == 0}
+    """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'bot': True|False|None}: the repo's approval
+    ruleset and whether OpenClaw's bot can write to it. None means unknown (no gh, no admin, rate limit, a
+    server or network error), which is not the same as a confirmed 'missing' or False (HTTP 404)."""
+    ruleset, detail = ruleset_status(repo)
+    code, _, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
+    bot = True if code == 0 else False if code is not None and 'HTTP 404' in err else None
+    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot}
 
 
 def cmd_doctor(a):
@@ -1076,14 +1118,18 @@ def cmd_doctor(a):
     if repo:
         state = repo_state(repo)
         fix = f'`magehand new {repo.split("/", 1)[1]}` (re-running it is safe)'
-        for key, label in (('bot', f"{repo}: OpenClaw's bot can write"),
-                           ('ruleset', f"{repo}: ruleset '{RULESET['name']}'")):
-            if state[key] is None:  # unknown (no gh, or the ruleset needs admin): a note, never a failure
-                results.append({'check': label, 'ok': None, 'hint': 'could not be read (needs gh, and admin for the ruleset)'})
+        weak = f'{state["ruleset_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
+        for label, value, hint in ((f"{repo}: OpenClaw's bot can write", state['bot'], fix),
+                                   (f"{repo}: ruleset '{RULESET['name']}'",
+                                    None if state['ruleset'] is None else state['ruleset'] == 'ok',
+                                    weak if state['ruleset'] == 'weak' else fix)):
+            if value is None:  # unknown (no gh, no admin, rate limit, network): a note, never a failure
+                note = 'could not be read (needs gh, and admin for the ruleset)'
+                results.append({'check': label, 'ok': None, 'hint': note})
                 if not a.json:
-                    print(f'--   {label}: could not be read (needs gh, and admin for the ruleset)')
+                    print(f'--   {label}: {note}')
             else:
-                check(label, state[key], fix)
+                check(label, value, hint)
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
