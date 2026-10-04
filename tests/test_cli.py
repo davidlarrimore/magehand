@@ -908,6 +908,13 @@ class Agents(unittest.TestCase):
 BOT_PATH = f"/collaborators/{magehand.BOT}"
 
 
+class SkillProcess(unittest.TestCase):
+    def test_the_skill_teaches_the_review_and_agents_process(self):
+        for text in ('gh pr edit N --add-reviewer davidlarrimore-bot', 'magehand update-agents', 'not a draft',
+                     'Base every PR on `main`'):
+            self.assertIn(text, magehand.SKILL)
+
+
 class RepoConformance(unittest.TestCase):
     """check warns when AGENTS.md has fallen behind the template; doctor reports a repo's ruleset and bot access."""
     TEMPLATE = '# Rules\n\nnew\n\n## This app\n\n(describe it)\n'
