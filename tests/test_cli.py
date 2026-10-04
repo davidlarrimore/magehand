@@ -807,6 +807,53 @@ class Runtimes(unittest.TestCase):
             os.environ.pop('MAGEHAND_RUNTIME', None)
 
 
+class Agents(unittest.TestCase):
+    TEMPLATE = '# Rules\n\nnew platform rules\n\n## This app\n\n(describe it)\n'
+
+    def run_agents(self, current, *argv):
+        import contextlib
+        import io
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'AGENTS.md'
+            if current is not None:
+                path.write_text(current)
+            saved = magehand.github_file
+            magehand.github_file = lambda repo, name, required=True: self.TEMPLATE
+            code = 0
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        magehand.main(['agents', '--code', tmp, *argv])
+                    except SystemExit as exit_:
+                        code = exit_.code if isinstance(exit_.code, int) else 1
+            finally:
+                magehand.github_file = saved
+            return code, path.read_text() if path.is_file() else None
+
+    def test_split(self):
+        self.assertEqual(magehand.split_agents('a\n## This app\nb\n'), ('a\n', '## This app\nb\n'))
+        self.assertEqual(magehand.split_agents('a\n## This application\n'), ('a\n## This application\n', None))
+
+    def test_replaces_the_platform_part_and_keeps_the_apps_notes(self):
+        code, text = self.run_agents('# Rules\n\nold rules\n\n## This app\n\nrun pytest\n')
+        self.assertEqual((code, text), (0, '# Rules\n\nnew platform rules\n\n## This app\n\nrun pytest\n'))
+
+    def test_up_to_date_changes_nothing(self):
+        self.assertEqual(self.run_agents(self.TEMPLATE), (0, self.TEMPLATE))
+
+    def test_check_reports_without_writing(self):
+        old = '# Rules\n\nold\n\n## This app\n\nx\n'
+        self.assertEqual(self.run_agents(old, '--check'), (1, old))
+        self.assertEqual(self.run_agents(self.TEMPLATE, '--check'), (0, self.TEMPLATE))
+
+    def test_no_heading_is_refused_untouched(self):
+        self.assertEqual(self.run_agents('# Rules\n\nold\n'), (1, '# Rules\n\nold\n'))
+
+    def test_a_repo_without_the_file_gets_the_template(self):
+        self.assertEqual(self.run_agents(None), (0, self.TEMPLATE))
+
+
 class CommandLine(unittest.TestCase):
     """The conventions in AGENTS.md "CLI conventions"."""
 
