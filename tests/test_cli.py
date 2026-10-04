@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import socket
+import sys
 import tempfile
 import threading
 import unittest
@@ -920,6 +921,48 @@ class RepoConformance(unittest.TestCase):
             self.assertEqual(magehand.check_agents_drift(self.repo('old')), [])
         finally:
             magehand.github_file = saved
+
+    def test_current_repo_from_a_subdirectory(self):
+        root = self.repo(None)
+        sub = root / 'src' / 'pkg'
+        sub.mkdir(parents=True)
+        subprocess = magehand.subprocess
+        subprocess.run(['git', 'init', '-q', str(root)], check=True)
+        subprocess.run(['git', '-C', str(root), 'remote', 'add', 'origin', 'git@github.com:davidlarrimore/elvis.git'], check=True)
+        self.assertEqual(magehand.current_repo(root), 'davidlarrimore/elvis')
+        self.assertEqual(magehand.current_repo(sub), 'davidlarrimore/elvis')  # not only from the repo root
+        self.assertIsNone(magehand.current_repo(tempfile.gettempdir()))
+
+    def test_repo_state_without_gh_is_unknown_not_a_crash(self):
+        saved = magehand.gh_cli
+
+        def no_gh(*args, **kw):
+            sys.exit('magehand: needs the GitHub CLI')
+        magehand.gh_cli = no_gh
+        try:
+            self.assertEqual(magehand.repo_state('o/r'), {'ruleset': None, 'bot': None})
+            magehand.gh_cli = lambda *a, **k: (_ for _ in ()).throw(magehand.subprocess.TimeoutExpired('gh', 60))
+            self.assertEqual(magehand.repo_state('o/r'), {'ruleset': None, 'bot': None})
+        finally:
+            magehand.gh_cli = saved
+
+    def test_doctor_json_survives_a_missing_gh(self):
+        import contextlib
+        import io
+        root = self.repo(None)
+        saved = (magehand.gh_cli, magehand.current_repo, magehand.github_token, magehand.github_file)
+        magehand.current_repo = lambda *a: 'davidlarrimore/elvis'
+        magehand.github_token = lambda: 't'
+        magehand.github_file = lambda *a, **k: 'x'
+        magehand.gh_cli = lambda *a, **k: sys.exit('magehand: needs the GitHub CLI')
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                magehand.cmd_doctor(magehand.build_parser().parse_args(['doctor', '--json']))
+        finally:
+            magehand.gh_cli, magehand.current_repo, magehand.github_token, magehand.github_file = saved
+        report = json.loads(out.getvalue())
+        self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None, None])
 
     def test_repo_state(self):
         saved = magehand.gh_cli

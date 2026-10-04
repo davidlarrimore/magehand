@@ -1011,21 +1011,41 @@ def cmd_run(a):
 
 # --- doctor and update ---------------------------------------------------------------
 
-def current_repo(root='.'):
-    """OWNER/NAME of the app repo in `root` (from its origin remote), or None outside one."""
-    if not is_app_checkout(root):
+def checkout_root(path='.'):
+    """The top of the Git checkout containing `path`, or None outside one."""
+    out = quiet(['git', '-C', str(path), 'rev-parse', '--show-toplevel'])
+    return pathlib.Path(out.stdout.strip()) if out and out.returncode == 0 and out.stdout.strip() else None
+
+
+def current_repo(path='.'):
+    """OWNER/NAME of the app repo whose checkout contains `path` (from its origin remote; works from any
+    subdirectory), or None outside one."""
+    root = checkout_root(path)
+    if not root or not is_app_checkout(root):
         return None
     out = quiet(['git', '-C', str(root), 'remote', 'get-url', 'origin'])
     m = re.search(rf'github\.com[:/]{OWNER}/([\w.-]+?)(?:\.git)?\s*$', out.stdout) if out and out.returncode == 0 else None
     return f'{OWNER}/{m.group(1)}' if m else None
 
 
+def gh_probe(*args):
+    """gh_cli for a diagnostic: (None, '', reason) when gh is missing or hangs, instead of exiting, so doctor
+    still reports (a machine that signs in with GITHUB_TOKEN has no gh)."""
+    try:
+        return gh_cli(*args)
+    except SystemExit:
+        return None, '', 'the GitHub CLI (gh) is not installed'
+    except (OSError, subprocess.TimeoutExpired):
+        return None, '', 'gh did not answer'
+
+
 def repo_state(repo):
-    """{'ruleset': True|False|None, 'bot': True|False}: the repo has the approval ruleset (None: not readable,
-    it needs admin) and OpenClaw's bot can write to it."""
-    code, out, _ = gh_cli('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
+    """{'ruleset': True|False|None, 'bot': True|False|None}: the repo has the approval ruleset and OpenClaw's
+    bot can write to it. None means unknown: gh is unavailable, or (the ruleset) it needs admin to read."""
+    code, out, _ = gh_probe('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
     ruleset = (RULESET['name'] in out.splitlines()) if code == 0 else None
-    return {'ruleset': ruleset, 'bot': gh_cli('api', f'repos/{repo}/collaborators/{BOT}')[0] == 0}
+    code, _, _ = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
+    return {'ruleset': ruleset, 'bot': None if code is None else code == 0}
 
 
 def cmd_doctor(a):
@@ -1056,12 +1076,14 @@ def cmd_doctor(a):
     if repo:
         state = repo_state(repo)
         fix = f'`magehand new {repo.split("/", 1)[1]}` (re-running it is safe)'
-        check(f'{repo}: OpenClaw\'s bot can write', state['bot'], fix)
-        if state['ruleset'] is None:
-            if not a.json:
-                print(f'--   {repo}: approval ruleset not readable (needs admin on the repo)')
-        else:
-            check(f"{repo}: ruleset '{RULESET['name']}'", state['ruleset'], fix)
+        for key, label in (('bot', f"{repo}: OpenClaw's bot can write"),
+                           ('ruleset', f"{repo}: ruleset '{RULESET['name']}'")):
+            if state[key] is None:  # unknown (no gh, or the ruleset needs admin): a note, never a failure
+                results.append({'check': label, 'ok': None, 'hint': 'could not be read (needs gh, and admin for the ruleset)'})
+                if not a.json:
+                    print(f'--   {label}: could not be read (needs gh, and admin for the ruleset)')
+            else:
+                check(label, state[key], fix)
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
@@ -1787,7 +1809,7 @@ class Parser(argparse.ArgumentParser):
     def error(self, message):
         match = re.search(r"argument (\S+): invalid choice: '([^']*)' \(choose from (.*)\)", message)
         if match:
-            choices = re.findall(r"'([^']*)'", match.group(3))
+            choices = [c.strip().strip("'") for c in match.group(3).split(', ')]  # quoted before Python 3.14
             close = difflib.get_close_matches(match.group(2), choices, n=1)
             hint = f"; did you mean '{close[0]}'?" if close else ''
             if match.group(1) == 'COMMAND':  # 13 choices: point to the list instead of printing it
