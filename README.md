@@ -35,7 +35,7 @@ COMMAND`) explains one, with examples.
 
 | Command | What it does |
 | --- | --- |
-| `magehand new APP [--json]` | Creates `davidlarrimore/APP` from `homelab-app-template` (private) with `gh`, as you, and invites OpenClaw's bot `davidlarrimore-bot` with write; OpenClaw accepts by itself. Safe to re-run: on an existing repo it only adds the bot, and warns if the repo is public. Its one write, and to GitHub, never the homelab |
+| `magehand new APP [--json]` | Creates `davidlarrimore/APP` from `homelab-app-template` (private) with `gh`, as you, and invites OpenClaw's bot `davidlarrimore-bot` with write; OpenClaw accepts by itself. It also adds the `main: owner approves` ruleset (a PR needs one approval of its latest push; the owner can bypass it as admin; a refusal only warns). Safe to re-run: on an existing repo it only adds the bot and the ruleset if missing, and warns if the repo is public. Its one write, and to GitHub, never the homelab |
 
 **Learn the platform and check an app**
 

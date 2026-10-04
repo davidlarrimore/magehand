@@ -518,12 +518,45 @@ RESERVED = {'argocd', 'authentik', 'cloudflared', 'external-secrets', 'ingress',
             'homelab-events', 'magehand'}
 
 
-def gh_cli(*args):
+def gh_cli(*args, stdin=None):
     """`gh ARGS` as the signed-in user: (exit status, stdout, stderr)."""
     if not shutil.which('gh'):
         die('needs the GitHub CLI: `brew install gh`, then `gh auth login`')
-    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60)  # nosec B603 B607
+    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607
     return out.returncode, out.stdout, out.stderr.strip()
+
+
+# The ruleset every app code repo carries (the same as homelab's "main: owner approves"): a PR needs one
+# approval of its latest push, so a merge is a pause for the owner; repo admins (the owner) can bypass it
+# through a pull request. OpenClaw's review (as the bot) or the owner's own approval satisfies it.
+RULESET = {
+    'name': 'main: owner approves', 'target': 'branch', 'enforcement': 'active',
+    'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH'], 'exclude': []}},
+    'rules': [{'type': 'pull_request', 'parameters': {
+        'required_approving_review_count': 1, 'dismiss_stale_reviews_on_push': True, 'required_reviewers': [],
+        'require_code_owner_review': False, 'require_last_push_approval': True,
+        'required_review_thread_resolution': False, 'require_extra_approval_for_unattributed_changes': True,
+        'allowed_merge_methods': ['squash']}}],
+    'bypass_actors': [{'actor_id': 5, 'actor_type': 'RepositoryRole', 'bypass_mode': 'pull_request'}],
+}
+
+
+def ensure_ruleset(repo):
+    """Make sure the repo has the approval ruleset: 'exists', 'created' or 'failed' (a warning, not an error:
+    the owner can add it by hand)."""
+    code, out, err = gh_cli('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
+    if code == 0 and RULESET['name'] in out.splitlines():
+        print(f"{repo}: ruleset '{RULESET['name']}' already there", file=sys.stderr)
+        return 'exists'
+    if code == 0:
+        code, _, err = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-', stdin=json.dumps(RULESET))
+    if code != 0:
+        print(f"{repo}: could not add the ruleset '{RULESET['name']}' ({err or 'gh api failed'}); "
+              'PRs can merge without a review until it exists', file=sys.stderr)
+        return 'failed'
+    print(f"{repo}: ruleset '{RULESET['name']}' added (a PR needs one approval; you can bypass it as admin)",
+          file=sys.stderr)
+    return 'created'
 
 
 def cmd_new(a):
@@ -556,8 +589,10 @@ def cmd_new(a):
             die(f'cannot invite {BOT} to {repo}: {err or "gh api failed"}')
         bot = 'invited'
         print(f'{BOT}: invited with write; OpenClaw accepts it within about 5 minutes', file=sys.stderr)
+    ruleset = ensure_ruleset(repo)
     if a.json:
-        print(json.dumps({'repo': repo, 'created': created, 'private': private, 'bot': bot}, indent=1))
+        print(json.dumps({'repo': repo, 'created': created, 'private': private, 'bot': bot, 'ruleset': ruleset},
+                         indent=1))
         return
     print(f'Next:\n  gh repo clone {repo} && cd {name}\n'
           '  write the code and deploy/ (`magehand guide search new app`); mock the LLM for now\n'
