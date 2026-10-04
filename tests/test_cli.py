@@ -878,6 +878,68 @@ class Agents(unittest.TestCase):
         self.assertEqual(self.run_agents(None), (0, self.TEMPLATE))
 
 
+class RepoConformance(unittest.TestCase):
+    """check warns when AGENTS.md has fallen behind the template; doctor reports a repo's ruleset and bot access."""
+    TEMPLATE = '# Rules\n\nnew\n\n## This app\n\n(describe it)\n'
+
+    def repo(self, agents, app_repo=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        if app_repo:
+            (root / 'ui-check.yaml').write_text('web_ui: false\n')
+        if agents is not None:
+            (root / 'AGENTS.md').write_text(agents)
+        return root
+
+    def drift(self, root, template=TEMPLATE):
+        saved = magehand.github_file
+        magehand.github_file = lambda repo, path, required=True: template
+        try:
+            return magehand.check_agents_drift(root)
+        finally:
+            magehand.github_file = saved
+
+    def test_up_to_date_is_quiet_whatever_the_apps_notes_say(self):
+        self.assertEqual(self.drift(self.repo('# Rules\n\nnew\n\n## This app\n\nrun pytest\n')), [])
+
+    def test_out_of_date_warns_and_names_the_fix(self):
+        found = self.drift(self.repo('# Rules\n\nold\n\n## This app\n\nx\n'))
+        self.assertEqual([f['level'] for f in found], ['warning'])
+        self.assertIn('magehand update-agents', found[0]['text'])
+
+    def test_no_heading_warns(self):
+        self.assertIn('no "## This app"', self.drift(self.repo('# Rules\n\nold\n'))[0]['text'])
+
+    def test_skipped_outside_an_app_repo_without_the_file_or_without_the_template(self):
+        self.assertEqual(self.drift(self.repo('old', app_repo=False)), [])
+        self.assertEqual(self.drift(self.repo(None)), [])
+        saved = magehand.github_file
+        magehand.github_file = lambda *a, **k: None  # offline, or no access to the template
+        try:
+            self.assertEqual(magehand.check_agents_drift(self.repo('old')), [])
+        finally:
+            magehand.github_file = saved
+
+    def test_repo_state(self):
+        saved = magehand.gh_cli
+
+        def gh(*args, **kw):
+            if args[1].endswith('/rulesets'):
+                return self.rules
+            return self.bot
+        magehand.gh_cli = gh
+        try:
+            self.rules, self.bot = (0, 'main: owner approves\n', ''), (0, '', '')
+            self.assertEqual(magehand.repo_state('o/r'), {'ruleset': True, 'bot': True})
+            self.rules, self.bot = (0, '', ''), (1, '', 'Not Found')
+            self.assertEqual(magehand.repo_state('o/r'), {'ruleset': False, 'bot': False})
+            self.rules = (1, '', 'HTTP 403')  # not an admin: unknown, not missing
+            self.assertIsNone(magehand.repo_state('o/r')['ruleset'])
+        finally:
+            magehand.gh_cli = saved
+
+
 class CommandLine(unittest.TestCase):
     """The conventions in AGENTS.md "CLI conventions"."""
 
