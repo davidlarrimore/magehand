@@ -612,6 +612,63 @@ class Skill(unittest.TestCase):
             self.assertTrue(paths[0].read_text().startswith('---\nname: homelab-app\n'))
 
 
+class New(unittest.TestCase):
+    """magehand new: the app's private repo from the template, with OpenClaw's bot invited."""
+
+    def setUp(self):
+        self.saved = magehand.gh_cli
+        self.calls = []
+        self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
+
+    def fake(self, exists=None, collaborator=False):
+        def gh(*args):
+            self.calls.append(args)
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis'):
+                return (1, '', 'Not Found') if exists is None else (0, exists + '\n', '')
+            if args[:1] == ('api',) and args[1].endswith('/collaborators/davidlarrimore-bot'):
+                return (0 if collaborator else 1), '', ''
+            return 0, '', ''
+        magehand.gh_cli = gh
+
+    def run_new(self, *argv):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            return magehand.cmd_new(magehand.build_parser().parse_args(['new', *argv]))
+
+    def test_creates_private_from_the_template_and_invites_the_bot(self):
+        self.fake()
+        self.run_new('elvis')
+        self.assertIn(('repo', 'create', 'davidlarrimore/elvis', '--private', '--template',
+                       'davidlarrimore/homelab-app-template'), self.calls)
+        self.assertIn(('api', '-X', 'PUT', 'repos/davidlarrimore/elvis/collaborators/davidlarrimore-bot',
+                       '-f', 'permission=push'), self.calls)
+
+    def test_rerun_changes_nothing(self):
+        self.fake(exists='true', collaborator=True)
+        self.run_new('elvis')
+        self.assertFalse([c for c in self.calls if c[0] == 'repo' or '-X' in c])
+
+    def test_existing_public_repo_gets_the_bot_and_a_warning(self):
+        import contextlib
+        import io
+        self.fake(exists='false')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_new('elvis')
+        self.assertIn('PUBLIC', err.getvalue())
+        self.assertFalse([c for c in self.calls if c[0] == 'repo'])  # visibility is the owner's call
+        self.assertTrue([c for c in self.calls if '-X' in c])
+
+    def test_bad_and_reserved_names(self):
+        self.fake()
+        for name in ('Elvis', '-x', 'a' * 41, 'litellm', 'homelab-apps'):
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_new(name)
+            self.assertEqual(ctx.exception.code, 2, name)
+        self.assertEqual(self.calls, [])
+
+
 class StayingCurrent(unittest.TestCase):
     def test_newest_tag(self):
         self.assertEqual(magehand.newest_tag(['v0.1.1', 'v0.10.0', 'v0.9.3', 'latest', 'v1.0']), '0.10.0')
