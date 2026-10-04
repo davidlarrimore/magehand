@@ -1011,6 +1011,23 @@ def cmd_run(a):
 
 # --- doctor and update ---------------------------------------------------------------
 
+def current_repo(root='.'):
+    """OWNER/NAME of the app repo in `root` (from its origin remote), or None outside one."""
+    if not is_app_checkout(root):
+        return None
+    out = quiet(['git', '-C', str(root), 'remote', 'get-url', 'origin'])
+    m = re.search(rf'github\.com[:/]{OWNER}/([\w.-]+?)(?:\.git)?\s*$', out.stdout) if out and out.returncode == 0 else None
+    return f'{OWNER}/{m.group(1)}' if m else None
+
+
+def repo_state(repo):
+    """{'ruleset': True|False|None, 'bot': True|False}: the repo has the approval ruleset (None: not readable,
+    it needs admin) and OpenClaw's bot can write to it."""
+    code, out, _ = gh_cli('api', f'repos/{repo}/rulesets', '--jq', '.[].name')
+    ruleset = (RULESET['name'] in out.splitlines()) if code == 0 else None
+    return {'ruleset': ruleset, 'bot': gh_cli('api', f'repos/{repo}/collaborators/{BOT}')[0] == 0}
+
+
 def cmd_doctor(a):
     ok = True
     results = []
@@ -1035,6 +1052,16 @@ def cmd_doctor(a):
     token = saved_token()
     check('signed in to OpenBao', bool(reach and token and bao('GET', 'auth/token/lookup-self', token)[0] == 200),
           '`magehand login`')
+    repo = current_repo()
+    if repo:
+        state = repo_state(repo)
+        fix = f'`magehand new {repo.split("/", 1)[1]}` (re-running it is safe)'
+        check(f'{repo}: OpenClaw\'s bot can write', state['bot'], fix)
+        if state['ruleset'] is None:
+            if not a.json:
+                print(f'--   {repo}: approval ruleset not readable (needs admin on the repo)')
+        else:
+            check(f"{repo}: ruleset '{RULESET['name']}'", state['ruleset'], fix)
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
@@ -1371,6 +1398,34 @@ def try_load_app(name, root=None):
     return app
 
 
+def is_app_checkout(root):
+    """True for an app's own repo (not a homelab-apps checkout): it has the template's ui-check.yaml or a deploy/app.yaml."""
+    root = pathlib.Path(root)
+    return (root / 'ui-check.yaml').is_file() or (root / DEPLOY / 'app.yaml').is_file()
+
+
+def check_agents_drift(root):
+    """A warning when the repo's AGENTS.md platform rules (above "## This app") differ from the template's:
+    the platform moved on and `magehand update-agents` brings them in. Skipped without a readable template
+    (offline, or CI without access to it) and outside an app's own repo."""
+    path = pathlib.Path(root) / 'AGENTS.md'
+    if not is_app_checkout(root) or not path.is_file():
+        return []
+    try:
+        template = github_file(TEMPLATE_REPO, 'AGENTS.md', required=False)
+    except SystemExit:  # no GitHub token: nothing to compare with
+        return []
+    platform, app = split_agents(template or '')
+    if not template or app is None:
+        return []
+    current, own = split_agents(path.read_text())
+    if own is not None and current == platform:
+        return []
+    why = ('has no "## This app" heading' if own is None else 'the platform rules above "## This app" are out of date')
+    return [finding('warning', 'AGENTS.md', f'{why}: run `magehand update-agents` and commit the diff',
+                    'homelab-apps AGENTS.md')]
+
+
 def cmd_check(a):
     global APPS_DIR
     manifests_only = a.manifests_only
@@ -1383,7 +1438,7 @@ def cmd_check(a):
     app = try_load_app(name, root)
     found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root, name)
     if not manifests_only:
-        found += check_code(root, app, catalog)
+        found += check_code(root, app, catalog) + check_agents_drift(root)
     errors = sum(f['level'] == 'error' for f in found)
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
