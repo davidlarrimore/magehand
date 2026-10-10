@@ -1624,10 +1624,13 @@ ask the platform, with magehand (installed with `uv tool install magehand`).
    so): mock the LLM until then. Never use another app's key.
 5. If the guide doesn't answer, say so in the PR or issue (what you searched
    for) instead of inventing a mechanism; the owner adds it to the guide.
-6. Opening a PR: ready for review (not a draft), then request the reviewer,
-   `gh pr edit N --add-reviewer davidlarrimore-bot`. OpenClaw reviews only
-   when asked: a push starts no review and dismisses the approval, so request
-   it again after pushing fixes. Don't call the PR ready to merge until its
+6. Opening a PR: open it as a draft (`gh pr create --draft`) and request the
+   reviewer at once, `gh pr edit N --add-reviewer davidlarrimore-bot`. CI runs
+   on drafts and OpenClaw ignores them: push until `magehand check` and CI are
+   green, then `gh pr ready N`, which starts the review (each review costs a
+   model run). A push starts no review and dismisses the approval: to change a
+   reviewed PR, `gh pr ready N --undo`, push until green, `gh pr ready N` and
+   request the reviewer again. Don't call the PR ready to merge until its
    review has posted; the owner merges. Base every PR on `main` (the repo's
    ruleset only guards the default branch).
 7. When `magehand check` warns that AGENTS.md is behind the template, run

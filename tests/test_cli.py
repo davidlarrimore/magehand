@@ -910,7 +910,7 @@ BOT_PATH = f"/collaborators/{magehand.BOT}"
 
 class SkillProcess(unittest.TestCase):
     def test_the_skill_teaches_the_review_and_agents_process(self):
-        for text in ('gh pr edit N --add-reviewer davidlarrimore-bot', 'magehand update-agents', 'not a draft',
+        for text in ('gh pr edit N --add-reviewer davidlarrimore-bot', 'magehand update-agents', 'gh pr create --draft', 'gh pr ready N',
                      'Base every PR on `main`'):
             self.assertIn(text, magehand.SKILL)
 
