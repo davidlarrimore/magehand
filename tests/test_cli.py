@@ -837,6 +837,41 @@ class New(unittest.TestCase):
             self.assertEqual(magehand.ensure_app_name('davidlarrimore/elvis', 'lab'), state)
             self.assertEqual(writes, [], state)  # never rewrites a deploy/app.yaml that exists
 
+    def test_names_that_are_not_yaml_strings_bare_round_trip_as_strings(self):
+        import base64
+        for app in ('true', 'yes', 'null', '123', 'on', '1e3'):
+            self.fake()
+            writes = self.with_contents()
+            self.run_new('elvis', '--app-name', app)
+            body = dict(a.split('=', 1) for a in writes[-1][3:] if a.startswith('content='))
+            seeded = magehand.yaml.safe_load(base64.b64decode(body['content']).decode())
+            self.assertEqual(seeded['app'], app, app)
+
+    def test_a_failed_naming_commit_exits_1_after_the_rest_is_set_up(self):
+        import contextlib
+        import io
+        self.fake()
+        self.with_contents(put_fails=99)
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--app-name', 'lab', '--json']))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn('could not write deploy/app.yaml', err.getvalue())
+        self.assertEqual(json.loads(out.getvalue())['app_name'], 'failed')
+        self.assertIn(('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-'), self.calls)
+        self.assertIn(('api', '-X', 'PUT', 'repos/davidlarrimore/elvis/collaborators/davidlarrimore-bot',
+                       '-f', 'permission=push'), self.calls)
+
+    def test_a_repo_that_names_another_app_exits_1(self):
+        self.fake(exists='true', collaborator=True, ruleset=True)
+        self.with_contents(existing='app: other\nservices: {}\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_new('elvis', '--app-name', 'lab')
+        self.assertEqual(ctx.exception.code, 1)
+
     def test_without_app_name_nothing_is_written(self):
         self.fake()
         writes = self.with_contents()

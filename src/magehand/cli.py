@@ -664,7 +664,7 @@ def ensure_ruleset(repo):
 
 APP_SEED = ('# This repo is {repo}; the app it deploys is named {app} (its hostnames, namespace and image).\n'
             '# Keep `app:` here: without it the platform names the app after the repo.\n'
-            'app: {app}\n'
+            'app: "{app}"\n'  # quoted: true, null and 123 are valid names and not YAML strings bare
             'services: {{}}\n')
 
 
@@ -733,15 +733,20 @@ def cmd_new(a):
         print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
+    unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
                           'ruleset': ruleset, 'app_name': named}, indent=1))
-        return
-    keep = f'  deploy/app.yaml already says `app: {app}`: keep it\n' if named in ('seeded', 'present') else ''
-    print(f'Next:\n  gh repo clone {repo} && cd {name}\n{keep}'
-          '  write the code and deploy/ (`magehand guide search new app`); mock the LLM for now\n'
-          f'  when deploy/ (app.yaml and base/) is merged to main, the platform registers {app} by itself '
-          'within about 5 minutes; then it has dev and its own LLM key')
+    else:
+        keep = (f'  FIRST: make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
+                f'{name})\n' if unnamed else
+                f'  deploy/app.yaml already says `app: {app}`: keep it\n' if named in ('seeded', 'present') else '')
+        print(f'Next:\n  gh repo clone {repo} && cd {name}\n{keep}'
+              '  write the code and deploy/ (`magehand guide search new app`); mock the LLM for now\n'
+              f'  when deploy/ (app.yaml and base/) is merged to main, the platform registers '
+              f'{name if unnamed else app} by itself within about 5 minutes; then it has dev and its own LLM key')
+    if unnamed:  # everything else is set up; a script must not carry on as if the app were named
+        sys.exit(1)
 
 
 # --- the container runtime: what runs local blocks and `run --container` -------------
