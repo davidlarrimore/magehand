@@ -59,7 +59,7 @@ COMMAND`) explains one, with examples.
 | `magehand run --container [--no-build] [-- CMD]` | Builds the repo's Dockerfile and runs the image as its pod runs: read-only, `/tmp` tmpfs, the pod's user, no capabilities, exactly the pod's env. Secrets go in as `-e NAME` only, never in the image, argv or on disk |
 | `magehand dev [up\|down\|status] [APP]` | Containers for the app's `postgres`/`redis` blocks (the blocks' own pinned images) on a per-app network, and local values for `secret` blocks. `down` deletes the local data |
 | `magehand runtime [docker\|podman\|none\|auto] [--json]` | Shows or sets the container runtime for `dev` and `run --container`. Detected without sudo (`<cli> info`): the `docker` CLI of Docker Desktop, OrbStack, Colima or Rancher Desktop (dockerd), or Podman. `auto` (the default) uses the first running one; `none` means no containers (`magehand run -- CMD` still works for apps whose blocks are only `llm` and `secret`) |
-| `magehand login` | Signs in to OpenBao through authentik (passkey) with role `dev`: read-only access to agent apps' LiteLLM keys, 1h (8h max). The token is kept in the macOS Keychain |
+| `magehand login [--check [--min N]] [--json]` | Signs in to OpenBao through authentik (passkey) with role `dev`: read-only access to agent apps' LiteLLM keys, 1h (8h max). The token is kept in the macOS Keychain. `doctor`, `app` and `run` show the time left (a warning under 10 minutes); an expired session in a terminal offers to sign in again and carries on. `--check` only reports the time left and exits 1 when signed out or under N minutes (default 10), so an agent can ask you to sign in before a long task |
 
 **This machine**
 

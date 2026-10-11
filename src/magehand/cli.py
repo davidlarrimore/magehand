@@ -352,11 +352,46 @@ def saved_token():
     return path.read_text().strip() if path.is_file() else None
 
 
+SIGNIN_WARN = 600  # seconds: warn when the session has less than this left
+NO_EXPIRY = 10 ** 9
+
+
+def signin_left(token=None):
+    """Seconds left on the OpenBao session, or None when not signed in (no token, or it expired)."""
+    token = token or saved_token()
+    if not token:
+        return None
+    status, body = bao('GET', 'auth/token/lookup-self', token)
+    if status != 200:
+        return None
+    ttl = ((body or {}).get('data') or {}).get('ttl')
+    return ttl if isinstance(ttl, int) and ttl > 0 else NO_EXPIRY  # ttl 0: the token never expires
+
+
+def minutes(seconds):
+    if seconds >= NO_EXPIRY:
+        return 'no expiry'
+    return 'under 1 min' if seconds < 60 else f'{seconds // 60} min'
+
+
 def valid_token():
+    """The session token. Reports the time left (a warning under 10 minutes); an expired session in a terminal
+    offers to sign in again and carries on, otherwise it says how to."""
     token = saved_token()
-    if token and bao('GET', 'auth/token/lookup-self', token)[0] == 200:
-        return token
-    die('not signed in, or the token expired: run `magehand login`')
+    left = signin_left(token)
+    if left is None and sys.stdin.isatty() and sys.stderr.isatty():
+        answer = input('magehand: not signed in, or the session expired. Sign in again now? [Y/n] ').strip().lower()
+        if answer in ('', 'y', 'yes'):
+            cmd_login(None)
+            token = saved_token()
+            left = signin_left(token)
+    if left is None:
+        die('not signed in, or the token expired: run `magehand login`')
+    note = f'magehand: signed in, {minutes(left)} left'
+    if left < SIGNIN_WARN:
+        note += '; `magehand login` renews it before a long task'
+    print(note, file=sys.stderr)
+    return token
 
 
 def identity():
@@ -364,7 +399,22 @@ def identity():
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
-def cmd_login(_args):
+def login_check(a):
+    left = signin_left()
+    need = a.min * 60
+    ok = left is not None and left >= need
+    if a.json:
+        print(json.dumps({'signed_in': left is not None, 'seconds_left': left or 0, 'min_minutes': a.min, 'ok': ok}))
+    elif left is None:
+        print('magehand: not signed in: run `magehand login`', file=sys.stderr)
+    else:
+        print(f'signed in, {minutes(left)} left' + ('' if ok else f' (less than {a.min} min): run `magehand login`'))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_login(args):
+    if getattr(args, 'check', False):
+        login_check(args)
     status, body = bao('POST', 'auth/oidc/oidc/auth_url', body={'role': 'dev', 'redirect_uri': CALLBACK})
     url = ((body or {}).get('data') or {}).get('auth_url')
     if status != 200 or not url:
@@ -499,6 +549,7 @@ def cmd_app(a):
     deployed = registration(name) if app['root'] else app['spec']
     keys = {block: llm_key_state(name, block, deployed)
             for block, svc in app['services'].items() if (svc or {}).get('type') == 'llm'}
+    left = signin_left()
     if a.json:
         env = []
         for entry in env_plan(app):
@@ -511,13 +562,18 @@ def cmd_app(a):
         print(json.dumps({'name': name, 'code': f'davidlarrimore/{source}' if source or app['root'] else f'homelab-apps apps/{name}/image',
                           'deployment': app['where'], 'dev_url': f'https://{name}-dev.{LAB}',
                           'port': app_port(app), 'registered': deployed is not None, 'blocks': app['services'],
-                          'llm_keys': keys, 'env': env}, indent=1))
+                          'llm_keys': keys, 'env': env,
+                          'signin_seconds_left': left}, indent=1))
         return
     deployment = ('deploy/ in this repo (merging copies it to homelab-apps apps/%s)' % name if app['root']
                   else app['where'])
     print(f'{name}  (code: {"davidlarrimore/" + source if source else "homelab-apps apps/" + name + "/image"};'
           f' deployment: {deployment})')
     print(f'  dev:      https://{name}-dev.{LAB}')
+    if left is None:
+        print('  sign-in:  not signed in (`magehand login`; run needs it for LLM keys)')
+    else:
+        print(f'  sign-in:  {minutes(left)} left' + ('  (`magehand login` renews it)' if left < SIGNIN_WARN else ''))
     if deployed is None:
         print(f'  not registered yet (no homelab-apps apps/{name}/): no dev deploy and no LLM key until deploy/ '
               'is merged to main (the platform then registers it, within about 5 minutes)')
@@ -1321,9 +1377,14 @@ def cmd_doctor(a):
     except (OSError, urllib.error.HTTPError):
         reach = False
     check(f'reach {OPENBAO}', reach, NOT_SET_UP)
-    token = saved_token()
-    check('signed in to OpenBao', bool(reach and token and bao('GET', 'auth/token/lookup-self', token)[0] == 200),
+    left = signin_left() if reach else None
+    check('signed in to OpenBao' + (f', {minutes(left)} left' if left is not None else ''), left is not None,
           '`magehand login`')
+    if left is not None and left < SIGNIN_WARN:
+        note = f'sign-in has {minutes(left)} left; `magehand login` renews it before a long task'
+        results.append({'check': 'sign-in time left', 'ok': None, 'hint': note})
+        if not a.json:
+            print(f'--   {note}')
     repo = current_repo()
     if repo:
         state = repo_state(repo)
@@ -2004,8 +2065,7 @@ def cmd_setup(a):
             die(f'{host} now resolves via {server} but https still fails; is this Mac on a network that reaches it?')
         print(f'    ok: {host} -> {lab_address(host)} (undo: magehand setup --undo)')
     print('4/5 sign in')
-    token = saved_token()
-    if token and bao('GET', 'auth/token/lookup-self', token)[0] == 200:
+    if signin_left() is not None:
         print('    ok (already signed in)')
     else:
         cmd_login(None)
@@ -2269,7 +2329,15 @@ def build_parser():
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
     json_option(p)
     # run it locally
-    command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, up to 8h)')
+    p = command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, up to 8h)',
+                'The session lasts about an hour; commands that need it show the time left and, in a terminal,\n'
+                'offer to sign in again when it has expired. An agent cannot tap the passkey: check first.\n\n'
+                'examples:\n  magehand login\n  magehand login --check            exit 1 unless signed in, 10+ min left\n'
+                '  magehand login --check --min 30 --json')
+    p.add_argument('--check', action='store_true', help='only report the time left (exit 1 when signed out or low)')
+    p.add_argument('--min', type=int, default=SIGNIN_WARN // 60, metavar='N',
+                   help='with --check: minutes that must remain (default: %(default)s)')
+    json_option(p)
     p = command('dev', cmd_dev, 'local postgres/redis blocks: up, down, status', "start, stop or show local containers for the app's postgres/redis blocks",
                 'Also makes local values for secret blocks. llm keys need nothing here: they come from\n'
                 'OpenBao when the app runs.\n\n'
@@ -2282,6 +2350,8 @@ def build_parser():
     p = command('run', cmd_run, "run a command or the app's image with its pod's env", "run a command, or the app's image, with the env the app's pod gets",
                 'Secrets come from OpenBao and local containers, never from disk. A proxy on 127.0.0.1:8080\n'
                 'adds the X-authentik-* headers Traefik would, as you.\n\n'
+                'Keys are read from OpenBao once, when it starts (the time left on your sign-in is shown), so\n'
+                'a run keeps working after the session expires; sign in again before starting a new one.\n\n'
                 'examples:\n  magehand run -- python -B app.py\n  magehand run --no-proxy -- npm run dev\n'
                 '  magehand run --container        build the Dockerfile and run the image as its pod runs')
     app_option(p, positional=False)
