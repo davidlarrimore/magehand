@@ -141,7 +141,7 @@ class MissingKey(unittest.TestCase):
     def test_not_registered(self):
         text = self.message()
         self.assertIn("isn't registered", text)
-        self.assertIn('OpenClaw registers', text)
+        self.assertIn('registers by itself', text)
         self.assertIn("Never use another app's key", text)
 
     def test_block_not_deployed_yet(self):
@@ -516,6 +516,81 @@ class DeployDir(unittest.TestCase):
             self.assertIn('namespace must be demo', errors[0])
 
 
+def git_checkout(root, remote):
+    import subprocess
+    subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    subprocess.run(['git', '-C', str(root), 'remote', 'add', 'origin', remote], check=True)
+    return root
+
+
+class AppNameOverride(unittest.TestCase):
+    """deploy/app.yaml's `app:` names the app when its repo is named differently."""
+
+    REMOTE = 'git@github.com:davidlarrimore/lab-website.git'
+
+    def setUp(self):
+        self.saved = magehand.APPS_DIR
+        self.apps = tempfile.TemporaryDirectory()
+        magehand.APPS_DIR = self.apps.name
+        self.addCleanup(setattr, magehand, 'APPS_DIR', self.saved)
+        self.addCleanup(self.apps.cleanup)
+
+    def checkout(self, tmp, app_yaml):
+        return git_checkout(deploy_repo(tmp, app_yaml), self.REMOTE)
+
+    def register(self, name, text):
+        d = pathlib.Path(self.apps.name) / 'apps' / name
+        d.mkdir(parents=True)
+        (d / 'app.yaml').write_text(text)
+
+    def test_the_app_is_app_or_the_repo_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(magehand.checkout_app(self.checkout(tmp, 'app: lab\nservices: {}\n')), 'lab')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(magehand.checkout_app(self.checkout(tmp, 'services: {}\n')), 'lab-website')
+        with tempfile.TemporaryDirectory() as tmp:  # an invalid app: is reported by check, never used as a name
+            self.assertEqual(magehand.checkout_app(self.checkout(tmp, 'app: Not A Name\n')), 'lab-website')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(magehand.current_app(self.checkout(tmp, 'app: lab\nservices: {}\n')), 'lab')
+
+    def test_platform_repos_are_not_apps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = git_checkout(pathlib.Path(tmp), 'git@github.com:davidlarrimore/homelab-apps.git')
+            self.assertIsNone(magehand.checkout_app(root))
+
+    def load(self, tmp, app_yaml, name='lab'):
+        return magehand.try_load_app(name, self.checkout(tmp, app_yaml))
+
+    def test_valid_override_and_unregistered_name_are_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), [])
+
+    def test_invalid_or_reserved_app(self):
+        for bad in ('Lab', 'lab-dev', 'litellm', '123x-', '[x]'):
+            with tempfile.TemporaryDirectory() as tmp:
+                errors = texts(magehand.check_app_name(self.load(tmp, f'app: {bad}\nservices: {{}}\n', name='x')),
+                               'error')
+            self.assertEqual(len(errors), 1, bad)
+
+    def test_a_name_registered_to_another_repo_is_an_error(self):
+        self.register('lab', 'source: {repo: lab}\nservices: {}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = texts(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), 'error')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('registered in homelab-apps to davidlarrimore/lab', errors[0])
+
+    def test_registered_to_this_repo_is_fine(self):
+        self.register('lab', 'source: {repo: lab-website}\nservices: {}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), [])
+
+    def test_a_repo_that_lost_its_app_key_is_an_error(self):
+        self.register('lab', 'source: {repo: lab-website}\nservices: {}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = texts(magehand.check_app_name(self.load(tmp, 'services: {}\n', name='lab-website')), 'error')
+        self.assertTrue(any('registered as the app lab' in e and 'restore `app: lab`' in e for e in errors), errors)
+
+
 class ModelRule(unittest.TestCase):
     def run_check(self, code, services):
         with tempfile.TemporaryDirectory() as tmp:
@@ -710,6 +785,73 @@ class New(unittest.TestCase):
         self.assertIn('PUBLIC', err.getvalue())
         self.assertFalse([c for c in self.calls if c[0] == 'repo'])  # visibility is the owner's call
         self.assertTrue([c for c in self.calls if '-X' in c])
+
+    def with_contents(self, existing=None, put_fails=0):
+        """Add deploy/app.yaml reads (`existing` text, else 404) and writes (the first `put_fails` fail) to fake()."""
+        inner, writes = magehand.gh_cli, []
+
+        def gh(*args, **kw):
+            if any(a.endswith('/contents/deploy/app.yaml') for a in args):
+                self.calls.append(args)
+                if args[:3] == ('api', '-X', 'PUT'):
+                    if put_fails > len(writes):
+                        writes.append(None)
+                        return 1, '', 'HTTP 404'
+                    writes.append(args)
+                    return 0, '', ''
+                return (0, existing, '') if existing is not None else (1, '', 'HTTP 404')
+            return inner(*args, **kw)
+        magehand.gh_cli = gh
+        return writes
+
+    def test_app_name_seeds_deploy_app_yaml_on_the_new_repo(self):
+        import base64
+        self.fake()
+        writes = self.with_contents()
+        self.run_new('elvis', '--app-name', 'lab')
+        self.assertIn(('repo', 'create', 'davidlarrimore/elvis', '--private', '--template',
+                       'davidlarrimore/homelab-app-template'), self.calls)
+        self.assertEqual(len(writes), 1)
+        body = dict(a.split('=', 1) for a in writes[0][3:] if '=' in a and not a.startswith('repos/'))
+        text = base64.b64decode(body['content']).decode()
+        self.assertIn('\napp: lab\n', text)
+        self.assertEqual(magehand.yaml.safe_load(text)['app'], 'lab')
+        # the seeding commit comes before the ruleset can ask for a review
+        put = next(i for i, c in enumerate(self.calls) if c[:3] == ('api', '-X', 'PUT') and 'deploy/app.yaml' in c[3])
+        rules = next(i for i, c in enumerate(self.calls) if c[:3] == ('api', '-X', 'POST'))
+        self.assertLess(put, rules)
+
+    def test_app_name_write_is_retried_while_the_template_copy_settles(self):
+        self.fake()
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        writes = self.with_contents(put_fails=2)
+        self.run_new('elvis', '--app-name', 'lab')
+        self.assertEqual(len([w for w in writes if w]), 1)
+
+    def test_app_name_states_on_an_existing_repo(self):
+        for existing, state in (('app: lab\nservices: {}\n', 'present'), ('services: {}\n', 'differs'),
+                                ('app: other\n', 'differs')):
+            self.fake(exists='true', collaborator=True, ruleset=True)
+            writes = self.with_contents(existing=existing)
+            self.assertEqual(magehand.ensure_app_name('davidlarrimore/elvis', 'lab'), state)
+            self.assertEqual(writes, [], state)  # never rewrites a deploy/app.yaml that exists
+
+    def test_without_app_name_nothing_is_written(self):
+        self.fake()
+        writes = self.with_contents()
+        self.run_new('elvis')
+        self.assertEqual(writes, [])
+        self.assertFalse([c for c in self.calls if any(a.endswith('/contents/deploy/app.yaml') for a in c)])
+
+    def test_app_name_is_validated_like_a_name(self):
+        self.fake()
+        for argv in (('elvis', '--app-name', 'Lab'), ('elvis', '--app-name', 'litellm'),
+                     ('elvis', '--app-name', 'lab-dev'), ('elvis', '--app-name', 'kube-x')):
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_new(*argv)
+            self.assertEqual(ctx.exception.code, 2, argv)
+        self.assertEqual(self.calls, [])
 
     def test_bad_and_reserved_names(self):
         self.fake()

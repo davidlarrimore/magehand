@@ -126,11 +126,11 @@ def github_dir(repo, path):
 
 # --- The app ------------------------------------------------------------------
 
-def current_app():
-    """The app this checkout is: an app repo is named after its app."""
-    if subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True).returncode != 0:  # nosec B603 B607
+def current_app(root=None):
+    """The app this checkout is: its deploy/app.yaml `app:` if it sets one, else the repo's name."""
+    if remote_repo(root) is None:
         die('not in a git checkout; pass the app name')
-    name = checkout_app()
+    name = checkout_app(root)
     if not name:
         die('this is a platform repo; pass the app name')
     return name
@@ -151,12 +151,8 @@ def deploy_dir(root):
 
 def repo_root(name):
     """The top of this git checkout if it is app `name`'s repo, else None."""
-    out = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)  # nosec B603 B607
-    remote = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True)  # nosec B603 B607
-    if out.returncode != 0 or remote.returncode != 0:
-        return None
-    repo = remote.stdout.strip().rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
-    return pathlib.Path(out.stdout.strip()) if repo in (name, name + '.git') else None
+    top = checkout_top()
+    return top if top and checkout_app() == name else None
 
 
 def load_app(name, root=None):
@@ -173,7 +169,7 @@ def load_app(name, root=None):
         if spec is None:
             die(f'{name} has no deployment yet: no deploy/app.yaml in this checkout and not registered on the platform '
                 f'(no homelab-apps apps/{name}/). Write deploy/app.yaml and deploy/base/ (`magehand guide search '
-                'deploy`); OpenClaw registers the app (ask it on Telegram or in an issue labelled openclaw)')
+                'deploy`); the platform registers the app by itself when they are merged to main')
         files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
     found = [(path, d) for path, text in files for d in yaml.safe_load_all(text)
              if isinstance(d, dict) and d.get('kind') == 'Deployment']
@@ -210,8 +206,8 @@ def no_llm_key(name, block, path, status):
     state = llm_key_state(name, block, registration(name))
     if state == 'unregistered':
         why = (f'{name} isn\'t registered on the platform yet (no homelab-apps apps/{name}/), so it has no dev key. '
-               'OpenClaw registers new apps: ask it on Telegram or in an issue labelled openclaw. Until then run '
-               'without the LLM (mock it, as the tests do)')
+               'It registers by itself when deploy/ (app.yaml and base/) is merged to main, within about 5 '
+               'minutes. Until then run without the LLM (mock it, as the tests do)')
     elif state == 'undeployed':
         why = (f'block {block} is in deploy/app.yaml but not deployed yet: its key is created when the change is '
                'merged and dev deploys (`magehand app` shows the state). Until then mock the LLM')
@@ -222,14 +218,51 @@ def no_llm_key(name, block, path, status):
             'are that app\'s (`magehand guide local-dev`)')
 
 
-def checkout_app():
-    """The app whose repo this checkout is (named after the app), or None outside an app repo."""
-    out = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True)  # nosec B603 B607
-    if out.returncode != 0:
+def git_out(args, root=None):
+    """Stdout of `git [-C root] ARGS` (stripped), or None if git fails."""
+    cmd = ['git', *(['-C', str(root)] if root else []), *args]
+    out = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 B607
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def remote_repo(root=None):
+    """The repo name (no owner, no .git) of the checkout's origin remote, or None without one."""
+    url = git_out(['remote', 'get-url', 'origin'], root)
+    if not url:
         return None
-    name = out.stdout.strip().rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
-    name = name[:-4] if name.endswith('.git') else name
-    return None if name in ('homelab', 'homelab-apps') else name
+    name = url.rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
+    return name[:-4] if name.endswith('.git') else name
+
+
+def checkout_top(root=None):
+    """The top directory of the git checkout at `root` (default: here), or None outside one."""
+    top = git_out(['rev-parse', '--show-toplevel'], root)
+    return pathlib.Path(top) if top else None
+
+
+def app_override(root):
+    """deploy/app.yaml's optional top-level `app:` (a string) in the checkout at `root`, or None. It names
+    the app when its repo is named differently (`magehand new REPO --app-name APP`)."""
+    local = deploy_dir(root) if root else None
+    if not local:
+        return None
+    try:
+        spec = yaml.safe_load((local / 'app.yaml').read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    value = spec.get('app') if isinstance(spec, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def checkout_app(root=None):
+    """The app whose repo this checkout is: deploy/app.yaml's `app:` when it sets a valid one, else the
+    repo's name. None outside a git checkout and in the platform repos."""
+    repo = remote_repo(root)
+    if repo is None or repo in ('homelab', 'homelab-apps'):
+        return None
+    top = checkout_top(root)
+    override = app_override(top) if top else None
+    return override if override and APP_NAME.match(override) else repo
 
 
 def app_repo_here():
@@ -457,7 +490,7 @@ def cmd_guide(a):
 def cmd_app(a):
     app = app_here(a.app_flag or a.app)
     name = app['name']
-    source = (app['spec'].get('source') or {}).get('repo') or (name if app['root'] else None)
+    source = (app['spec'].get('source') or {}).get('repo') or (remote_repo(app['root']) if app['root'] else None)
     deployed = registration(name) if app['root'] else app['spec']
     keys = {block: llm_key_state(name, block, deployed)
             for block, svc in app['services'].items() if (svc or {}).get('type') == 'llm'}
@@ -481,8 +514,8 @@ def cmd_app(a):
           f' deployment: {deployment})')
     print(f'  dev:      https://{name}-dev.{LAB}')
     if deployed is None:
-        print(f'  not registered yet (no homelab-apps apps/{name}/): no dev deploy and no LLM key until OpenClaw '
-              'registers it (ask it on Telegram or in an openclaw issue)')
+        print(f'  not registered yet (no homelab-apps apps/{name}/): no dev deploy and no LLM key until deploy/ '
+              'is merged to main (the platform then registers it, within about 5 minutes)')
     for preview in github_dir(APPS_REPO, f'previews/{name}'):
         if preview.endswith('.yaml'):
             print(f'  preview:  https://{name}-dev-{preview[:-5]}.{LAB}')
@@ -629,13 +662,46 @@ def ensure_ruleset(repo):
     return 'failed'
 
 
+APP_SEED = ('# This repo is {repo}; the app it deploys is named {app} (its hostnames, namespace and image).\n'
+            '# Keep `app:` here: without it the platform names the app after the repo.\n'
+            'app: {app}\n'
+            'services: {{}}\n')
+
+
+def ensure_app_name(repo, app):
+    """Make the repo's deploy/app.yaml say `app: APP`: 'seeded' (written, as the owner, on main), 'present'
+    (already says it), 'differs' (says another app, left alone) or 'failed' (couldn't write). deploy/ with only
+    app.yaml is not deployed: registration waits for deploy/base/."""
+    code, out, _ = gh_cli('api', '-H', 'Accept: application/vnd.github.raw', f'repos/{repo}/contents/deploy/app.yaml')
+    if code == 0:
+        try:
+            spec = yaml.safe_load(out) or {}
+        except yaml.YAMLError:
+            spec = {}
+        found = spec.get('app') if isinstance(spec, dict) else None
+        return 'present' if found == app else 'differs'
+    body = APP_SEED.format(repo=repo.split('/', 1)[1], app=app)
+    for attempt in range(6):  # a repo made from a template has its files a moment later
+        code, _, err = gh_cli('api', '-X', 'PUT', f'repos/{repo}/contents/deploy/app.yaml',
+                              '-f', f'message=Name the app {app} (deploy/app.yaml app:)',
+                              '-f', 'content=' + base64.b64encode(body.encode()).decode())
+        if code == 0:
+            return 'seeded'
+        time.sleep(2 if attempt < 5 else 0)
+    print(f'{repo}: could not write deploy/app.yaml ({err or "gh api failed"}); add `app: {app}` to it yourself '
+          '(first line) before the first deploy', file=sys.stderr)
+    return 'failed'
+
+
 def cmd_new(a):
     name = a.name
-    if not APP_NAME.match(name):
-        usage('new', f"bad app name '{name}': lowercase letters, digits and dashes, at most 40, "
-                     'starting and ending with a letter or digit')
-    if name in RESERVED:
-        usage('new', f"'{name}' is reserved for the platform; choose another")
+    app = a.app_name or name
+    for label, value in (('repo', name), ('app', app)):
+        if not APP_NAME.match(value):
+            usage('new', f"bad {label} name '{value}': lowercase letters, digits and dashes, at most 40, "
+                         'starting and ending with a letter or digit')
+        if value in RESERVED or (label == 'app' and (value.endswith(('-dev', '-prod')) or value.startswith('kube-'))):
+            usage('new', f"'{value}' is reserved for the platform; choose another")
     repo = f'{OWNER}/{name}'
     code, out, _ = gh_cli('api', f'repos/{repo}', '--jq', '.private')
     created = code != 0
@@ -659,15 +725,23 @@ def cmd_new(a):
             die(f'cannot invite {BOT} to {repo}: {err or "gh api failed"}')
         bot = 'invited'
         print(f'{BOT}: invited with write; OpenClaw accepts it within about 5 minutes', file=sys.stderr)
+    # Before the ruleset: the owner's one commit to main, so deploy/app.yaml names the app from the start.
+    named = ensure_app_name(repo, app) if app != name else None
+    if named == 'seeded':
+        print(f'{repo}: deploy/app.yaml says `app: {app}` (the repo keeps its name)', file=sys.stderr)
+    elif named == 'differs':
+        print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
+              '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
     if a.json:
-        print(json.dumps({'repo': repo, 'created': created, 'private': private, 'bot': bot, 'ruleset': ruleset},
-                         indent=1))
+        print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
+                          'ruleset': ruleset, 'app_name': named}, indent=1))
         return
-    print(f'Next:\n  gh repo clone {repo} && cd {name}\n'
+    keep = f'  deploy/app.yaml already says `app: {app}`: keep it\n' if named in ('seeded', 'present') else ''
+    print(f'Next:\n  gh repo clone {repo} && cd {name}\n{keep}'
           '  write the code and deploy/ (`magehand guide search new app`); mock the LLM for now\n'
-          f'  when deploy/ is on main, OpenClaw registers {name} (ask it, or an issue labelled openclaw '
-          f'in {APPS_REPO}); then it has dev and its own LLM key')
+          f'  when deploy/ (app.yaml and base/) is merged to main, the platform registers {app} by itself '
+          'within about 5 minutes; then it has dev and its own LLM key')
 
 
 # --- the container runtime: what runs local blocks and `run --container` -------------
@@ -1221,9 +1295,48 @@ def block_spec(catalog, kind):
             'key_options': spec.get('key_options') or BLOCK_KEYS.get(kind, {}).get('key_options') or {}}
 
 
+def check_app_name(app):
+    """The app's name against its repo and homelab-apps (only for a checkout's deploy/): `app:` is a valid
+    name, no other repo registered the name, and a repo registered under another name still says so."""
+    found = []
+    root = app.get('root')
+    if app.get('where') != DEPLOY or not root:
+        return found
+    at, guide = f'{DEPLOY}/app.yaml', 'README "How an app is put together"'
+    name, repo = app['name'], remote_repo(root)
+    if 'app' in app['spec']:
+        value = app['spec']['app']
+        if not isinstance(value, str) or not APP_NAME.match(value) or value.endswith(('-dev', '-prod')) \
+                or value.startswith('kube-'):
+            return [finding('error', at, f'app: {value!r} is not an app name (lowercase letters, digits and dashes, '
+                            'at most 40, not ending in -dev or -prod)', guide)]
+        if value in RESERVED:
+            return [finding('error', at, f'app: {value} is reserved for the platform', guide)]
+    if not repo:
+        return found
+    registered = registration(name)
+    if registered is not None:
+        owner = (registered.get('source') or {}).get('repo')
+        if owner != repo:
+            found.append(finding('error', at, f'the app name {name} is registered in homelab-apps to '
+                                 f'{"davidlarrimore/" + owner if owner else "code kept there"}, not to this repo '
+                                 f'({repo}): set another `app:`', guide))
+    if APPS_DIR:  # CI: homelab-apps' apps/ is on disk, so a repo registered under another name is found
+        for f in sorted(pathlib.Path(APPS_DIR, 'apps').glob('*/app.yaml')):
+            try:
+                other = (yaml.safe_load(f.read_text()) or {}).get('source') or {}
+            except (OSError, yaml.YAMLError, AttributeError):
+                continue
+            if f.parent.name != name and isinstance(other, dict) and other.get('repo') == repo:
+                found.append(finding('error', at, f'this repo is registered as the app {f.parent.name}, but '
+                                     f'{at} names {name}: restore `app: {f.parent.name}` (the image is named '
+                                     'after the app)', guide))
+    return found
+
+
 def check_manifests(app, catalog):
     """Rules for homelab-apps apps/<app>/: the blocks requested and the pod's env."""
-    found = []
+    found = check_app_name(app)
     where = app.get('where') or f"homelab-apps apps/{app['name']}"
     deployment_file = app.get('deployment_file') or f'{where}/base/deployment.yaml'
     if where == DEPLOY and 'source' in app['spec']:
@@ -1528,9 +1641,9 @@ def cmd_check(a):
     manifests_only = a.manifests_only
     if a.apps_dir:
         APPS_DIR = a.apps_dir
-    name = a.app_flag or a.app or current_app()
-    catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     root = pathlib.Path(a.code)
+    name = a.app_flag or a.app or current_app(root)
+    catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
     app = try_load_app(name, root)
     found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root, name)
@@ -1971,9 +2084,15 @@ def build_parser():
                 "create an app's private repo from homelab-app-template and invite OpenClaw's bot (write)",
                 'Uses gh as you (only the owner can create the repo). Safe to re-run: on an existing repo it\n'
                 'only invites the bot if needed, and warns if the repo is public. OpenClaw accepts the\n'
-                'invitation by itself; it registers the app once deploy/ is on main.\n\n'
-                'examples:\n  magehand new elvis\n  magehand new elvis --json')
-    p.add_argument('name', metavar='APP', help='the app name, also the repo name')
+                'invitation by itself; the platform registers the app once deploy/ is on main.\n'
+                'The app is named after the repo unless --app-name says otherwise (the repo lab-website\n'
+                'for the app lab: lab-dev.lab.davidlarrimore.com).\n\n'
+                'examples:\n  magehand new elvis\n  magehand new lab-website --app-name lab\n'
+                '  magehand new elvis --json')
+    p.add_argument('name', metavar='REPO', help="the repo's name (also the app's, unless --app-name)")
+    p.add_argument('--app-name', metavar='APP', dest='app_name',
+                   help="name the app APP when the repo isn't named after it (hostnames, namespace and image "
+                        'use APP); written to deploy/app.yaml as app:')
     json_option(p)
     # learn the platform and check an app
     p = command('guide', cmd_guide, 'read the platform guide: search it, recipes, a topic', 'read the platform guide for apps (live from homelab-apps docs/platform)',
