@@ -969,6 +969,26 @@ class New(unittest.TestCase):
         self.assertIn('has not finished', str(ctx.exception.code))
         self.assertFalse([c for c in self.calls if '-X' in c])  # no bot invite, no seed, no ruleset
 
+    def test_an_unreadable_api_is_not_reported_as_a_missing_copy(self):
+        """403/401/network on the probe says "could not check", never advice to delete or restore the repo."""
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        for exists, error in (('true', 'HTTP 403: API rate limit exceeded'), (None, 'HTTP 401: Bad credentials'),
+                              ('true', 'dial tcp: lookup api.github.com: no such host')):
+            self.calls.clear()
+            self.fake(exists=exists, collaborator=True, ruleset=True)
+            inner = magehand.gh_cli
+            magehand.gh_cli = lambda *a, __e=error, __i=inner, **k: (1, '', __e) \
+                if a[:1] == ('api',) and '/contents/' in a[1] else __i(*a, **k)
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_new('elvis')
+            message = str(ctx.exception.code)
+            self.assertIn('could not check', message, error)
+            self.assertIn(error, message)
+            self.assertNotIn('gh repo delete', message)
+            self.assertNotIn('has not finished', message)
+            self.assertFalse([c for c in self.calls if '-X' in c])  # still no writes
+
     def test_an_existing_repo_without_the_template_files_is_reported(self):
         saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
         self.addCleanup(setattr, magehand.time, 'sleep', saved)

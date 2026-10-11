@@ -700,14 +700,29 @@ def ensure_app_name(repo, app):
 TEMPLATE_FILES = ('AGENTS.md', '.github/workflows/build.yaml')
 
 
+def template_state(repo):
+    """('ready', ''), ('missing', path) when GitHub says a template file isn't there (HTTP 404), or
+    ('unknown', reason) when it can't be told (rate limit, authorization, network): never "missing"."""
+    for path in TEMPLATE_FILES:
+        code, _, err = gh_cli('api', f'repos/{repo}/contents/{path}')
+        if code != 0:
+            if re.search(r'HTTP 404|Not Found', err or ''):
+                return 'missing', path
+            return 'unknown', err or 'gh api failed'
+    return 'ready', ''
+
+
 def wait_for_template(repo, tries=30, delay=2):
-    """True once the template's files are on the repo's main (polls about tries*delay seconds)."""
+    """The last template_state after polling until the template's files are on the repo's main (about
+    tries*delay seconds). A copy in progress reads as missing; an unreadable API is retried too."""
+    state = ('missing', '')
     for attempt in range(tries):
-        if all(gh_cli('api', f'repos/{repo}/contents/{path}')[0] == 0 for path in TEMPLATE_FILES):
-            return True
+        state = template_state(repo)
+        if state[0] == 'ready':
+            return state
         if attempt < tries - 1:
             time.sleep(delay)
-    return False
+    return state
 
 
 def shell_path(path):
@@ -763,7 +778,12 @@ def cmd_new(a):
               '--accept-visibility-change-consequences'), file=sys.stderr)
     # The template's files first: a commit or a ruleset on main before GitHub's asynchronous copy lands makes
     # the copy fail. Nothing else is touched until they are there.
-    if not wait_for_template(repo, tries=30 if created else 4):
+    ready, detail = wait_for_template(repo, tries=30 if created else 4)
+    if ready == 'unknown':
+        die(f"could not check whether {repo} has the template's files ({detail}). Nothing else was changed; "
+            'fix the access problem (`gh auth status`, rate limits, network) and run `magehand new` again: '
+            'it is safe to re-run, and the repo is not known to be broken')
+    if ready != 'ready':
         die(f"{repo} has not got the template's files ({', '.join(TEMPLATE_FILES)}) "
             + ("after about a minute: GitHub's copy of " + TEMPLATE_REPO + ' has not finished. '
                'Nothing else was changed (no ruleset yet); run `magehand new` again in a minute'
