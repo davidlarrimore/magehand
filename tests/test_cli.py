@@ -494,6 +494,22 @@ class DeployDir(unittest.TestCase):
             found = magehand.check_deploy_files(root, 'lab')
             self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/base')])
 
+    def test_an_existing_base_without_a_deployment_is_still_rejected(self):
+        for body, why in (("kind: Service\nmetadata: {name: x}\n", 'has no Deployment'),
+                          ("kind: Deployment\n  broken: [", 'not valid YAML')):
+            with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as apps:
+                root = pathlib.Path(tmp)
+                (root / 'deploy/base').mkdir(parents=True)
+                (root / 'deploy/app.yaml').write_text('app: "lab"\nservices:\n  ai: {type: llm}\n')
+                (root / 'deploy/base/service.yaml').write_text(body)
+                with self.assertRaises(SystemExit) as ctx:
+                    magehand.try_load_app('lab', root)
+                self.assertIn(why, str(ctx.exception.code))
+                # and through the command: exit 1, not "no findings"
+                code, out, _ = CommandLine.run_main(self, 'check', 'lab', '--code', tmp, '--apps-dir', apps,
+                                                    '--manifests-only', '--json')
+                self.assertEqual((code, out), (1, ''), why)  # run_main drops the message; real runs print it
+
     def test_load_app_from_the_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = magehand.try_load_app('demo', deploy_repo(tmp))

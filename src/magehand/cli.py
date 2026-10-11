@@ -172,8 +172,12 @@ def load_app(name, root=None):
                 f'(no homelab-apps apps/{name}/). Write deploy/app.yaml and deploy/base/ (`magehand guide search '
                 'deploy`); the platform registers the app by itself when they are merged to main')
         files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
-    found = [(path, d) for path, text in files for d in yaml.safe_load_all(text)
-             if isinstance(d, dict) and d.get('kind') == 'Deployment']
+    found = []
+    for path, text in files:
+        try:
+            found += [(path, d) for d in yaml.safe_load_all(text) if isinstance(d, dict) and d.get('kind') == 'Deployment']
+        except yaml.YAMLError as error:
+            die(f'{path} is not valid YAML: {str(error).splitlines()[0] if str(error) else error}')
     if not found:
         die(f'{where}/base has no Deployment')
     path, deployment = found[0]
@@ -1709,23 +1713,14 @@ def provided_secrets(name, root=None):
     return names - {None}
 
 
-def has_deployment(local):
-    """True if the Kustomize base under deploy/ (the directory `local`) has a Deployment."""
-    for f in sorted((local / 'base').glob('*.y*ml')):
-        try:
-            if any(isinstance(d, dict) and d.get('kind') == 'Deployment' for d in yaml.safe_load_all(f.read_text())):
-                return True
-        except (OSError, yaml.YAMLError):
-            continue
-    return False
-
-
 def try_load_app(name, root=None):
     """load_app (with the Secrets its manifests make): from `root`'s deploy/ when it has one, else homelab-apps';
     None when neither has a deployment for it yet."""
     local = deploy_dir(root) if root else None
-    if local and not has_deployment(local):
-        return None  # deploy/app.yaml alone (`new --app-name` seeds it): no deployment to check yet
+    if local and not any((local / 'base').glob('*.y*ml')):
+        # deploy/app.yaml alone (`new --app-name` seeds it): no deployment to check yet. A base that has
+        # manifests but no (valid) Deployment is a mistake, and load_app says so.
+        return None
     if not local and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
     app = load_app(name, root)
