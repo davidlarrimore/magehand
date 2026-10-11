@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from unittest import mock
 
 from magehand import cli as magehand
 
@@ -1573,3 +1574,151 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(self.run_main('version')[0], 130)
         finally:
             magehand.cmd_version = saved
+
+
+class SignIn(unittest.TestCase):
+    """Time left on the session: shown, warned about, and renewed in place in a terminal."""
+
+    def setUp(self):
+        self.names = ('bao', 'saved_token', 'cmd_login')
+        self.saved = {n: getattr(magehand, n) for n in self.names}
+        self.ttl = {'tok': 720}
+        magehand.saved_token = lambda: 'tok'
+        magehand.bao = lambda method, path, token=None, body=None, soft=False: (
+            (200, {'data': {'ttl': self.ttl[token]}}) if token in self.ttl else (403, None))
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(magehand, n, v)
+
+    def run_main(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                magehand.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else 1
+        return code, out.getvalue(), err.getvalue()
+
+    def test_time_left(self):
+        self.assertEqual(magehand.signin_left(), 720)
+        self.ttl['tok'] = 0  # a token that never expires
+        self.assertEqual(magehand.minutes(magehand.signin_left()), 'no expiry')
+        magehand.saved_token = lambda: 'gone'
+        self.assertIsNone(magehand.signin_left())
+
+    def test_check_passes_and_fails_on_minutes(self):
+        code, out, _ = self.run_main('login', '--check')
+        self.assertEqual((code, out.strip()), (0, 'signed in, 12 min left'))
+        code, out, _ = self.run_main('login', '--check', '--min', '30')
+        self.assertEqual(code, 1)
+        self.assertIn('less than 30 min', out)
+
+    def test_check_json_and_signed_out(self):
+        code, out, _ = self.run_main('login', '--check', '--json')
+        self.assertEqual((code, json.loads(out)['seconds_left']), (0, 720))
+        magehand.saved_token = lambda: None
+        code, out, err = self.run_main('login', '--check', '--json')
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(out)['signed_in'])
+
+    def test_valid_token_warns_when_low(self):
+        import contextlib
+        import io
+        self.ttl['tok'] = 300
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(magehand.valid_token(), 'tok')
+        self.assertIn('5 min left', err.getvalue())
+        self.assertIn('magehand login', err.getvalue())
+
+    def test_expired_session_renews_in_a_terminal_and_fails_otherwise(self):
+        import contextlib
+        import io
+        state = {'token': 'old'}
+        magehand.saved_token = lambda: state['token']
+        magehand.cmd_login = lambda _a: state.update(token='tok') or 'tok'
+        tty = type('Tty', (io.StringIO,), {'isatty': lambda self: True})
+        with mock.patch('builtins.input', return_value=''), \
+                mock.patch.object(magehand.sys, 'stdin', tty()), \
+                mock.patch.object(magehand.sys, 'stderr', tty()):
+            self.assertEqual(magehand.valid_token(), 'tok')
+        # a stale MAGEHAND_BAO_TOKEN still wins in saved_token(): the fresh token is used directly
+        state['token'] = 'old'
+        magehand.cmd_login = lambda _a: 'tok'
+        with mock.patch('builtins.input', return_value='y'), \
+                mock.patch.object(magehand.sys, 'stdin', tty()), \
+                mock.patch.object(magehand.sys, 'stderr', tty()):
+            self.assertEqual(magehand.valid_token(), 'tok')
+        state['token'] = 'old'
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            magehand.valid_token()  # not a terminal: exit with the message, no prompt
+
+    def test_app_report_survives_an_unreachable_openbao(self):
+        def unreachable(method, path, token=None, body=None, soft=False):
+            if soft:
+                return 0, None
+            raise SystemExit(1)
+        magehand.bao = unreachable
+        self.assertEqual(magehand.signin_left(soft=True), magehand.UNREACHABLE)
+        with self.assertRaises(SystemExit):
+            magehand.signin_left()
+        app = {'name': 'demo', 'root': None, 'where': 'homelab-apps apps/demo', 'spec': {}, 'services': {},
+               'container': {'env': []}}
+        names = ('app_here', 'registration', 'github_dir', 'env_plan')
+        before = {n: getattr(magehand, n) for n in names}
+        magehand.app_here = lambda name=None: app
+        magehand.registration = lambda name: {'services': {}}
+        magehand.github_dir = lambda repo, path: []
+        magehand.env_plan = lambda app: []
+        try:
+            code, out, _ = self.run_main('app', '-a', 'demo', '--json')
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
+        self.assertEqual(code, 0)
+        self.assertIsNone(json.loads(out)['signin_seconds_left'])
+
+    def test_login_json_prints_a_result_without_the_token(self):
+        def fake_bao(method, path, token=None, body=None, soft=False):
+            if path.endswith('auth_url'):
+                return 200, {'data': {'auth_url': 'https://auth.example.com/x'}}
+            return 200, {'auth': {'client_token': 'secret-token', 'policies': ['dev-read'], 'lease_duration': 3600,
+                                  'metadata': {'email': 'me@example.com'}, 'entity_id': 'e'}}
+
+        class Server:  # delivers the browser's callback to the handler without a socket
+            timeout = 0
+
+            def __init__(self, address, handler):
+                self.handler = handler
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def handle_request(self):
+                request = self.handler.__new__(self.handler)
+                request.path = '/oidc/callback?code=c&state=s'
+                request.wfile = type('W', (), {'write': lambda self, data: None})()
+                request.send_response = request.send_header = request.end_headers = lambda *a: None
+                request.do_GET()
+        stored = []
+        saved = magehand.bao, magehand.store_token, magehand.webbrowser.open, magehand.http.server.HTTPServer
+        magehand.bao, magehand.store_token = fake_bao, lambda token, who: stored.append(token)
+        magehand.webbrowser.open = lambda url: True
+        magehand.http.server.HTTPServer = Server
+        try:
+            code, out, err = self.run_main('login', '--json')
+        finally:
+            magehand.bao, magehand.store_token, magehand.webbrowser.open, magehand.http.server.HTTPServer = saved
+        self.assertEqual(code, 0)
+        result = json.loads(out)  # stdout is the JSON object only; progress went to stderr
+        self.assertEqual((result['signed_in'], result['email']), (True, 'me@example.com'))
+        self.assertNotIn('secret-token', out + err)
+        self.assertEqual(stored, ['secret-token'])
+        self.assertIn('Sign in through authentik', err)
