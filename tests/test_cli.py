@@ -899,6 +899,37 @@ class New(unittest.TestCase):
         self.assertIn('https://lab-dev.', then)          # the app, not the repo
         self.assertNotIn('lab-website-dev', text)
 
+    def test_a_file_where_the_clone_would_go_stops_before_github(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp) / 'elvis'
+            target.write_text('a file')
+            self.fake()
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_new('elvis', '--dir', str(target))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertEqual(self.calls, [])  # nothing was created or invited
+            self.run_new('elvis', '--dir', str(target), '--no-clone')  # but --no-clone doesn't care
+
+    def test_paths_in_commands_survive_a_shell(self):
+        import shlex
+        for path in ('/tmp/my apps/elvis', "/tmp/it's here", '/tmp/a;b$(c)', '-x', 'plain'):
+            quoted = magehand.shell_path(pathlib.Path(path))
+            word = shlex.split(quoted)
+            self.assertEqual(len(word), 1, path)
+            self.assertEqual(word[0], './-x' if path == '-x' else path)
+            text = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path(path), 'seeded', 'cloned')
+            cd = next(l for l in text.splitlines() if 'run:   cd' in l).split('run:   ', 1)[1]
+            self.assertEqual(shlex.split(cd)[0], 'cd')
+            self.assertEqual(shlex.split(cd)[-1], './-x' if path == '-x' else path)
+            clone = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path(path), 'seeded', 'failed')
+            line = next(l for l in clone.splitlines() if 'gh repo clone' in l).split('run:   ', 1)[1]
+            self.assertEqual(shlex.split(line)[-1], './-x' if path == '-x' else path)
+
+    def test_a_leading_dash_directory_is_not_read_as_an_option(self):
+        self.fake()
+        self.run_new('elvis', '--dir=-weird')
+        self.assertIn(('repo', 'clone', 'davidlarrimore/elvis', './-weird'), self.calls)
+
     def test_summary_when_not_cloned_or_not_named(self):
         text = magehand.new_summary('davidlarrimore/lab-website', 'lab-website', 'lab', pathlib.Path('lab-website'),
                                     'failed', 'failed')

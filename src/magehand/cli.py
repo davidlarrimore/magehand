@@ -23,6 +23,7 @@ import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -693,13 +694,25 @@ def ensure_app_name(repo, app):
     return 'failed'
 
 
+def shell_path(path):
+    """`path` as one safe word for a command the user pastes: quoted, and never starting with a dash (it
+    would be read as an option)."""
+    text = str(path)
+    return shlex.quote('./' + text if text.startswith('-') else text)
+
+
 def clone_repo(repo, dest):
-    """'cloned', 'exists' (dest is already there: left alone) or 'failed'. A repo made from a template has
-    its files a moment later, so a first failure is retried briefly."""
-    if dest.exists() and any(dest.iterdir()):
-        return 'exists'
+    """'cloned', 'exists' (dest is a non-empty directory: left alone) or 'failed'. A repo made from a
+    template has its files a moment later, so a first failure is retried briefly. (cmd_new has already
+    refused a destination that is a file.)"""
+    try:
+        if dest.is_dir() and any(dest.iterdir()):
+            return 'exists'
+    except OSError:  # unreadable directory: let git say what is wrong
+        return 'failed'
+    target = './' + str(dest) if str(dest).startswith('-') else str(dest)
     for attempt in range(5):
-        code, _, _ = gh_cli('repo', 'clone', repo, str(dest))
+        code, _, _ = gh_cli('repo', 'clone', repo, target)
         if code == 0:
             return 'cloned'
         time.sleep(2 if attempt < 4 else 0)
@@ -716,6 +729,9 @@ def cmd_new(a):
         if value in RESERVED or (label == 'app' and (value.endswith(('-dev', '-prod')) or value.startswith('kube-'))):
             usage('new', f"'{value}' is reserved for the platform; choose another")
     repo = f'{OWNER}/{name}'
+    dest = pathlib.Path(a.dir or name)
+    if not a.no_clone and dest.exists() and not dest.is_dir():  # before anything is created on GitHub
+        usage('new', f'{dest} exists and is not a directory: pick another with --dir, or use --no-clone')
     code, out, _ = gh_cli('api', f'repos/{repo}', '--jq', '.private')
     created = code != 0
     if created:
@@ -747,14 +763,13 @@ def cmd_new(a):
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
-    dest = pathlib.Path(a.dir or name)
     cloned = None if a.no_clone else clone_repo(repo, dest)
     if cloned == 'cloned':
         print(f'{repo}: cloned to {dest}', file=sys.stderr)
     elif cloned == 'exists':
         print(f'{dest}: already exists; not cloned (is it {repo}?)', file=sys.stderr)
     elif cloned == 'failed':
-        print(f'{repo}: could not clone it; run `gh repo clone {repo} {dest}`', file=sys.stderr)
+        print(f'{repo}: could not clone it; run `gh repo clone {repo} {shell_path(dest)}`', file=sys.stderr)
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
                           'ruleset': ruleset, 'app_name': named, 'clone': cloned,
@@ -771,8 +786,8 @@ def new_summary(repo, name, app, dest, named, cloned):
     live = name if named in ('failed', 'differs') else app
     # run: a command to type, write:/edit: work in the repo, do: a decision or action of yours. A program
     # can't change its parent shell's directory, so `cd` is a step even when it cloned.
-    steps = [f'run:   gh repo clone {repo} {dest}'] if cloned not in ('cloned', 'exists') else []
-    steps.append(f'run:   cd {dest}')
+    steps = [f'run:   gh repo clone {repo} {shell_path(dest)}'] if cloned not in ('cloned', 'exists') else []
+    steps.append(f'run:   cd -- {shell_path(dest)}' if str(dest).startswith('-') else f'run:   cd {shell_path(dest)}')
     if named in ('failed', 'differs'):
         steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
                      f'{name})')
