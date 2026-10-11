@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/davidlarrimore/magehand/main/assets/logo.png" alt="magehand" width="480">
+</p>
+
 # magehand
 
 The developer CLI for building apps on [davidlarrimore](https://github.com/davidlarrimore)'s
