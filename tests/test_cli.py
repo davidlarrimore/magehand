@@ -475,6 +475,25 @@ class DeployDir(unittest.TestCase):
         self.addCleanup(setattr, magehand, 'APPS_DIR', self.saved)
         self.addCleanup(self.apps.cleanup)
 
+    def test_a_seeded_deploy_dir_with_only_app_yaml_checks_without_error(self):
+        """`new --app-name` commits deploy/app.yaml alone (`app: ...`, `services: {}`): CI must not fail on it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'deploy').mkdir()
+            (root / 'deploy/app.yaml').write_text('app: "lab"\nservices: {}\n')
+            self.assertIsNone(magehand.try_load_app('lab', root))  # no Deployment yet: nothing to check, no die
+            found = magehand.check_deploy_files(root, 'lab')
+            self.assertEqual([(f['level'], f['where']) for f in found], [('warning', 'deploy/base')])
+            self.assertIn('nothing is deployed or registered', found[0]['text'])
+
+    def test_blocks_requested_without_a_base_is_still_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'deploy').mkdir()
+            (root / 'deploy/app.yaml').write_text('app: "lab"\nservices:\n  ai: {type: llm}\n')
+            found = magehand.check_deploy_files(root, 'lab')
+            self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/base')])
+
     def test_load_app_from_the_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = magehand.try_load_app('demo', deploy_repo(tmp))

@@ -1525,7 +1525,15 @@ def check_deploy_files(root, name=None):
                                  'base/, dev/, prod/ *.yaml only, and a merge with anything else is not deployed',
                                  'README "How an app is put together"'))
     if not any((local / 'base').glob('*.y*ml')):
-        found.append(finding('error', f'{DEPLOY}/base', 'missing: the Kustomize base (Deployment, Service, ...) goes here',
+        try:
+            requested = (yaml.safe_load((local / 'app.yaml').read_text()) or {}).get('services')
+        except (OSError, yaml.YAMLError, AttributeError):
+            requested = True
+        # `new --app-name` commits deploy/app.yaml alone (naming the app): that is not yet a deployment, and
+        # nothing registers or deploys until base/ exists; asking for blocks without a base is a mistake.
+        found.append(finding('error' if requested else 'warning', f'{DEPLOY}/base',
+                             'missing: the Kustomize base (Deployment, Service, ...) goes here'
+                             + ('' if requested else '; until it exists nothing is deployed or registered'),
                              'README "How an app is put together"'))
     for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
         path = local / overlay / 'kustomization.yaml'
@@ -1701,10 +1709,24 @@ def provided_secrets(name, root=None):
     return names - {None}
 
 
+def has_deployment(local):
+    """True if the Kustomize base under deploy/ (the directory `local`) has a Deployment."""
+    for f in sorted((local / 'base').glob('*.y*ml')):
+        try:
+            if any(isinstance(d, dict) and d.get('kind') == 'Deployment' for d in yaml.safe_load_all(f.read_text())):
+                return True
+        except (OSError, yaml.YAMLError):
+            continue
+    return False
+
+
 def try_load_app(name, root=None):
     """load_app (with the Secrets its manifests make): from `root`'s deploy/ when it has one, else homelab-apps';
     None when neither has a deployment for it yet."""
-    if not (root and deploy_dir(root)) and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
+    local = deploy_dir(root) if root else None
+    if local and not has_deployment(local):
+        return None  # deploy/app.yaml alone (`new --app-name` seeds it): no deployment to check yet
+    if not local and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
     app = load_app(name, root)
     app['provided'] = provided_secrets(name, root)
