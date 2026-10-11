@@ -1441,6 +1441,23 @@ def check_app_name(app):
     return found
 
 
+def seeded_name_findings(name, root):
+    """The app-name rules for a checkout whose deploy/ has only app.yaml (no Deployment yet, so no pod to
+    check): `app:` is a valid, unreserved name that homelab-apps hasn't registered to another repo."""
+    local = deploy_dir(root)
+    if not local:
+        return []
+    try:
+        spec = yaml.safe_load((local / 'app.yaml').read_text()) or {}
+    except (OSError, yaml.YAMLError) as error:
+        return [finding('error', f'{DEPLOY}/app.yaml', f'not valid YAML: {str(error).splitlines()[0]}',
+                        'README "How an app is put together"')]
+    if not isinstance(spec, dict):
+        return [finding('error', f'{DEPLOY}/app.yaml', 'must be a mapping (app:, services:)',
+                        'README "How an app is put together"')]
+    return check_app_name({'name': name, 'spec': spec, 'where': DEPLOY, 'root': local.parent})
+
+
 def check_manifests(app, catalog):
     """Rules for homelab-apps apps/<app>/: the blocks requested and the pod's env."""
     found = check_app_name(app)
@@ -1766,7 +1783,8 @@ def cmd_check(a):
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
     app = try_load_app(name, root)
-    found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root, name)
+    found = (check_manifests(app, catalog) if app else seeded_name_findings(name, root)) \
+        + check_deploy_files(root, name)
     if not manifests_only:
         found += check_code(root, app, catalog) + check_agents_drift(root)
     errors = sum(f['level'] == 'error' for f in found)

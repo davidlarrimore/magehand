@@ -619,6 +619,44 @@ class AppNameOverride(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), [])
 
+    def seeded(self, tmp, app_yaml):
+        """A repo as `new --app-name` leaves it: deploy/app.yaml alone, origin lab-website."""
+        root = pathlib.Path(tmp)
+        (root / 'deploy').mkdir()
+        (root / 'deploy/app.yaml').write_text(app_yaml)
+        return git_checkout(root, self.REMOTE)
+
+    def run_check(self, root, name='lab'):
+        code, out, _ = CommandLine.run_main(self, 'check', name, '--code', str(root), '--apps-dir', self.apps.name,
+                                            '--manifests-only', '--json')
+        return code, json.loads(out)
+
+    def test_seeded_checkout_names_are_still_validated(self):
+        """Returning early for "no Deployment yet" must not skip the app-name rules."""
+        for app_yaml, why in (('app: Lab\nservices: {}\n', 'not an app name'),
+                              ('app: litellm\nservices: {}\n', 'reserved'),
+                              ('app: lab-dev\nservices: {}\n', 'not an app name'),
+                              ('app: [x\n', 'not valid YAML')):
+            with tempfile.TemporaryDirectory() as tmp:
+                code, result = self.run_check(self.seeded(tmp, app_yaml), name='lab-website')
+            errors = [f['text'] for f in result['findings'] if f['level'] == 'error']
+            self.assertEqual(code, 1, app_yaml)
+            self.assertTrue(any(why in e for e in errors), (app_yaml, errors))
+
+    def test_seeded_checkout_registered_to_another_repo_fails(self):
+        self.register('lab', 'source: {repo: lab}\nservices: {}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            code, result = self.run_check(self.seeded(tmp, 'app: "lab"\nservices: {}\n'))
+        errors = [f['text'] for f in result['findings'] if f['level'] == 'error']
+        self.assertEqual(code, 1)
+        self.assertTrue(any('registered in homelab-apps to davidlarrimore/lab' in e for e in errors), errors)
+
+    def test_a_valid_seeded_checkout_only_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, result = self.run_check(self.seeded(tmp, 'app: "lab"\nservices: {}\n'))
+        self.assertEqual(code, 0)
+        self.assertEqual([(f['level'], f['where']) for f in result['findings']], [('warning', 'deploy/base')])
+
     def test_a_repo_that_lost_its_app_key_is_an_error(self):
         self.register('lab', 'source: {repo: lab-website}\nservices: {}\n')
         with tempfile.TemporaryDirectory() as tmp:
