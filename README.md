@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/davidlarrimore/magehand/main/assets/logo.png" alt="magehand" width="480">
+  <img src="https://raw.githubusercontent.com/davidlarrimore/magehand/main/assets/logo/logo-1024.png" alt="magehand" width="480">
 </p>
 
 # magehand
