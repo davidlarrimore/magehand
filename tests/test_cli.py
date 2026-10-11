@@ -938,6 +938,68 @@ class New(unittest.TestCase):
         self.assertIn('3. edit:  make the first line of deploy/app.yaml `app: "lab"`', text)
         self.assertIn('https://lab-website-dev.', text)  # still the repo's name until it is fixed
 
+    def test_nothing_is_touched_until_the_template_copy_has_landed(self):
+        """The copy is asynchronous: a commit or a ruleset on main before it lands makes it fail."""
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        self.fake()
+        inner = magehand.gh_cli
+        polls = []
+
+        def gh(*args, **kw):
+            if args[:1] == ('api',) and args[1].endswith('/contents/AGENTS.md'):
+                polls.append(args)
+                return (1, '', 'HTTP 404') if len(polls) < 3 else (0, '', '')
+            return inner(*args, **kw)
+        magehand.gh_cli = gh
+        self.run_new('elvis')
+        order = [c for c in self.calls if c[0] == 'repo' and c[1] == 'create' or '-X' in c]
+        self.assertEqual(len(polls), 3)  # polled until the files were there
+        self.assertEqual(order[0][:2], ('repo', 'create'))
+
+    def test_a_template_copy_that_never_lands_changes_nothing_more(self):
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        self.fake()
+        inner = magehand.gh_cli
+        magehand.gh_cli = lambda *a, **k: (1, '', 'HTTP 404') if a[:1] == ('api',) and '/contents/' in a[1] \
+            else inner(*a, **k)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_new('elvis', '--app-name', 'lab')
+        self.assertIn('has not finished', str(ctx.exception.code))
+        self.assertFalse([c for c in self.calls if '-X' in c])  # no bot invite, no seed, no ruleset
+
+    def test_an_unreadable_api_is_not_reported_as_a_missing_copy(self):
+        """403/401/network on the probe says "could not check", never advice to delete or restore the repo."""
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        for exists, error in (('true', 'HTTP 403: API rate limit exceeded'), (None, 'HTTP 401: Bad credentials'),
+                              ('true', 'dial tcp: lookup api.github.com: no such host')):
+            self.calls.clear()
+            self.fake(exists=exists, collaborator=True, ruleset=True)
+            inner = magehand.gh_cli
+            magehand.gh_cli = lambda *a, __e=error, __i=inner, **k: (1, '', __e) \
+                if a[:1] == ('api',) and '/contents/' in a[1] else __i(*a, **k)
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_new('elvis')
+            message = str(ctx.exception.code)
+            self.assertIn('could not check', message, error)
+            self.assertIn(error, message)
+            self.assertNotIn('gh repo delete', message)
+            self.assertNotIn('has not finished', message)
+            self.assertFalse([c for c in self.calls if '-X' in c])  # still no writes
+
+    def test_an_existing_repo_without_the_template_files_is_reported(self):
+        saved, magehand.time.sleep = magehand.time.sleep, lambda _s: None
+        self.addCleanup(setattr, magehand.time, 'sleep', saved)
+        self.fake(exists='true', collaborator=True, ruleset=True)
+        inner = magehand.gh_cli
+        magehand.gh_cli = lambda *a, **k: (1, '', 'HTTP 404') if a[:1] == ('api',) and '/contents/' in a[1] \
+            else inner(*a, **k)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_new('elvis')
+        self.assertIn('gh repo delete davidlarrimore/elvis', str(ctx.exception.code))
+
     def test_without_app_name_nothing_is_written(self):
         self.fake()
         writes = self.with_contents()
