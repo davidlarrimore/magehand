@@ -694,6 +694,22 @@ def ensure_app_name(repo, app):
     return 'failed'
 
 
+# GitHub copies a template into a new repo asynchronously, as a push to main. Anything that lands on main
+# first (our deploy/app.yaml) or a ruleset that requires a pull request makes the copy fail ("Changes must
+# be made through a pull request") and leaves the repo without the template's files. So we wait for them.
+TEMPLATE_FILES = ('AGENTS.md', '.github/workflows/build.yaml')
+
+
+def wait_for_template(repo, tries=30, delay=2):
+    """True once the template's files are on the repo's main (polls about tries*delay seconds)."""
+    for attempt in range(tries):
+        if all(gh_cli('api', f'repos/{repo}/contents/{path}')[0] == 0 for path in TEMPLATE_FILES):
+            return True
+        if attempt < tries - 1:
+            time.sleep(delay)
+    return False
+
+
 def shell_path(path):
     """`path` as one safe word for a command the user pastes: quoted, and never starting with a dash (it
     would be read as an option)."""
@@ -745,6 +761,16 @@ def cmd_new(a):
         print(f'{repo}: exists' + ('' if private else
               f'; it is PUBLIC, app repos are private: gh repo edit {repo} --visibility private '
               '--accept-visibility-change-consequences'), file=sys.stderr)
+    # The template's files first: a commit or a ruleset on main before GitHub's asynchronous copy lands makes
+    # the copy fail. Nothing else is touched until they are there.
+    if not wait_for_template(repo, tries=30 if created else 4):
+        die(f"{repo} has not got the template's files ({', '.join(TEMPLATE_FILES)}) "
+            + ("after about a minute: GitHub's copy of " + TEMPLATE_REPO + ' has not finished. '
+               'Nothing else was changed (no ruleset yet); run `magehand new` again in a minute'
+               if created else
+               'on main: its template copy did not complete (a ruleset or an early commit blocks it). '
+               'An app repo with nothing in it yet is quickest to recreate: `gh repo delete '
+               f'{repo}` and run `magehand new` again; otherwise restore the files through a pull request'))
     if gh_cli('api', f'repos/{repo}/collaborators/{BOT}')[0] == 0:
         bot = 'collaborator'
         print(f'{BOT}: already a collaborator', file=sys.stderr)
