@@ -312,7 +312,7 @@ def app_port(app):
 
 # --- OpenBao (role dev: read-only LiteLLM keys) ---------------------------------
 
-def bao(method, path, token=None, body=None):
+def bao(method, path, token=None, body=None, soft=False):
     headers = {'Content-Type': 'application/json'}
     if token:
         headers['X-Vault-Token'] = token
@@ -325,6 +325,8 @@ def bao(method, path, token=None, body=None):
     except urllib.error.HTTPError as error:
         return error.code, None
     except OSError:
+        if soft:  # an optional lookup: the caller reports it as unknown
+            return 0, None
         die(f'cannot reach {OPENBAO}: {NOT_SET_UP}')
 
 
@@ -354,14 +356,18 @@ def saved_token():
 
 SIGNIN_WARN = 600  # seconds: warn when the session has less than this left
 NO_EXPIRY = 10 ** 9
+UNREACHABLE = -1
 
 
-def signin_left(token=None):
-    """Seconds left on the OpenBao session, or None when not signed in (no token, or it expired)."""
+def signin_left(token=None, soft=False):
+    """Seconds left on the OpenBao session, or None when not signed in (no token, or it expired). With soft,
+    UNREACHABLE when OpenBao can't be reached, instead of exiting (for informational output)."""
     token = token or saved_token()
     if not token:
         return None
-    status, body = bao('GET', 'auth/token/lookup-self', token)
+    status, body = bao('GET', 'auth/token/lookup-self', token, soft=soft)
+    if soft and status == 0:
+        return UNREACHABLE
     if status != 200:
         return None
     ttl = ((body or {}).get('data') or {}).get('ttl')
@@ -382,8 +388,7 @@ def valid_token():
     if left is None and sys.stdin.isatty() and sys.stderr.isatty():
         answer = input('magehand: not signed in, or the session expired. Sign in again now? [Y/n] ').strip().lower()
         if answer in ('', 'y', 'yes'):
-            cmd_login(None)
-            token = saved_token()
+            token = cmd_login(None)  # use the fresh token: a stale MAGEHAND_BAO_TOKEN would win in saved_token()
             left = signin_left(token)
     if left is None:
         die('not signed in, or the token expired: run `magehand login`')
@@ -413,8 +418,10 @@ def login_check(a):
 
 
 def cmd_login(args):
+    """Sign in through authentik; returns the new token (kept in the Keychain, never printed)."""
     if getattr(args, 'check', False):
         login_check(args)
+    as_json = getattr(args, 'json', False)
     status, body = bao('POST', 'auth/oidc/oidc/auth_url', body={'role': 'dev', 'redirect_uri': CALLBACK})
     url = ((body or {}).get('data') or {}).get('auth_url')
     if status != 200 or not url:
@@ -439,7 +446,7 @@ def cmd_login(args):
 
     with http.server.HTTPServer(('localhost', 8250), Callback) as server:
         server.timeout = 5
-        print('Sign in through authentik in your browser (passkey)...')
+        print('Sign in through authentik in your browser (passkey)...', file=sys.stderr)
         webbrowser.open(url)
         deadline = time.monotonic() + 300
         while 'code' not in params and time.monotonic() < deadline:
@@ -456,8 +463,13 @@ def cmd_login(args):
     who = {'email': email, 'uid': auth.get('entity_id', ''), 'username': email.split('@')[0],
            'name': meta.get('name') or email.split('@')[0], 'groups': 'homelab-admins'}
     store_token(auth['client_token'], who)
-    hours = auth.get('lease_duration', 3600) // 3600
-    print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {hours}h).')
+    lease = auth.get('lease_duration', 3600)
+    if as_json:
+        print(json.dumps({'signed_in': True, 'email': email, 'policies': auth.get('policies', []),
+                          'seconds_left': lease}))
+    else:
+        print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {lease // 3600}h).')
+    return auth['client_token']
 
 
 # --- guide and app --------------------------------------------------------------
@@ -549,7 +561,7 @@ def cmd_app(a):
     deployed = registration(name) if app['root'] else app['spec']
     keys = {block: llm_key_state(name, block, deployed)
             for block, svc in app['services'].items() if (svc or {}).get('type') == 'llm'}
-    left = signin_left()
+    left = signin_left(soft=True)
     if a.json:
         env = []
         for entry in env_plan(app):
@@ -563,14 +575,16 @@ def cmd_app(a):
                           'deployment': app['where'], 'dev_url': f'https://{name}-dev.{LAB}',
                           'port': app_port(app), 'registered': deployed is not None, 'blocks': app['services'],
                           'llm_keys': keys, 'env': env,
-                          'signin_seconds_left': left}, indent=1))
+                          'signin_seconds_left': left if left != UNREACHABLE else None}, indent=1))
         return
     deployment = ('deploy/ in this repo (merging copies it to homelab-apps apps/%s)' % name if app['root']
                   else app['where'])
     print(f'{name}  (code: {"davidlarrimore/" + source if source else "homelab-apps apps/" + name + "/image"};'
           f' deployment: {deployment})')
     print(f'  dev:      https://{name}-dev.{LAB}')
-    if left is None:
+    if left == UNREACHABLE:
+        print(f'  sign-in:  unknown ({OPENBAO} is not reachable)')
+    elif left is None:
         print('  sign-in:  not signed in (`magehand login`; run needs it for LLM keys)')
     else:
         print(f'  sign-in:  {minutes(left)} left' + ('  (`magehand login` renews it)' if left < SIGNIN_WARN else ''))
