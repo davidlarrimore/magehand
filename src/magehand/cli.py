@@ -172,8 +172,12 @@ def load_app(name, root=None):
                 f'(no homelab-apps apps/{name}/). Write deploy/app.yaml and deploy/base/ (`magehand guide search '
                 'deploy`); the platform registers the app by itself when they are merged to main')
         files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
-    found = [(path, d) for path, text in files for d in yaml.safe_load_all(text)
-             if isinstance(d, dict) and d.get('kind') == 'Deployment']
+    found = []
+    for path, text in files:
+        try:
+            found += [(path, d) for d in yaml.safe_load_all(text) if isinstance(d, dict) and d.get('kind') == 'Deployment']
+        except yaml.YAMLError as error:
+            die(f'{path} is not valid YAML: {str(error).splitlines()[0] if str(error) else error}')
     if not found:
         die(f'{where}/base has no Deployment')
     path, deployment = found[0]
@@ -1437,6 +1441,23 @@ def check_app_name(app):
     return found
 
 
+def seeded_name_findings(name, root):
+    """The app-name rules for a checkout whose deploy/ has only app.yaml (no Deployment yet, so no pod to
+    check): `app:` is a valid, unreserved name that homelab-apps hasn't registered to another repo."""
+    local = deploy_dir(root)
+    if not local:
+        return []
+    try:
+        spec = yaml.safe_load((local / 'app.yaml').read_text()) or {}
+    except (OSError, yaml.YAMLError) as error:
+        return [finding('error', f'{DEPLOY}/app.yaml', f'not valid YAML: {str(error).splitlines()[0]}',
+                        'README "How an app is put together"')]
+    if not isinstance(spec, dict):
+        return [finding('error', f'{DEPLOY}/app.yaml', 'must be a mapping (app:, services:)',
+                        'README "How an app is put together"')]
+    return check_app_name({'name': name, 'spec': spec, 'where': DEPLOY, 'root': local.parent})
+
+
 def check_manifests(app, catalog):
     """Rules for homelab-apps apps/<app>/: the blocks requested and the pod's env."""
     found = check_app_name(app)
@@ -1525,7 +1546,15 @@ def check_deploy_files(root, name=None):
                                  'base/, dev/, prod/ *.yaml only, and a merge with anything else is not deployed',
                                  'README "How an app is put together"'))
     if not any((local / 'base').glob('*.y*ml')):
-        found.append(finding('error', f'{DEPLOY}/base', 'missing: the Kustomize base (Deployment, Service, ...) goes here',
+        try:
+            requested = (yaml.safe_load((local / 'app.yaml').read_text()) or {}).get('services')
+        except (OSError, yaml.YAMLError, AttributeError):
+            requested = True
+        # `new --app-name` commits deploy/app.yaml alone (naming the app): that is not yet a deployment, and
+        # nothing registers or deploys until base/ exists; asking for blocks without a base is a mistake.
+        found.append(finding('error' if requested else 'warning', f'{DEPLOY}/base',
+                             'missing: the Kustomize base (Deployment, Service, ...) goes here'
+                             + ('' if requested else '; until it exists nothing is deployed or registered'),
                              'README "How an app is put together"'))
     for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
         path = local / overlay / 'kustomization.yaml'
@@ -1704,7 +1733,12 @@ def provided_secrets(name, root=None):
 def try_load_app(name, root=None):
     """load_app (with the Secrets its manifests make): from `root`'s deploy/ when it has one, else homelab-apps';
     None when neither has a deployment for it yet."""
-    if not (root and deploy_dir(root)) and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
+    local = deploy_dir(root) if root else None
+    if local and not any((local / 'base').glob('*.y*ml')):
+        # deploy/app.yaml alone (`new --app-name` seeds it): no deployment to check yet. A base that has
+        # manifests but no (valid) Deployment is a mistake, and load_app says so.
+        return None
+    if not local and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
     app = load_app(name, root)
     app['provided'] = provided_secrets(name, root)
@@ -1749,7 +1783,8 @@ def cmd_check(a):
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
     app = try_load_app(name, root)
-    found = (check_manifests(app, catalog) if app else []) + check_deploy_files(root, name)
+    found = (check_manifests(app, catalog) if app else seeded_name_findings(name, root)) \
+        + check_deploy_files(root, name)
     if not manifests_only:
         found += check_code(root, app, catalog) + check_agents_drift(root)
     errors = sum(f['level'] == 'error' for f in found)

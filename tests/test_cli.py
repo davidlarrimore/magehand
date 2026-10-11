@@ -475,6 +475,41 @@ class DeployDir(unittest.TestCase):
         self.addCleanup(setattr, magehand, 'APPS_DIR', self.saved)
         self.addCleanup(self.apps.cleanup)
 
+    def test_a_seeded_deploy_dir_with_only_app_yaml_checks_without_error(self):
+        """`new --app-name` commits deploy/app.yaml alone (`app: ...`, `services: {}`): CI must not fail on it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'deploy').mkdir()
+            (root / 'deploy/app.yaml').write_text('app: "lab"\nservices: {}\n')
+            self.assertIsNone(magehand.try_load_app('lab', root))  # no Deployment yet: nothing to check, no die
+            found = magehand.check_deploy_files(root, 'lab')
+            self.assertEqual([(f['level'], f['where']) for f in found], [('warning', 'deploy/base')])
+            self.assertIn('nothing is deployed or registered', found[0]['text'])
+
+    def test_blocks_requested_without_a_base_is_still_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'deploy').mkdir()
+            (root / 'deploy/app.yaml').write_text('app: "lab"\nservices:\n  ai: {type: llm}\n')
+            found = magehand.check_deploy_files(root, 'lab')
+            self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/base')])
+
+    def test_an_existing_base_without_a_deployment_is_still_rejected(self):
+        for body, why in (("kind: Service\nmetadata: {name: x}\n", 'has no Deployment'),
+                          ("kind: Deployment\n  broken: [", 'not valid YAML')):
+            with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as apps:
+                root = pathlib.Path(tmp)
+                (root / 'deploy/base').mkdir(parents=True)
+                (root / 'deploy/app.yaml').write_text('app: "lab"\nservices:\n  ai: {type: llm}\n')
+                (root / 'deploy/base/service.yaml').write_text(body)
+                with self.assertRaises(SystemExit) as ctx:
+                    magehand.try_load_app('lab', root)
+                self.assertIn(why, str(ctx.exception.code))
+                # and through the command: exit 1, not "no findings"
+                code, out, _ = CommandLine.run_main(self, 'check', 'lab', '--code', tmp, '--apps-dir', apps,
+                                                    '--manifests-only', '--json')
+                self.assertEqual((code, out), (1, ''), why)  # run_main drops the message; real runs print it
+
     def test_load_app_from_the_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = magehand.try_load_app('demo', deploy_repo(tmp))
@@ -583,6 +618,44 @@ class AppNameOverride(unittest.TestCase):
         self.register('lab', 'source: {repo: lab-website}\nservices: {}\n')
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), [])
+
+    def seeded(self, tmp, app_yaml):
+        """A repo as `new --app-name` leaves it: deploy/app.yaml alone, origin lab-website."""
+        root = pathlib.Path(tmp)
+        (root / 'deploy').mkdir()
+        (root / 'deploy/app.yaml').write_text(app_yaml)
+        return git_checkout(root, self.REMOTE)
+
+    def run_check(self, root, name='lab'):
+        code, out, _ = CommandLine.run_main(self, 'check', name, '--code', str(root), '--apps-dir', self.apps.name,
+                                            '--manifests-only', '--json')
+        return code, json.loads(out)
+
+    def test_seeded_checkout_names_are_still_validated(self):
+        """Returning early for "no Deployment yet" must not skip the app-name rules."""
+        for app_yaml, why in (('app: Lab\nservices: {}\n', 'not an app name'),
+                              ('app: litellm\nservices: {}\n', 'reserved'),
+                              ('app: lab-dev\nservices: {}\n', 'not an app name'),
+                              ('app: [x\n', 'not valid YAML')):
+            with tempfile.TemporaryDirectory() as tmp:
+                code, result = self.run_check(self.seeded(tmp, app_yaml), name='lab-website')
+            errors = [f['text'] for f in result['findings'] if f['level'] == 'error']
+            self.assertEqual(code, 1, app_yaml)
+            self.assertTrue(any(why in e for e in errors), (app_yaml, errors))
+
+    def test_seeded_checkout_registered_to_another_repo_fails(self):
+        self.register('lab', 'source: {repo: lab}\nservices: {}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            code, result = self.run_check(self.seeded(tmp, 'app: "lab"\nservices: {}\n'))
+        errors = [f['text'] for f in result['findings'] if f['level'] == 'error']
+        self.assertEqual(code, 1)
+        self.assertTrue(any('registered in homelab-apps to davidlarrimore/lab' in e for e in errors), errors)
+
+    def test_a_valid_seeded_checkout_only_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, result = self.run_check(self.seeded(tmp, 'app: "lab"\nservices: {}\n'))
+        self.assertEqual(code, 0)
+        self.assertEqual([(f['level'], f['where']) for f in result['findings']], [('warning', 'deploy/base')])
 
     def test_a_repo_that_lost_its_app_key_is_an_error(self):
         self.register('lab', 'source: {repo: lab-website}\nservices: {}\n')
