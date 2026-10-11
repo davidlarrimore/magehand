@@ -814,7 +814,7 @@ class New(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         body = dict(a.split('=', 1) for a in writes[0][3:] if '=' in a and not a.startswith('repos/'))
         text = base64.b64decode(body['content']).decode()
-        self.assertIn('\napp: lab\n', text)
+        self.assertIn('\napp: "lab"\n', text)
         self.assertEqual(magehand.yaml.safe_load(text)['app'], 'lab')
         # the seeding commit comes before the ruleset can ask for a review
         put = next(i for i, c in enumerate(self.calls) if c[:3] == ('api', '-X', 'PUT') and 'deploy/app.yaml' in c[3])
