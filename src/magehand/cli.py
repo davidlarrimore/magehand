@@ -693,6 +693,19 @@ def ensure_app_name(repo, app):
     return 'failed'
 
 
+def clone_repo(repo, dest):
+    """'cloned', 'exists' (dest is already there: left alone) or 'failed'. A repo made from a template has
+    its files a moment later, so a first failure is retried briefly."""
+    if dest.exists() and any(dest.iterdir()):
+        return 'exists'
+    for attempt in range(5):
+        code, _, _ = gh_cli('repo', 'clone', repo, str(dest))
+        if code == 0:
+            return 'cloned'
+        time.sleep(2 if attempt < 4 else 0)
+    return 'failed'
+
+
 def cmd_new(a):
     name = a.name
     app = a.app_name or name
@@ -734,19 +747,43 @@ def cmd_new(a):
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
+    dest = pathlib.Path(a.dir or name)
+    cloned = None if a.no_clone else clone_repo(repo, dest)
+    if cloned == 'cloned':
+        print(f'{repo}: cloned to {dest}', file=sys.stderr)
+    elif cloned == 'exists':
+        print(f'{dest}: already exists; not cloned (is it {repo}?)', file=sys.stderr)
+    elif cloned == 'failed':
+        print(f'{repo}: could not clone it; run `gh repo clone {repo} {dest}`', file=sys.stderr)
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
-                          'ruleset': ruleset, 'app_name': named}, indent=1))
+                          'ruleset': ruleset, 'app_name': named, 'clone': cloned,
+                          'dir': str(dest) if cloned in ('cloned', 'exists') else None}, indent=1))
     else:
-        keep = (f'  FIRST: make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
-                f'{name})\n' if unnamed else
-                f'  deploy/app.yaml already says `app: {app}`: keep it\n' if named in ('seeded', 'present') else '')
-        print(f'Next:\n  gh repo clone {repo} && cd {name}\n{keep}'
-              '  write the code and deploy/ (`magehand guide search new app`); mock the LLM for now\n'
-              f'  when deploy/ (app.yaml and base/) is merged to main, the platform registers '
-              f'{name if unnamed else app} by itself within about 5 minutes; then it has dev and its own LLM key')
+        print(new_summary(repo, name, app, dest, named, cloned))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
+
+
+def new_summary(repo, name, app, dest, named, cloned):
+    """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
+    what the platform does by itself afterwards. Everything already done went to stderr as it happened."""
+    live = name if named in ('failed', 'differs') else app
+    steps = []
+    if cloned not in ('cloned', 'exists'):
+        steps.append(f'run:  gh repo clone {repo} {dest}')
+    where = f' (in {dest}/)' if cloned in ('cloned', 'exists') else ''
+    if named in ('failed', 'differs'):
+        steps.append(f'edit: make the first line of deploy/app.yaml `app: "{app}"`; the repo still names the app '
+                     f'{name}')
+    steps += [f'write: the code and deploy/ (app.yaml and base/){where}   see: magehand guide search new app',
+              'run:  magehand check        (the platform\'s rules, before you push)',
+              'do:   open a PR and merge it (the platform deploys what is on main)']
+    lines = ['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
+    lines += ['', 'Then, by itself (about 5 minutes after deploy/ with base/ is merged to main):',
+              f'  - {live} is registered and deployed to https://{live}-dev.{LAB}/',
+              '  - its blocks and its own LLM key are created (until then, mock the LLM)']
+    return '\n'.join(lines)
 
 
 # --- the container runtime: what runs local blocks and `run --container` -------------
@@ -2091,10 +2128,13 @@ def build_parser():
                 'only invites the bot if needed, and warns if the repo is public. OpenClaw accepts the\n'
                 'invitation by itself; the platform registers the app once deploy/ is on main.\n'
                 'The app is named after the repo unless --app-name says otherwise (the repo lab-website\n'
-                'for the app lab: lab-dev.lab.davidlarrimore.com).\n\n'
+                'for the app lab: lab-dev.lab.davidlarrimore.com). It clones the repo into ./REPO (--dir\n'
+                'DIR, or --no-clone), then lists what is left for you and what the platform does by itself.\n\n'
                 'examples:\n  magehand new elvis\n  magehand new lab-website --app-name lab\n'
-                '  magehand new elvis --json')
+                '  magehand new elvis --no-clone --json')
     p.add_argument('name', metavar='REPO', help="the repo's name (also the app's, unless --app-name)")
+    p.add_argument('--no-clone', action='store_true', help="don't clone the new repo into ./REPO")
+    p.add_argument('--dir', metavar='DIR', help='clone into DIR (default: ./REPO)')
     p.add_argument('--app-name', metavar='APP', dest='app_name',
                    help="name the app APP when the repo isn't named after it (hostnames, namespace and image "
                         'use APP); written to deploy/app.yaml as app:')

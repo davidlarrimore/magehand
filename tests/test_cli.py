@@ -773,7 +773,7 @@ class New(unittest.TestCase):
     def test_rerun_changes_nothing(self):
         self.fake(exists='true', collaborator=True, ruleset=True)
         self.run_new('elvis')
-        self.assertFalse([c for c in self.calls if c[0] == 'repo' or '-X' in c])
+        self.assertFalse([c for c in self.calls if c[:2] == ('repo', 'create') or '-X' in c])
 
     def test_existing_public_repo_gets_the_bot_and_a_warning(self):
         import contextlib
@@ -783,7 +783,7 @@ class New(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.run_new('elvis')
         self.assertIn('PUBLIC', err.getvalue())
-        self.assertFalse([c for c in self.calls if c[0] == 'repo'])  # visibility is the owner's call
+        self.assertFalse([c for c in self.calls if c[0] == 'repo' and c[1] != 'clone'])  # visibility is the owner's call
         self.assertTrue([c for c in self.calls if '-X' in c])
 
     def with_contents(self, existing=None, put_fails=0):
@@ -871,6 +871,39 @@ class New(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             self.run_new('elvis', '--app-name', 'lab')
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_new_clones_the_repo_unless_told_not_to(self):
+        self.fake()
+        self.run_new('elvis', '--dir', '/nonexistent-parent-x/elvis')
+        self.assertIn(('repo', 'clone', 'davidlarrimore/elvis', '/nonexistent-parent-x/elvis'), self.calls)
+        self.calls.clear()
+        self.fake()
+        self.run_new('elvis', '--no-clone')
+        self.assertFalse([c for c in self.calls if c[:2] == ('repo', 'clone')])
+
+    def test_an_existing_directory_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'x').write_text('x')
+            self.fake()
+            self.run_new('elvis', '--dir', tmp)
+            self.assertFalse([c for c in self.calls if c[:2] == ('repo', 'clone')])
+
+    def test_summary_lists_your_steps_and_the_automatic_ones_apart(self):
+        text = magehand.new_summary('davidlarrimore/lab-website', 'lab-website', 'lab', pathlib.Path('lab-website'),
+                                    'seeded', 'cloned')
+        you, then = text.split('\n\nThen, by itself')
+        self.assertNotIn('gh repo clone', you)          # cloned already: not a step
+        self.assertIn('1. write:', you)
+        self.assertIn('run:  magehand check', you)
+        self.assertIn('https://lab-dev.', then)          # the app, not the repo
+        self.assertNotIn('lab-website-dev', text)
+
+    def test_summary_when_not_cloned_or_not_named(self):
+        text = magehand.new_summary('davidlarrimore/lab-website', 'lab-website', 'lab', pathlib.Path('lab-website'),
+                                    'failed', 'failed')
+        self.assertIn('1. run:  gh repo clone davidlarrimore/lab-website lab-website', text)
+        self.assertIn('2. edit: make the first line of deploy/app.yaml `app: "lab"`', text)
+        self.assertIn('https://lab-website-dev.', text)  # still the repo's name until it is fixed
 
     def test_without_app_name_nothing_is_written(self):
         self.fake()
