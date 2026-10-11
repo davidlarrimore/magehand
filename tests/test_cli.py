@@ -893,16 +893,18 @@ class New(unittest.TestCase):
                                     'seeded', 'cloned')
         you, then = text.split('\n\nThen, by itself')
         self.assertNotIn('gh repo clone', you)          # cloned already: not a step
-        self.assertIn('1. write:', you)
-        self.assertIn('run:  magehand check', you)
+        self.assertIn('1. run:   cd lab-website', you)  # a program can't change your shell's directory
+        self.assertIn('2. write: the code', you)
+        self.assertIn('run:   magehand check', you)
         self.assertIn('https://lab-dev.', then)          # the app, not the repo
         self.assertNotIn('lab-website-dev', text)
 
     def test_summary_when_not_cloned_or_not_named(self):
         text = magehand.new_summary('davidlarrimore/lab-website', 'lab-website', 'lab', pathlib.Path('lab-website'),
                                     'failed', 'failed')
-        self.assertIn('1. run:  gh repo clone davidlarrimore/lab-website lab-website', text)
-        self.assertIn('2. edit: make the first line of deploy/app.yaml `app: "lab"`', text)
+        self.assertIn('1. run:   gh repo clone davidlarrimore/lab-website lab-website', text)
+        self.assertIn('2. run:   cd lab-website', text)
+        self.assertIn('3. edit:  make the first line of deploy/app.yaml `app: "lab"`', text)
         self.assertIn('https://lab-website-dev.', text)  # still the repo's name until it is fixed
 
     def test_without_app_name_nothing_is_written(self):

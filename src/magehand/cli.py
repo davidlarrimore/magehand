@@ -769,16 +769,16 @@ def new_summary(repo, name, app, dest, named, cloned):
     """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
     what the platform does by itself afterwards. Everything already done went to stderr as it happened."""
     live = name if named in ('failed', 'differs') else app
-    steps = []
-    if cloned not in ('cloned', 'exists'):
-        steps.append(f'run:  gh repo clone {repo} {dest}')
-    where = f' (in {dest}/)' if cloned in ('cloned', 'exists') else ''
+    # run: a command to type, write:/edit: work in the repo, do: a decision or action of yours. A program
+    # can't change its parent shell's directory, so `cd` is a step even when it cloned.
+    steps = [f'run:   gh repo clone {repo} {dest}'] if cloned not in ('cloned', 'exists') else []
+    steps.append(f'run:   cd {dest}')
     if named in ('failed', 'differs'):
-        steps.append(f'edit: make the first line of deploy/app.yaml `app: "{app}"`; the repo still names the app '
-                     f'{name}')
-    steps += [f'write: the code and deploy/ (app.yaml and base/){where}   see: magehand guide search new app',
-              'run:  magehand check        (the platform\'s rules, before you push)',
-              'do:   open a PR and merge it (the platform deploys what is on main)']
+        steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
+                     f'{name})')
+    steps += ['write: the code, and deploy/ (app.yaml and base/)   guide: magehand guide search new app',
+              'run:   magehand check          # the platform\'s rules, before you push',
+              'do:    open a PR and merge it  # the platform deploys what is on main']
     lines = ['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
     lines += ['', 'Then, by itself (about 5 minutes after deploy/ with base/ is merged to main):',
               f'  - {live} is registered and deployed to https://{live}-dev.{LAB}/',
