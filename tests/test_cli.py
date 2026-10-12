@@ -1576,6 +1576,161 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+class Release(unittest.TestCase):
+    """`release` picks the next semver version from what merged, and refuses what would not deploy."""
+
+    def test_classify_change(self):
+        c = magehand.classify_change
+        self.assertEqual(c('feat: add export (#8)'), ('feature', 8, 'feat: add export'))
+        self.assertEqual(c('fix(api): stop the crash (#9)')[0], 'fix')
+        self.assertEqual(c('feat!: drop the v1 route (#10)')[0], 'breaking')
+        self.assertEqual(c('Rework storage (#11)', 'BREAKING CHANGE: tables renamed')[0], 'breaking')
+        self.assertEqual(c('Add a thing (#12)', labels=['enhancement'])[0], 'feature')
+        self.assertEqual(c('Tidy (#13)', labels=['Breaking'])[0], 'breaking')
+        self.assertEqual(c('docs: wording')[0:2], ('other', None))
+        self.assertEqual(c('Merge pull request #14 from x/y', 'fix: thing\n')[0:2], ('fix', 14))
+
+    def test_next_version_and_first_release(self):
+        self.assertEqual(magehand.next_version('v1.2.3', 'patch'), 'v1.2.4')
+        self.assertEqual(magehand.next_version('v1.2.3', 'minor'), 'v1.3.0')
+        self.assertEqual(magehand.next_version('v1.2.3', 'major'), 'v2.0.0')
+        self.assertEqual(magehand.next_version('v2', 'minor'), 'v2.1.0')
+        self.assertEqual(magehand.next_version(None, 'patch'), 'v1.0.0')
+
+    def test_choose_bump_and_override(self):
+        fix, feat, brk = ('fix', 1, 'fix: a'), ('feature', 2, 'feat: b'), ('breaking', 3, 'feat!: c')
+        self.assertEqual(magehand.choose_bump([fix], [], [])[0], 'patch')
+        self.assertEqual(magehand.choose_bump([fix, feat], [], [])[0], 'minor')
+        self.assertEqual(magehand.choose_bump([fix, feat, brk], [], [])[0], 'major')
+        self.assertEqual(magehand.choose_bump([fix], [], ['block cache (redis)'])[0], 'minor')
+        bump, why = magehand.choose_bump([fix], ['block db (postgres)'], [])
+        self.assertEqual(bump, 'major')
+        self.assertIn('block db', why)
+        bump, why = magehand.choose_bump([feat], [], [], forced='patch')
+        self.assertEqual(bump, 'patch')
+        self.assertIn('as asked', why)
+        # nothing marks the changes: a floor, said so
+        bump, why = magehand.choose_bump([('other', 6, 'Design scenarios')], [], [])
+        self.assertEqual((bump, 'a guess' in why), ('patch', True))
+
+    def test_spec_changes_reads_blocks_and_models(self):
+        old = {'services': {'db': {'type': 'postgres'}, 'ai': {'type': 'llm', 'models': ['small']}}}
+        new = {'services': {'ai': {'type': 'llm', 'models': ['small', 'large']}, 'cache': {'type': 'redis'}}}
+        removed, added = magehand.spec_changes(old, new)
+        self.assertEqual(removed, ['block db (postgres)'])
+        self.assertEqual(added, ['block cache (redis)', 'model large of ai'])
+        self.assertEqual(magehand.spec_changes(None, {}), ([], []))
+
+    def test_release_notes_group_and_link(self):
+        notes = magehand.release_notes('davidlarrimore/app', 'v1.0.0', 'v1.1.0', [
+            ('feature', 8, 'feat: add export'), ('fix', None, 'fix: crash'), ('breaking', 10, 'feat!: drop v1')])
+        self.assertLess(notes.index('Breaking changes'), notes.index('Features'))
+        self.assertLess(notes.index('Features'), notes.index('Fixes'))
+        self.assertIn('[#8](https://github.com/davidlarrimore/app/pull/8)', notes)
+        self.assertIn('compare/v1.0.0...v1.1.0', notes)
+
+    def fake_gh(self, calls=None, **overrides):
+        """gh_query/gh_probe/collect_status for plan_release over one app with two commits since v1.0.0."""
+        data = {
+            'repos/davidlarrimore/app/commits/main': {'sha': 'a' * 40, 'commit': {'message': 'x'}},
+            'user': {'login': magehand.OWNER},
+            'repos/davidlarrimore/app/releases?per_page=20': [
+                {'tag_name': 'v1.0.0', 'draft': False, 'prerelease': False, 'author': {'login': magehand.OWNER}}],
+            'repos/davidlarrimore/app/compare/v1.0.0...main': {'ahead_by': 2, 'commits': [
+                {'commit': {'message': 'feat: add export (#8)\n\nbody'}},
+                {'commit': {'message': 'fix: crash (#9)'}}]},
+            'repos/davidlarrimore/app/pulls/8': {'labels': []}, 'repos/davidlarrimore/app/pulls/9': {'labels': []},
+            'repos/davidlarrimore/app/git/ref/tags/v1.1.0': None,
+            'repos/davidlarrimore/app/commits/' + 'a' * 40 + '/check-runs?per_page=100': {'check_runs': [
+                {'name': 'scan', 'status': 'completed', 'conclusion': 'success'}]},
+        }
+        data.update(overrides)
+
+        def query(*args):
+            value = data.get(args[1])
+            return (None, 'HTTP 404') if value is None else (value, None)
+
+        def probe(*args):
+            path = args[1].split('?')[0].replace('repos/', '', 1).replace('davidlarrimore/', '')
+            files = {'homelab/contents/platform/prod-apps/apps/lab.yaml': 'exposure: internal\n',
+                     'app/contents/deploy/prod': '[]', 'app/contents/deploy/app.yaml': 'services: {}\n'}
+            content = overrides.get('files', files).get(path)
+            if content is None:
+                return 1, '', 'HTTP 404: Not Found'
+            if content.startswith('['):
+                return 0, json.dumps([{'name': 'kustomization.yaml'}]), ''
+            import base64
+            return 0, json.dumps({'content': base64.b64encode(content.encode()).decode()}), ''
+        stages = [{'stage': 'build', 'state': 'ok', 'text': 'built'}, {'stage': 'deploy', 'state': 'ok', 'text': 'merged'},
+                  {'stage': 'dev', 'state': 'ok', 'text': 'running'}]
+        return mock.patch.multiple(magehand, gh_query=query, gh_probe=probe,
+                                   collect_status=lambda *a, **k: {'stages': overrides.get('stages', stages)})
+
+    def test_plan_picks_minor_and_has_no_problems_when_everything_is_ready(self):
+        with self.fake_gh():
+            plan = magehand.plan_release('davidlarrimore/app', 'lab')
+        self.assertEqual((plan['version'], plan['bump'], plan['problems']), ('v1.1.0', 'minor', []))
+        self.assertIn('feat: add export', plan['notes'])
+
+    def test_plan_refuses_what_would_not_deploy(self):
+        failing = {'check_runs': [{'name': 'scan', 'status': 'completed', 'conclusion': 'failure'},
+                                  {'name': 'build', 'status': 'in_progress', 'conclusion': None}]}
+        stages = [{'stage': 'build', 'state': 'pending', 'text': 'building'},
+                  {'stage': 'deploy', 'state': 'pending', 'text': 'no deploy PR'},
+                  {'stage': 'dev', 'state': 'pending', 'text': 'rolling out'}]
+        with self.fake_gh(stages=stages, **{'repos/davidlarrimore/app/commits/' + 'a' * 40 + '/check-runs?per_page=100': failing,
+                                            'user': {'login': 'someone-else'}, 'files': {}}):
+            problems = ' | '.join(magehand.plan_release('davidlarrimore/app', 'lab')['problems'])
+        for text in ('signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
+                     'failing checks: scan', 'still has checks running: build', 'build of', 'deploy of',
+                     'dev is not running'):
+            self.assertIn(text, problems)
+
+    def test_plan_nothing_new_and_existing_tag(self):
+        with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...main': {'ahead_by': 0, 'commits': []}}):
+            self.assertIn('nothing new on main since v1.0.0', magehand.plan_release('davidlarrimore/app', 'lab')['problems'])
+        with self.fake_gh(**{'repos/davidlarrimore/app/git/ref/tags/v1.1.0': {'ref': 'refs/tags/v1.1.0'}}):
+            self.assertTrue(any('already exists' in p for p in magehand.plan_release('davidlarrimore/app', 'lab')['problems']))
+
+    def test_unreadable_dev_pods_only_warn(self):
+        stages = [{'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''},
+                  {'stage': 'dev', 'state': 'unknown', 'text': 'not checked'}]
+        with self.fake_gh(stages=stages):
+            plan = magehand.plan_release('davidlarrimore/app', 'lab')
+        self.assertEqual(plan['problems'], [])
+        self.assertEqual(len(plan['warnings']), 1)
+
+    def test_command_creates_only_on_yes_and_targets_the_checked_commit(self):
+        import contextlib
+        import io
+        created = []
+        app = {'name': 'lab', 'spec': {'source': {'repo': 'app'}}, 'root': None}
+
+        def run(*argv):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    magehand.main(['release', 'lab', *argv])
+                    return 0, out.getvalue()
+                except SystemExit as exit_:
+                    return exit_.code, out.getvalue()
+        with self.fake_gh(), mock.patch.object(magehand, 'app_here', lambda name: app), \
+                mock.patch.object(magehand, 'gh_cli',
+                                  lambda *args, stdin=None: created.append((args, stdin)) or (0, 'https://x/r\n', '')):
+            code, out = run('--dry-run')
+            self.assertEqual((code, created), (0, []))
+            self.assertIn('v1.0.0 -> v1.1.0', out)
+            code, _ = run()  # no terminal and no --yes: refuse
+            self.assertEqual((code == 0, created), (False, []))
+            code, out = run('--yes', '--patch', '--json')
+            self.assertEqual(code, 0)
+        args, notes = created[0]
+        self.assertEqual(args[:3], ('release', 'create', 'v1.0.1'))
+        self.assertIn('a' * 40, args)
+        self.assertIn('feat: add export', notes)
+        self.assertTrue(json.loads(out)['created'])
+
+
 class TokenStorage(unittest.TestCase):
     """The OpenBao token is never an argument, and the file fallback is private to its owner."""
 

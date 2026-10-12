@@ -9,8 +9,9 @@
   every network call to GitHub and `*.lab`; never add a public homelab
   endpoint. The one cluster call is read-only `kubectl get` (`status`: dev's
   pods and Argo application), skipped without kubectl and by `--no-cluster`.
-  Its one write is `magehand new`: an app's repo on GitHub, as the owner
-  (through `gh`).
+  Its writes are `magehand new` (an app's repo on GitHub) and `magehand
+  release` (a tag and release on an app's repo), both as the owner through
+  `gh`, never to the homelab itself.
 - Secrets never touch argv (`-e NAME` for docker; the token goes to the
   Keychain on stdin, `security -i`) and never touch disk, except the token's
   0600 file off macOS, where the standard library has no credential store.
