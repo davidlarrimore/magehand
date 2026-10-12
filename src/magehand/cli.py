@@ -4,7 +4,8 @@ The developer CLI for apps on the homelab, used by the owner (Claude Code on
 the MacBook) and by OpenClaw's coding workers. `magehand --help` lists the
 commands; `magehand COMMAND --help` explains each, with examples.
 
-`magehand new` is its one write: an app's repo on GitHub, as the owner.
+Its writes are `magehand new` (an app's repo on GitHub) and `magehand release` (a tag and release on an
+app's repo), both as the owner.
 
 Private by design: it talks only to GitHub and the private *.lab network,
 never to a public homelab endpoint. Everyday commands assume they can
@@ -880,10 +881,10 @@ def build_runs(repo, head):
     return runs, None
 
 
-def collect_status(repo, name, cluster=True):
-    """The stages for the app `name` whose code is `repo` (OWNER/NAME); a failed query is a stage in state
-    'error' naming what could not be read."""
-    commit, err = gh_query('api', f'repos/{repo}/commits/main')
+def collect_status(repo, name, cluster=True, ref='main'):
+    """The stages for the app `name` whose code is `repo` (OWNER/NAME) at `ref` (main, or the one commit
+    `release` is about to tag); a failed query is a stage in state 'error' naming what could not be read."""
+    commit, err = gh_query('api', f'repos/{repo}/commits/{ref}')
     if err:
         die(f'cannot read {repo} through gh: {err} (is it yours, and are you signed in: `gh auth login`)')
     head = commit['sha']
@@ -921,13 +922,18 @@ def render_status(report):
     return '\n'.join(lines)
 
 
-def cmd_status(a):
-    app = app_here(a.app_flag or a.app)
+def code_repo(app):
+    """OWNER/NAME of the app's code repo, or exits: an app built in homelab-apps has no main of its own."""
     spec = app['spec'].get('source') or {}
     source = spec.get('repo') or (remote_repo(app['root']) if app['root'] else None)
     if not source:
         die(f'{app["name"]} has no code repo (its image is built in homelab-apps), so there is no main to follow')
-    repo = f'{OWNER}/{source}'
+    return f'{OWNER}/{source}'
+
+
+def cmd_status(a):
+    app = app_here(a.app_flag or a.app)
+    repo = code_repo(app)
     deadline = time.monotonic() + a.timeout * 60
     last = None
     while True:
@@ -958,8 +964,302 @@ def cmd_status(a):
     sys.exit(1 if failed or report.get('timeout') else 0)
 
 
+# --- release: cut an app's production release ----------------------------------------
+# The second write magehand makes, to GitHub as the owner (through gh): a tag and release on the app's
+# repo. The platform deploys production from the owner's published release vX.Y.Z (see `status`), so
+# this only picks the version, writes the notes and refuses when the release would not deploy.
+
+CONVENTIONAL = re.compile(r'^(\w+)(\([^)]*\))?(!)?:\s*(.*)$')
+PR_SUFFIX = re.compile(r'\s*\(#(\d+)\)\s*$')
+PR_MERGE = re.compile(r'^Merge pull request #(\d+)')
+BREAKING_FOOTER = re.compile(r'^BREAKING[ -]CHANGE:', re.MULTILINE)
+KINDS = (('breaking', 'Breaking changes'), ('feature', 'Features'), ('fix', 'Fixes'), ('other', 'Other changes'))
+BUMP_OF = {'breaking': 'major', 'feature': 'minor', 'fix': 'patch', 'other': 'patch'}
+MAX_LABEL_LOOKUPS = 40
+FAILED_CHECK = ('failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required')
+
+
+def classify_change(subject, body='', labels=()):
+    """(kind, number or None, title) of one commit on main: breaking | feature | fix | other, from a
+    Conventional Commit prefix (`!` or a BREAKING CHANGE footer) or the PR's labels."""
+    names = {str(label).lower() for label in labels}
+    number = None
+    merge = PR_MERGE.match(subject)
+    if merge:  # a merge commit: the PR's title is the first line of its body
+        number = int(merge.group(1))
+        subject, body = (body or '').strip().splitlines()[0] if (body or '').strip() else subject, ''
+    tail = PR_SUFFIX.search(subject)
+    if tail:
+        number = int(tail.group(1))
+        subject = subject[:tail.start()]
+    m = CONVENTIONAL.match(subject)
+    kind_word = m.group(1).lower() if m else ''
+    if (m and m.group(3)) or BREAKING_FOOTER.search(body or '') or names & {'breaking', 'breaking change'}:
+        kind = 'breaking'
+    elif kind_word == 'feat' or names & {'enhancement', 'feature'}:
+        kind = 'feature'
+    elif kind_word in ('fix', 'perf') or 'bug' in names:
+        kind = 'fix'
+    else:
+        kind = 'other'
+    return kind, number, subject
+
+
+def spec_changes(old, new):
+    """(removed, added): what a release takes out of or puts into deploy/app.yaml that an app's users or its
+    data would notice: building blocks (by name and type) and the llm models they request."""
+    def items(spec):
+        found = {}
+        for block, svc in ((spec or {}).get('services') or {}).items():
+            svc = svc if isinstance(svc, dict) else {}
+            found[f'block {block} ({svc.get("type")})'] = None
+            for model in svc.get('models') or []:
+                found[f'model {model} of {block}'] = None
+        return found
+    before, after = items(old), items(new)
+    return sorted(set(before) - set(after)), sorted(set(after) - set(before))
+
+
+def next_version(tag, bump):
+    """The tag after `tag` (None: no release yet, so v1.0.0) for a major | minor | patch bump."""
+    m = re.match(r'^v(\d+)(?:\.(\d+))?(?:\.(\d+))?$', tag or '')
+    if not m:
+        return 'v1.0.0'
+    major, minor, patch = (int(g or 0) for g in m.groups())
+    if bump == 'major':
+        return f'v{major + 1}.0.0'
+    if bump == 'minor':
+        return f'v{major}.{minor + 1}.0'
+    return f'v{major}.{minor}.{patch + 1}'
+
+
+def choose_bump(changes, removed, added, forced=None):
+    """(bump, why) from the classified changes [(kind, number, title)] and the deploy/app.yaml delta. An
+    explicit bump wins and is shown next to what was found."""
+    def refs(kind):
+        return ', '.join(f'#{n}' if n else f'"{t[:40]}"' for k, n, t in changes if k == kind)
+    breaking = [c for c in changes if c[0] == 'breaking']
+    features = [c for c in changes if c[0] == 'feature']
+    if breaking or removed:
+        found = 'major', ('breaking: ' + refs('breaking') if breaking else 'deploy/app.yaml removes ' + ', '.join(removed))
+    elif features or added:
+        found = 'minor', ('features: ' + refs('feature') if features else 'deploy/app.yaml adds ' + ', '.join(added))
+    elif any(c[0] == 'fix' for c in changes) or not changes:
+        found = 'patch', 'only fixes and other changes; no features or breaking changes found'
+    else:  # nothing marks these as fixes or features: say it is a floor, not a finding
+        found = 'patch', (f'{len(changes)} change{"" if len(changes) == 1 else "s"} with no feat/fix prefix or '
+                          'label to read: a guess; pass --minor if they add features')
+    if forced and forced != found[0]:
+        return forced, f'{forced} as asked (the changes read as {found[0]}: {found[1]})'
+    return found[0], f'{found[0]}: {found[1]}'
+
+
+def release_notes(repo, previous, version, changes):
+    """Markdown release notes grouped by kind, each change linking its PR."""
+    lines = []
+    for kind, heading in KINDS:
+        mine = [c for c in changes if c[0] == kind]
+        if mine:
+            lines += [f'## {heading}', ''] + [
+                f'- {t}' + (f' ([#{n}](https://github.com/{repo}/pull/{n}))' if n else '') for _, n, t in mine] + ['']
+    if previous:
+        lines.append(f'**Full changelog**: https://github.com/{repo}/compare/{previous}...{version}')
+    return '\n'.join(lines).strip() + '\n'
+
+
+def file_at(repo, path, ref):
+    """(text, None) of a file at a ref, (None, None) when it is absent, (None, why) when it can't be read."""
+    code, out, err = gh_probe('api', f'repos/{repo}/contents/{path}?ref={ref}')
+    if code != 0:
+        return (None, None) if '404' in err or 'Not Found' in err else (None, err or 'gh failed')
+    try:
+        listing = json.loads(out)
+        if isinstance(listing, list):
+            return json.dumps([f.get('name') for f in listing]), None
+        return base64.b64decode(listing.get('content') or '').decode(), None
+    except (ValueError, UnicodeDecodeError):
+        return None, 'gh returned something unreadable'
+
+
+def compare_commits(repo, base, head):
+    """(commits, ahead_by, None) of base...head across every page of GitHub's comparison (it returns at most
+    250 commits, and `ahead_by` is the whole count), or ([], 0, why) when a page can't be read or the
+    result is incomplete: a release must not be versioned from part of its changes."""
+    commits, ahead, page = [], 0, 1
+    while page <= 30:
+        found, err = gh_query('api', f'repos/{repo}/compare/{base}...{head}?per_page=100&page={page}')
+        if err:
+            return [], 0, f'could not compare {base} with main: {err}'
+        ahead = found.get('ahead_by') or 0
+        got = found.get('commits') or []
+        commits += got
+        if len(commits) >= ahead or len(got) < 100:
+            break
+        page += 1
+    if len(commits) < ahead:
+        return [], ahead, f'only {len(commits)} of the {ahead} commits since {base} could be read'
+    return commits, ahead, None
+
+
+def read_spec(repo, ref, problems, required):
+    """deploy/app.yaml at `ref`, parsed: {} when the file is absent and not required. A read or parse error
+    is a problem, never an empty spec (an empty one would invent removals or hide them)."""
+    text, err = file_at(repo, 'deploy/app.yaml', ref)
+    if err:
+        problems.append(f'could not read deploy/app.yaml at {ref[:12]}: {err}')
+        return {}
+    if text is None:
+        if required:
+            problems.append(f'deploy/app.yaml is missing on main (production needs deploy/app.yaml, base/ and prod/)')
+        return {}
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as error:
+        problems.append(f'deploy/app.yaml at {ref[:12]} is not valid YAML: {str(error).splitlines()[0]}')
+        return {}
+
+
+def plan_release(repo, name, forced=None, cluster=True):
+    """Everything `release` decides, from reads only: {app, repo, commit, previous, version, bump, why,
+    changes, notes, problems, warnings}. A problem is a reason the release would not deploy."""
+    problems, warnings = [], []
+    commit, err = gh_query('api', f'repos/{repo}/commits/main')
+    if err:
+        die(f'cannot read {repo} through gh: {err} (is it yours, and are you signed in: `gh auth login`)')
+    head = commit['sha']
+    who, err = gh_query('api', 'user')
+    if err or (who or {}).get('login') != OWNER:
+        problems.append(f'gh is signed in as {(who or {}).get("login") or "nobody"}: only {OWNER}\'s release '
+                        f'deploys production (`gh auth login`)')
+    approved, err = file_at(f'{OWNER}/homelab', f'platform/prod-apps/apps/{name}.yaml', 'main')
+    if err:
+        problems.append(f'could not read the production approval of {name}: {err}')
+    elif approved is None:
+        problems.append(f'{name} is not approved for production: homelab platform/prod-apps/apps/{name}.yaml '
+                        f'is added by the owner (see the guide, "Going to production")')
+    prod_dir, err = file_at(repo, 'deploy/prod', head)
+    if prod_dir is None:
+        problems.append(f'deploy/prod/ is missing on main (production needs deploy/app.yaml, base/ and prod/)'
+                        if not err else f'could not read deploy/prod: {err}')
+    releases, err = gh_query('api', f'repos/{repo}/releases?per_page=20')
+    if err:
+        die(f'cannot read {repo} releases through gh: {err}')
+    last = eligible_release(releases)
+    previous = (last or {}).get('tag_name')
+    changes, ahead, old_spec = [], 0, None
+    if previous:
+        commits, ahead, err = compare_commits(repo, previous, head)
+        if err:
+            problems.append(err)
+        looked = 0
+        for c in commits:
+            message = (c.get('commit') or {}).get('message') or ''
+            subject, _, body = message.partition('\n')
+            labels = []
+            tail = PR_SUFFIX.search(subject) or PR_MERGE.match(subject)
+            if tail and looked < MAX_LABEL_LOOKUPS:
+                looked += 1
+                pr, err = gh_query('api', f'repos/{repo}/pulls/{tail.group(1)}')
+                if err:  # a missed `breaking` label would pick the wrong version
+                    problems.append(f'could not read the labels of PR #{tail.group(1)}: {err}')
+                else:
+                    labels = [l.get('name') for l in (pr or {}).get('labels') or []]
+            changes.append(classify_change(subject, body, labels))
+        if looked == MAX_LABEL_LOOKUPS:
+            warnings.append(f'only the first {MAX_LABEL_LOOKUPS} PRs were checked for labels')
+        old_spec = read_spec(repo, previous, problems, required=False)
+    else:
+        found, err = gh_query('api', f'repos/{repo}/commits?sha={head}&per_page=100')
+        if err:
+            problems.append(f'could not read the commits of main: {err}')
+        ahead = len(found or [])
+        for c in found or []:
+            message = (c.get('commit') or {}).get('message') or ''
+            subject, _, body = message.partition('\n')
+            changes.append(classify_change(subject, body))
+    new_spec = read_spec(repo, head, problems, required=True)
+    removed, added = spec_changes(old_spec, new_spec) if previous else ([], [])
+    bump, why = choose_bump(changes, removed, added, forced) if previous else ('major', 'major: the first release')
+    version = next_version(previous, bump)
+    if previous and ahead == 0:
+        problems.append(f'nothing new on main since {previous}')
+    ref, err = gh_query('api', f'repos/{repo}/git/ref/tags/{version}')
+    if ref and not err:
+        problems.append(f'the tag {version} already exists (a draft or prerelease?): delete it or pick a bump')
+    checks, err = gh_query('api', f'repos/{repo}/commits/{head}/check-runs?per_page=100')
+    if err:
+        problems.append(f'could not read the checks of main: {err}')
+    else:
+        runs = checks.get('check_runs') or []
+        bad = [r.get('name') for r in runs if r.get('conclusion') in FAILED_CHECK]
+        busy = [r.get('name') for r in runs if r.get('status') != 'completed']
+        if bad:
+            problems.append(f'main {head[:7]} has failing checks: {", ".join(bad)}')
+        if busy:
+            problems.append(f'main {head[:7]} still has checks running: {", ".join(busy)}')
+    stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head)['stages']}
+    for stage in ('build', 'deploy'):
+        if stages[stage]['state'] != 'ok':
+            problems.append(f'{stage} of {head[:7]} is not done: {stages[stage]["text"]}')
+    dev = stages.get('dev')
+    if dev and dev['state'] in ('failed', 'pending'):
+        problems.append(f'dev is not running {head[:7]}: {dev["text"]}')
+    elif not dev or dev['state'] == 'unknown':
+        warnings.append("dev's pods were not read (no kubectl, or --no-cluster): only its deploy PR merged")
+    return {'app': name, 'repo': repo, 'commit': head, 'previous': previous, 'version': version, 'bump': bump,
+            'why': why, 'commits': ahead, 'changes': [{'kind': k, 'pr': n, 'title': t} for k, n, t in changes],
+            'notes': release_notes(repo, previous, version, changes), 'problems': problems, 'warnings': warnings}
+
+
+def render_release(plan):
+    lines = [f'{plan["app"]}  {plan["previous"] or "no release yet"} -> {plan["version"]}'
+             f'  ({plan["repo"]} main {plan["commit"][:7]}, {plan["commits"]} commit'
+             f'{"" if plan["commits"] == 1 else "s"})', f'  {plan["why"]}']
+    lines += [f'  ! {w}' for w in plan['warnings']]
+    lines += [f'  ✗ {p}' for p in plan['problems']]
+    lines += ['', plan['notes'].rstrip()]
+    return '\n'.join(lines)
+
+
+def cmd_release(a):
+    if sum(map(bool, (a.major, a.minor, a.patch))) > 1:
+        usage('release', 'choose one of --major, --minor, --patch')
+    forced = 'major' if a.major else 'minor' if a.minor else 'patch' if a.patch else None
+    app = app_here(a.app_flag or a.app)
+    plan = plan_release(code_repo(app), app['name'], forced, cluster=not a.no_cluster)
+    plan['created'] = False
+    refuse = f'not releasing {plan["version"]}: ' + '; '.join(plan['problems']) if plan['problems'] else None
+    if a.dry_run or refuse:
+        if a.json:
+            print(json.dumps(plan, indent=1))
+        else:
+            print(render_release(plan))
+        if refuse:
+            print(f'magehand: {refuse}', file=sys.stderr)
+        sys.exit(1 if refuse else 0)
+    if not a.json:
+        print(render_release(plan))
+    if not a.yes:
+        if not sys.stdin.isatty():
+            die('not a terminal: add --yes to create the release, or --dry-run to only see the plan')
+        if input(f'\nCreate release {plan["version"]} of {plan["repo"]} (deploys {plan["app"]} to production)? '
+                 '[y/N] ').strip().lower() not in ('y', 'yes'):
+            die('cancelled; nothing was created')
+    code, out, err = gh_cli('release', 'create', plan['version'], '-R', plan['repo'], '--target', plan['commit'],
+                            '--title', plan['version'], '--notes-file', '-', stdin=plan['notes'])
+    if code != 0:
+        die(f'gh could not create the release: {err}')
+    plan['created'], plan['url'] = True, out.strip()
+    if a.json:
+        print(json.dumps(plan, indent=1))
+    else:
+        print(f'released {plan["version"]}: {plan["url"]}')
+        print(f'The platform deploys it to production within minutes; follow it with `magehand status {plan["app"]}`.',
+              file=sys.stderr)
+
+
 # --- new: start an app's repo --------------------------------------------------------
-# The one write magehand makes, to GitHub as the owner (never to the homelab): the
+# A write magehand makes, to GitHub as the owner (never to the homelab): the
 # app's private repo from the template, with OpenClaw's bot as a collaborator.
 
 OWNER = APPS_REPO.split('/')[0]
@@ -2622,6 +2922,7 @@ class Parser(argparse.ArgumentParser):
 # command's short help).
 GROUPS = (('start an app', ('new',)),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'update-agents')),
+          ('ship an app', ('release',)),
           ('run an app locally', ('run', 'dev', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
@@ -2724,6 +3025,25 @@ def build_parser():
     p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read the dev pods with kubectl (GitHub only)")
     p.add_argument('--interval', type=int, default=15, metavar='SEC', help=argparse.SUPPRESS)
+    json_option(p)
+    p = command('release', cmd_release, "cut an app's production release (the next vX.Y.Z)", "create an app's GitHub release: the next semver version, release notes, and the checks that it will deploy",
+                "Picks the next version from what merged to main since the last release (Conventional Commit\n"
+                "types, `!` or BREAKING CHANGE, PR labels `breaking` and `enhancement`, blocks and models added or\n"
+                "removed in deploy/app.yaml), drafts grouped notes and, on your yes, creates the tag and release\n"
+                "as you through gh. Refuses unless main is green, dev runs its newest commit, the app is approved\n"
+                "for production and deploy/prod/ exists. The platform deploys the release; follow it with `status`.\n\n"
+                'examples:\n  magehand release --dry-run           the version, notes and checks only\n'
+                '  magehand release                     ask, then create it\n'
+                '  magehand release --minor --yes       force the bump, no prompt')
+    app_option(p)
+    bump = p.add_mutually_exclusive_group()
+    bump.add_argument('--major', action='store_true', help='release the next major version whatever the changes')
+    bump.add_argument('--minor', action='store_true', help='release the next minor version whatever the changes')
+    bump.add_argument('--patch', action='store_true', help='release the next patch version whatever the changes')
+    p.add_argument('--dry-run', action='store_true', dest='dry_run', help='print the version, notes and checks; create nothing')
+    p.add_argument('--yes', action='store_true', help="create the release without asking (when it isn't refused)")
+    p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
+                   help="don't read the dev pods with kubectl (GitHub only)")
     json_option(p)
     p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
                 'Run it before every push; CI runs the same check. Each finding names the guide section\n'
