@@ -1587,9 +1587,10 @@ class ArgoAccess(unittest.TestCase):
         return {**self.APP, 'status': {'conditions': [{'type': kind, 'message': message}]}}
 
     def test_status_fails_with_the_fix_when_argo_cannot_read_the_repo(self):
-        for message in ('rpc error: code = Unknown desc = authentication required',
-                        'Failed to load target state: repository not found',
-                        "failed to list refs: could not read Username for 'https://github.com'"):
+        repo = 'https://github.com/davidlarrimore/elvis.git'
+        for message in (f'rpc error: code = Unknown desc = authentication required for {repo}',
+                        f'Failed to load target state: repository not found: {repo}',
+                        f"failed to list refs: could not read Username for '{repo}'"):
             with self.subTest(message):
                 stage = magehand.argo_problem(self.app('ComparisonError', message))
                 self.assertEqual(stage['state'], 'failed')
@@ -1610,11 +1611,16 @@ class ArgoAccess(unittest.TestCase):
                 'ssh platform source': 'rpc error: ssh: handshake failed: Permission denied (publickey) '
                                        'for git@github.com:davidlarrimore/homelab.git',
                 'another source authentication failure': 'failed to fetch davidlarrimore/homelab.git: authentication failed',
-                'kustomize remote base': 'kustomize build failed: authentication required'}.items():
+                'kustomize remote base': 'kustomize build failed: authentication required',
+                'numbered other source': 'Failed to load target state: failed to generate manifest for source 2 of 2: '
+                                         'rpc error: code = Unknown desc = failed to list refs: authentication required',
+                'several sources, none named': 'failed to list refs: authentication required'}.items():
             with self.subTest(label):
                 self.assertEqual(magehand.argo_problem(self.app('ComparisonError', message))['state'], 'pending')
         named = 'failed to list refs https://github.com/davidlarrimore/elvis.git: authentication required'
         self.assertEqual(magehand.argo_problem(self.app('ComparisonError', named))['state'], 'failed')
+        numbered = 'failed to generate manifest for source 1 of 2: failed to list refs: authentication required'
+        self.assertEqual(magehand.argo_problem(self.app('ComparisonError', numbered))['state'], 'failed')
 
     def test_a_failing_pod_wins_over_a_pending_render_error(self):
         app = self.app('ComparisonError', 'kustomize build failed: no such file')
@@ -1628,7 +1634,7 @@ class ArgoAccess(unittest.TestCase):
         self.assertIn('CrashLoopBackOff', stage['text'])
 
     def test_dev_stage_reports_it_before_the_pods(self):
-        app = self.app('ComparisonError', 'repository not found')
+        app = self.app('ComparisonError', 'repository not found: https://github.com/davidlarrimore/elvis.git')
         calls = {'pods': ({'items': []}, None), 'application.argoproj.io': (app, None)}
         with mock.patch.object(magehand, 'kubectl_json', lambda kind, *a: calls[kind]):
             stage = magehand.dev_stage('elvis', {'digest': 'sha256:abc', 'image': 'x@sha256:' + 'a' * 64})

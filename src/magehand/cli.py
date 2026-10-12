@@ -894,11 +894,20 @@ def argo_problem(application):
         sources = spec.get('sources') or [spec.get('source') or {}]
         repo = next((str(s.get('repoURL')) for s in sources if 'github.com/' in str(s.get('repoURL')) and
                      str(s.get('repoURL')).startswith('https://')), '')
-        others = {n for s in sources if str(s.get('repoURL')) != repo for n in repo_names(s.get('repoURL'))}
         shown = repo.rsplit('/', 1)[-1].removesuffix('.git') if repo else 'the app repo'
         lower = message.lower()
-        about_other = any(n.lower() in lower for n in others - repo_names(repo)) and \
-            not any(n.lower() in lower for n in repo_names(repo) if '/' in n)
+        # Which source failed: Argo's "source N of M" when it says, else the app repo must be named in the
+        # message when there are several sources (the platform repo is another, read over SSH). Ambiguous
+        # errors stay pending.
+        numbered = re.search(r'source (\d+) of (\d+)', lower)
+        if numbered:
+            index = int(numbered.group(1)) - 1
+            ours = 0 <= index < len(sources) and str(sources[index].get('repoURL')) == repo
+        elif len(sources) > 1:
+            ours = any(n.lower() in lower for n in repo_names(repo) if '/' in n)
+        else:
+            ours = bool(repo)
+        about_other = not ours
         if ARGO_REPO_ACCESS.search(message) and 'kustomize' not in lower and not about_other:
             return {'state': 'failed',
                     'text': f'Argo CD cannot read {shown}: add it to the GitHub App installation it reads app repos '
