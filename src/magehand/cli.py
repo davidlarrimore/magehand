@@ -750,6 +750,8 @@ def prod_stage(tag, ahead, prs):
             'tag': tag, 'ahead': ahead}
 
 
+BLOCK_LABEL = 'homelab.davidlarrimore.com/block'  # on a building block's pods (postgres, redis): not the app's image
+
 STUCK_PODS = ('CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError',
               'InvalidImageName', 'RunContainerError')
 
@@ -774,29 +776,31 @@ def kubectl_json(*args):
 
 def pod_stage(pods, application, image, argo_error=None):
     """What dev's pods run: `pods` and `application` are kubectl's JSON (application may be None), `image` the
-    deploy PR's pinned ref. ok when every live pod is ready on that digest (and Argo reports synced and
-    healthy), failed when a pod on the new image can't start, otherwise a rollout in progress. Without the
+    deploy PR's pinned ref. ok when every live app pod is ready on that digest and every building-block pod
+    (postgres, redis: they run their own images) is ready (and Argo reports synced and healthy), failed when
+    a pod can't start, otherwise a rollout in progress. Without the
     application (`argo_error`: why) pods that are ready are 'unknown', never a verified rollout."""
     digest = image.rsplit('@', 1)[-1]
     live = [p for p in (pods or {}).get('items') or []
             if not (p.get('metadata') or {}).get('deletionTimestamp')
             and (p.get('status') or {}).get('phase') not in ('Succeeded', 'Failed')]
-    if not live:
+    if not any(BLOCK_LABEL not in ((p.get('metadata') or {}).get('labels') or {}) for p in live):
         return {'stage': 'dev', 'state': 'pending', 'text': f'no pods yet for {digest[:19]}'}
     ready = stuck = 0
     for pod in live:
+        block = BLOCK_LABEL in ((pod.get('metadata') or {}).get('labels') or {})
         statuses = (pod.get('status') or {}).get('containerStatuses') or []
         declared = {c.get('name'): c.get('image') or '' for c in (pod.get('spec') or {}).get('containers') or []}
 
         def ident(c):
             """The image a container runs, or (not pulled yet: no imageID) is declared to run."""
             return c.get('imageID') or c.get('image') or declared.get(c.get('name'), '')
-        on_new = bool(statuses) and all(digest in ident(c) for c in statuses)
+        on_new = bool(statuses) and (block or all(digest in ident(c) for c in statuses))
         if on_new and all(c.get('ready') for c in statuses):
             ready += 1
         for c in statuses:
             reason = ((c.get('state') or {}).get('waiting') or {}).get('reason')
-            if reason in STUCK_PODS and digest in ident(c):
+            if reason in STUCK_PODS and (block or digest in ident(c)):
                 stuck += 1
                 why = f'{pod["metadata"]["name"]}: {reason}'
     if stuck:
@@ -2170,6 +2174,46 @@ def check_agents_drift(root):
                     'homelab-apps AGENTS.md')]
 
 
+def check_merged_branch(root):
+    """A warning when the checked-out branch already had a pull request merged (squash merges keep other
+    hashes, so `git log main..` still lists its commits) and has gone on since: new work on a merged branch
+    is a new PR from a fresh branch off origin/main. Skipped outside an app's own repo, on a detached HEAD
+    (CI), without gh or a merged PR for this branch's history, and while the branch has an open PR."""
+    if not is_app_checkout(root):
+        return []
+    branch, tip = git_out(['branch', '--show-current'], root), git_out(['rev-parse', 'HEAD'], root)
+    repo = current_repo(root)
+    if not branch or not tip or not repo or branch in ('main', 'master'):
+        return []
+    code, out, _ = gh_probe('pr', 'list', '-R', repo, '--head', branch, '--state', 'all', '--limit', '20',
+                            '--json', 'number,state,headRefOid')
+    try:
+        prs = json.loads(out) if code == 0 else []
+    except ValueError:
+        return []
+    if any(p.get('state') == 'OPEN' for p in prs):
+        return []
+    covered = []  # merged PRs whose head is in this branch's history (HEAD itself included)
+    for pr in prs:
+        old = pr.get('headRefOid') or ''
+        if pr.get('state') != 'MERGED' or not old:
+            continue
+        if old == tip:
+            return []  # a merged PR already covers HEAD: nothing new to move
+        ancestor = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', old, tip],  # nosec B603 B607
+                                  capture_output=True)
+        if ancestor.returncode == 0:
+            covered.append(pr)
+    if not covered:
+        return []
+    pr = max(covered, key=lambda p: p.get('number') or 0)  # the latest merge the new commits follow
+    return [finding('warning', f'branch {branch}',
+                    f'its PR #{pr["number"]} was already merged (a squash merge keeps other hashes, so '
+                    f'`git log main..` still lists these commits) and the branch has new commits since: '
+                    f'start a fresh branch from origin/main (`git fetch && git switch -c NAME '
+                    f'origin/main`) and cherry-pick the new commits', 'recipes')]
+
+
 def cmd_check(a):
     global APPS_DIR
     manifests_only = a.manifests_only
@@ -2183,7 +2227,7 @@ def cmd_check(a):
     found = (check_manifests(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
     if not manifests_only:
-        found += check_code(root, app, catalog) + check_agents_drift(root)
+        found += check_code(root, app, catalog) + check_agents_drift(root) + check_merged_branch(root)
     errors = sum(f['level'] == 'error' for f in found)
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
