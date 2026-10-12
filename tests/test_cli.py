@@ -1611,11 +1611,12 @@ class ArgoAccess(unittest.TestCase):
     def test_a_refusal_is_failed_and_says_why(self):
         import contextlib
         import io
-        self.gh(put=(1, '', 'HTTP 403: Must have admin rights'))
+        self.gh(put=(1, '', 'You do not have permission to modify this app on davidlarrimore. (HTTP 403)'))
         err = io.StringIO()
         with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': '12345'}), contextlib.redirect_stderr(err):
             self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'failed')
-        self.assertIn('admin rights', err.getvalue())
+        self.assertIn('do not have permission', err.getvalue())
+        self.assertIn('classic personal access token', err.getvalue())  # says why, and what would work
 
     def test_a_bad_installation_value_is_ignored(self):
         self.gh()

@@ -1679,6 +1679,12 @@ def ensure_argocd_access(repo):
     if code != 0:
         print(f'{repo}: could not add it to the Argo CD GitHub App installation: {err or "gh api failed"}',
               file=sys.stderr)
+        if '403' in (err or '') or 'permission' in (err or '').lower():
+            # GitHub allows this call only with a classic personal access token (repo scope); the OAuth token
+            # of a browser `gh auth login` is refused (verified: 403 "You do not have permission to modify this app").
+            print('  GitHub accepts this only with a classic personal access token with the repo scope '
+                  '(`gh auth login --with-token`, or GH_TOKEN for this command), not the default `gh auth login`; '
+                  'otherwise add the repo on the installation page by hand', file=sys.stderr)
         return 'failed'
     return 'added'
 
