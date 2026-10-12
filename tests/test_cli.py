@@ -1577,6 +1577,94 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+class ArgoAccess(unittest.TestCase):
+    """new adds the repo to the Argo CD GitHub App installation; status says when Argo cannot read it."""
+
+    def setUp(self):
+        self.saved = magehand.gh_cli
+        self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
+        self.calls = []
+
+    def gh(self, id_out='42\n', put=(0, '', '')):
+        def run(*args, **kw):
+            self.calls.append(args)
+            if args == ('api', 'repos/davidlarrimore/elvis', '--jq', '.id'):
+                return 0, id_out, ''
+            if args[:3] == ('api', '-X', 'PUT'):
+                return put
+            return 0, '', ''
+        magehand.gh_cli = run
+
+    def test_not_configured_is_manual_and_calls_nothing(self):
+        self.gh()
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(magehand, 'CONFIG', pathlib.Path('/nonexistent/c.json')):
+            os.environ.pop('MAGEHAND_ARGOCD_INSTALLATION', None)
+            self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'manual')
+        self.assertEqual(self.calls, [])
+
+    def test_configured_adds_the_repo_by_id_through_the_installation(self):
+        self.gh()
+        with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': '12345'}):
+            self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'added')
+        self.assertIn(('api', '-X', 'PUT', 'user/installations/12345/repositories/42'), self.calls)
+
+    def test_a_refusal_is_failed_and_says_why(self):
+        import contextlib
+        import io
+        self.gh(put=(1, '', 'HTTP 403: Must have admin rights'))
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': '12345'}), contextlib.redirect_stderr(err):
+            self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'failed')
+        self.assertIn('admin rights', err.getvalue())
+
+    def test_a_bad_installation_value_is_ignored(self):
+        self.gh()
+        with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': 'not-a-number; rm -rf'}), \
+                mock.patch.object(magehand, 'CONFIG', pathlib.Path('/nonexistent/c.json')):
+            self.assertIsNone(magehand.argocd_installation())
+        self.assertEqual(self.calls, [])
+
+    def test_the_summary_has_a_step_unless_it_was_added(self):
+        done = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path('elvis'), None, 'cloned', 'added')
+        self.assertNotIn('GitHub App installation', done)
+        for access in ('manual', 'failed'):
+            text = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path('elvis'), None, 'cloned', access)
+            self.assertIn('add davidlarrimore/elvis to the GitHub App installation', text)
+            self.assertIn('MAGEHAND_ARGOCD_INSTALLATION', text)
+
+    APP = {'spec': {'sources': [{'repoURL': 'https://github.com/davidlarrimore/elvis.git'},
+                                {'repoURL': 'git@github.com:davidlarrimore/homelab.git'}]}}
+
+    def app(self, kind, message):
+        return {**self.APP, 'status': {'conditions': [{'type': kind, 'message': message}]}}
+
+    def test_status_fails_with_the_fix_when_argo_cannot_read_the_repo(self):
+        for message in ('rpc error: code = Unknown desc = authentication required',
+                        'Failed to load target state: repository not found',
+                        "failed to list refs: could not read Username for 'https://github.com'"):
+            with self.subTest(message):
+                stage = magehand.argo_problem(self.app('ComparisonError', message))
+                self.assertEqual(stage['state'], 'failed')
+                self.assertIn('cannot read elvis', stage['text'])
+                self.assertIn('GitHub App installation', stage['text'])
+
+    def test_other_comparison_errors_are_pending_and_shown_and_healthy_is_none(self):
+        stage = magehand.argo_problem(self.app('ComparisonError', 'kustomize build failed: no such file'))
+        self.assertEqual(stage['state'], 'pending')
+        self.assertIn('no such file', stage['text'])
+        self.assertIsNone(magehand.argo_problem({**self.APP, 'status': {'conditions': []}}))
+        self.assertIsNone(magehand.argo_problem(self.app('OrphanedResourceWarning', 'x')))
+        self.assertIsNone(magehand.argo_problem(None))
+
+    def test_dev_stage_reports_it_before_the_pods(self):
+        app = self.app('ComparisonError', 'repository not found')
+        calls = {'pods': ({'items': []}, None), 'application.argoproj.io': (app, None)}
+        with mock.patch.object(magehand, 'kubectl_json', lambda kind, *a: calls[kind]):
+            stage = magehand.dev_stage('elvis', {'digest': 'sha256:abc', 'image': 'x@sha256:' + 'a' * 64})
+        self.assertEqual(stage['state'], 'failed')
+        self.assertEqual(stage['stage'], 'dev')
+
+
 class PinnedLayout(unittest.TestCase):
     """homelab-apps holds only a pin for an app whose manifests are in its own repo."""
     PIN = {'repo': 'elvis', 'ref': 'a' * 40, 'image': 'ghcr.io/davidlarrimore/homelab-apps/elvis@sha256:' + 'b' * 64}
