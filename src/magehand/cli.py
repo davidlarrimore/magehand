@@ -750,6 +750,76 @@ def prod_stage(tag, ahead, prs):
             'tag': tag, 'ahead': ahead}
 
 
+STUCK_PODS = ('CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError',
+              'InvalidImageName', 'RunContainerError')
+
+
+def kubectl_json(*args):
+    """(parsed JSON, None) of a read-only `kubectl get ARGS -o json`, or (None, why): no kubectl, no context,
+    no access. The one call magehand makes to the cluster, and it only reads."""
+    if not shutil.which('kubectl'):
+        return None, 'kubectl is not installed'
+    try:
+        out = subprocess.run(['kubectl', 'get', *args, '-o', 'json', '--request-timeout=10s'],  # nosec B603 B607
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, 'kubectl did not answer'
+    if out.returncode != 0:
+        return None, out.stderr.strip().splitlines()[-1] if out.stderr.strip() else 'kubectl failed'
+    try:
+        return json.loads(out.stdout), None
+    except ValueError:
+        return None, 'kubectl returned something that is not JSON'
+
+
+def pod_stage(pods, application, image):
+    """What dev's pods run: `pods` and `application` are kubectl's JSON (application may be None), `image` the
+    deploy PR's pinned ref. ok when every live pod is ready on that digest (and Argo reports synced and
+    healthy), failed when a pod on the new image can't start, otherwise a rollout in progress."""
+    digest = image.rsplit('@', 1)[-1]
+    live = [p for p in (pods or {}).get('items') or []
+            if not (p.get('metadata') or {}).get('deletionTimestamp')
+            and (p.get('status') or {}).get('phase') not in ('Succeeded', 'Failed')]
+    if not live:
+        return {'stage': 'dev', 'state': 'pending', 'text': f'no pods yet for {digest[:19]}'}
+    ready = stuck = 0
+    for pod in live:
+        statuses = (pod.get('status') or {}).get('containerStatuses') or []
+        on_new = bool(statuses) and all(digest in (c.get('imageID') or '') for c in statuses)
+        if on_new and all(c.get('ready') for c in statuses):
+            ready += 1
+        for c in statuses:
+            reason = ((c.get('state') or {}).get('waiting') or {}).get('reason')
+            if reason in STUCK_PODS and (not c.get('imageID') or digest in c['imageID']):
+                stuck += 1
+                why = f'{pod["metadata"]["name"]}: {reason}'
+    if stuck:
+        return {'stage': 'dev', 'state': 'failed',
+                'text': f'{why}; `kubectl logs` and `kubectl describe pod` in the app\'s dev namespace say why'}
+    argo = ((application or {}).get('status') or {})
+    sync, health = (argo.get('sync') or {}).get('status'), (argo.get('health') or {}).get('status')
+    if ready == len(live) and (application is None or (sync, health) == ('Synced', 'Healthy')):
+        note = f', Argo {sync}/{health}'.lower() if application else ''
+        return {'stage': 'dev', 'state': 'ok',
+                'text': f'running {digest[:19]} ({ready}/{len(live)} pods ready{note})'}
+    return {'stage': 'dev', 'state': 'pending',
+            'text': f'rolling out {digest[:19]}: {ready}/{len(live)} pods ready on it'
+                    + (f', Argo {sync}/{health}' if application else '')}
+
+
+def dev_stage(name, deploy, cluster=True):
+    """The running pods for a merged dev deploy, or an unknown stage saying why they weren't read."""
+    unknown = lambda why: {'stage': 'dev', 'state': 'unknown',  # noqa: E731
+                           'text': f'config deployed ({deploy["digest"]}); the running pod is not checked ({why})'}
+    if not cluster:
+        return unknown('--no-cluster')
+    pods, err = kubectl_json('pods', '-n', f'{name}-dev')
+    if err:
+        return unknown(err)
+    application, _ = kubectl_json('application.argoproj.io', f'{name}-dev', '-n', 'argocd')
+    return pod_stage(pods, application, deploy['image'])
+
+
 def build_runs(repo, head):
     """(workflow_runs, error) for main's commit and, when the PR that merged it has main's exact tree, for
     that PR's head too (the image of a squash merge is the PR's build)."""
@@ -777,7 +847,7 @@ def build_runs(repo, head):
     return runs, None
 
 
-def collect_status(repo, name):
+def collect_status(repo, name, cluster=True):
     """The stages for the app `name` whose code is `repo` (OWNER/NAME); a failed query is a stage in state
     'error' naming what could not be read."""
     commit, err = gh_query('api', f'repos/{repo}/commits/main')
@@ -807,9 +877,7 @@ def collect_status(repo, name):
                 else prod_stage(tag, ahead, prod_prs))
     stages = [build, deploy, prod]
     if deploy['state'] == 'ok':
-        stages.insert(2, {'stage': 'dev', 'state': 'unknown',
-                          'text': f'config for {head[:7]} deployed ({deploy["digest"]}); the running pod is not '
-                                  'checked here (the app is behind sign-in)'})
+        stages.insert(2, dev_stage(name, deploy, cluster))
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
 
@@ -830,10 +898,12 @@ def cmd_status(a):
     deadline = time.monotonic() + a.timeout * 60
     last = None
     while True:
-        report = collect_status(repo, app['name'])
-        states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy')]
+        report = collect_status(repo, app['name'], cluster=not a.no_cluster)
+        # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
+        states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev')]
         failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages'])
-        done = states == ['ok', 'ok']
+        done = all(st == 'ok' for st in states if st != 'unknown') and len(
+            [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2
         if not a.watch or failed or done:
             break
         if time.monotonic() > deadline:
@@ -2568,14 +2638,18 @@ def build_parser():
     app_option(p)
     json_option(p)
     p = command('status', cmd_status, 'where a merge to main has got to: build, dev, prod', "show an app's build, dev deploy and prod release for its latest main commit",
-                'Reads GitHub only (through gh). The dev line says the deploy PR for the commit merged; it does\n'
-                'not look at the running pod. A skipped image job is normal: the PR build\'s image is reused.\n'
-                '--watch waits until dev has the newest main commit; exit 1 on a failed stage or a timeout.\n\n'
+                'Reads GitHub through gh and, when kubectl has a context, the dev pods and Argo application (read-only\n'
+                '`kubectl get`; --no-cluster skips it). The dev line says whether the pods run the image the deploy\n'
+                'PR pinned; without kubectl it only says the deploy merged.\n'
+                '--watch waits until build, the dev deploy and (when readable) the pods are done; exit 1 on a\n'
+                'failed stage or a timeout.\n\n'
                 'examples:\n  magehand status\n  magehand status elvis --json\n'
                 '  magehand status --watch            wait for the merge to reach dev')
     app_option(p)
     p.add_argument('--watch', action='store_true', help='wait for build and the dev deploy to finish')
     p.add_argument('--timeout', type=int, default=20, metavar='MIN', help='with --watch: give up after MIN (default: 20)')
+    p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
+                   help="don't read the dev pods with kubectl (GitHub only)")
     p.add_argument('--interval', type=int, default=15, metavar='SEC', help=argparse.SUPPRESS)
     json_option(p)
     p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
