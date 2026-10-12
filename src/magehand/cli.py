@@ -1651,44 +1651,6 @@ def clone_repo(repo, dest):
     return 'failed'
 
 
-def argocd_installation():
-    """The installation id of the read-only GitHub App Argo CD reads app repos through (MAGEHAND_ARGOCD_INSTALLATION,
-    else `argocd_installation` in config.json), or None. Not built in: it is the owner's account's, found on
-    the installation's page (https://github.com/settings/installations/<id>)."""
-    value = os.environ.get('MAGEHAND_ARGOCD_INSTALLATION')
-    if not value:
-        try:
-            value = json.loads(CONFIG.read_text()).get('argocd_installation')
-        except (OSError, ValueError, AttributeError):
-            value = None
-    value = str(value or '').strip()
-    return value if value.isdigit() else None
-
-
-def ensure_argocd_access(repo):
-    """Add `repo` to the GitHub App installation Argo CD reads app repos through, as the owner: 'added', 'failed'
-    (not accepted: why is on stderr), or 'manual' when the installation id is not configured. Idempotent."""
-    installation = argocd_installation()
-    if not installation:
-        return 'manual'
-    code, out, _ = gh_cli('api', f'repos/{repo}', '--jq', '.id')
-    repo_id = out.strip()
-    if code != 0 or not repo_id.isdigit():
-        return 'failed'
-    code, _, err = gh_cli('api', '-X', 'PUT', f'user/installations/{installation}/repositories/{repo_id}')
-    if code != 0:
-        print(f'{repo}: could not add it to the Argo CD GitHub App installation: {err or "gh api failed"}',
-              file=sys.stderr)
-        if '403' in (err or '') or 'permission' in (err or '').lower():
-            # GitHub allows this call only with a classic personal access token (repo scope); the OAuth token
-            # of a browser `gh auth login` is refused (verified: 403 "You do not have permission to modify this app").
-            print('  GitHub accepts this only with a classic personal access token with the repo scope '
-                  '(`gh auth login --with-token`, or GH_TOKEN for this command), not the default `gh auth login`; '
-                  'otherwise add the repo on the installation page by hand', file=sys.stderr)
-        return 'failed'
-    return 'added'
-
-
 def cmd_new(a):
     name = a.name
     app = a.app_name or name
@@ -1747,9 +1709,6 @@ def cmd_new(a):
         print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
-    access = ensure_argocd_access(repo)
-    if access == 'added':
-        print(f'{repo}: added to the GitHub App installation Argo CD reads app repos through', file=sys.stderr)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
     cloned = None if a.no_clone else clone_repo(repo, dest)
     if cloned == 'cloned':
@@ -1760,15 +1719,15 @@ def cmd_new(a):
         print(f'{repo}: could not clone it; run `gh repo clone {repo} {shell_path(dest)}`', file=sys.stderr)
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
-                          'ruleset': ruleset, 'app_name': named, 'clone': cloned, 'argocd_access': access,
+                          'ruleset': ruleset, 'app_name': named, 'clone': cloned,
                           'dir': str(dest) if cloned in ('cloned', 'exists') else None}, indent=1))
     else:
-        print(new_summary(repo, name, app, dest, named, cloned, access))
+        print(new_summary(repo, name, app, dest, named, cloned))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
 
 
-def new_summary(repo, name, app, dest, named, cloned, access='added'):
+def new_summary(repo, name, app, dest, named, cloned):
     """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
     what the platform does by itself afterwards. Everything already done went to stderr as it happened."""
     live = name if named in ('failed', 'differs') else app
@@ -1779,11 +1738,6 @@ def new_summary(repo, name, app, dest, named, cloned, access='added'):
     if named in ('failed', 'differs'):
         steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
                      f'{name})')
-    if access != 'added':  # Argo CD reads deploy/ from the repo; a repo outside the installation fails to sync
-        steps.append(f'do:    add {repo} to the GitHub App installation Argo CD reads app repos through '
-                     '(GitHub > Settings > Applications > Configure > Repository access); until then its first '
-                     'sync fails with "repository not found". To have `new` do it, set MAGEHAND_ARGOCD_INSTALLATION '
-                     'to the installation id (the number in that page\'s URL)')
     steps += ['write: the code, and deploy/ (app.yaml and base/)   guide: magehand guide search new app',
               'run:   magehand check          # the platform\'s rules, before you push',
               'do:    open a PR and merge it  # the platform deploys what is on main']

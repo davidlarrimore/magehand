@@ -1578,60 +1578,7 @@ class CommandLine(unittest.TestCase):
 
 
 class ArgoAccess(unittest.TestCase):
-    """new adds the repo to the Argo CD GitHub App installation; status says when Argo cannot read it."""
-
-    def setUp(self):
-        self.saved = magehand.gh_cli
-        self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
-        self.calls = []
-
-    def gh(self, id_out='42\n', put=(0, '', '')):
-        def run(*args, **kw):
-            self.calls.append(args)
-            if args == ('api', 'repos/davidlarrimore/elvis', '--jq', '.id'):
-                return 0, id_out, ''
-            if args[:3] == ('api', '-X', 'PUT'):
-                return put
-            return 0, '', ''
-        magehand.gh_cli = run
-
-    def test_not_configured_is_manual_and_calls_nothing(self):
-        self.gh()
-        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(magehand, 'CONFIG', pathlib.Path('/nonexistent/c.json')):
-            os.environ.pop('MAGEHAND_ARGOCD_INSTALLATION', None)
-            self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'manual')
-        self.assertEqual(self.calls, [])
-
-    def test_configured_adds_the_repo_by_id_through_the_installation(self):
-        self.gh()
-        with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': '12345'}):
-            self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'added')
-        self.assertIn(('api', '-X', 'PUT', 'user/installations/12345/repositories/42'), self.calls)
-
-    def test_a_refusal_is_failed_and_says_why(self):
-        import contextlib
-        import io
-        self.gh(put=(1, '', 'You do not have permission to modify this app on davidlarrimore. (HTTP 403)'))
-        err = io.StringIO()
-        with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': '12345'}), contextlib.redirect_stderr(err):
-            self.assertEqual(magehand.ensure_argocd_access('davidlarrimore/elvis'), 'failed')
-        self.assertIn('do not have permission', err.getvalue())
-        self.assertIn('classic personal access token', err.getvalue())  # says why, and what would work
-
-    def test_a_bad_installation_value_is_ignored(self):
-        self.gh()
-        with mock.patch.dict(os.environ, {'MAGEHAND_ARGOCD_INSTALLATION': 'not-a-number; rm -rf'}), \
-                mock.patch.object(magehand, 'CONFIG', pathlib.Path('/nonexistent/c.json')):
-            self.assertIsNone(magehand.argocd_installation())
-        self.assertEqual(self.calls, [])
-
-    def test_the_summary_has_a_step_unless_it_was_added(self):
-        done = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path('elvis'), None, 'cloned', 'added')
-        self.assertNotIn('GitHub App installation', done)
-        for access in ('manual', 'failed'):
-            text = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path('elvis'), None, 'cloned', access)
-            self.assertIn('add davidlarrimore/elvis to the GitHub App installation', text)
-            self.assertIn('MAGEHAND_ARGOCD_INSTALLATION', text)
+    """status says when Argo cannot read the app's repo."""
 
     APP = {'spec': {'sources': [{'repoURL': 'https://github.com/davidlarrimore/elvis.git'},
                                 {'repoURL': 'git@github.com:davidlarrimore/homelab.git'}]}}
