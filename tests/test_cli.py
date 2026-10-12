@@ -1576,6 +1576,58 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+class TokenStorage(unittest.TestCase):
+    """The OpenBao token is never an argument, and the file fallback is private to its owner."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patch = mock.patch.object(magehand, 'STATE', pathlib.Path(self.tmp.name) / 'state')
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_keychain_gets_the_token_on_stdin_not_argv(self):
+        with mock.patch.object(magehand.sys, 'platform', 'darwin'), \
+                mock.patch.object(magehand.subprocess, 'run') as run:
+            magehand.store_token('hvs.example-token_1', {'email': 'dev@example.com'})
+        argv = run.call_args[0][0]
+        self.assertEqual(argv, ['security', '-i'])
+        self.assertFalse(any('hvs.' in a for a in argv))
+        self.assertIn('-w hvs.example-token_1', run.call_args[1]['input'])
+
+    def test_a_token_that_could_break_out_of_the_command_is_refused(self):
+        import contextlib
+        import io
+        with mock.patch.object(magehand.sys, 'platform', 'darwin'), \
+                mock.patch.object(magehand.subprocess, 'run') as run, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            magehand.store_token('abc\nadd-generic-password -s x', {})
+        run.assert_not_called()
+
+    def test_file_fallback_is_owner_only_even_over_a_wider_file(self):
+        magehand.STATE.mkdir(parents=True)
+        path = magehand.STATE / 'openbao-token'
+        path.write_text('old')
+        path.chmod(0o644)
+        with mock.patch.object(magehand.sys, 'platform', 'linux'):
+            magehand.store_token('hvs.new', {})
+            self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600')
+            self.assertEqual(path.read_text(), 'hvs.new')
+            self.assertEqual(oct(magehand.STATE.stat().st_mode & 0o777), '0o700')
+            self.assertEqual(magehand.saved_token(), 'hvs.new')
+
+    def test_env_token_still_works_with_one_deprecation_note(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {'MAGEHAND_BAO_TOKEN': 'from-env'}), \
+                mock.patch.object(magehand, '_warned_env', []), contextlib.redirect_stderr(err):
+            self.assertEqual(magehand.saved_token(), 'from-env')
+            self.assertEqual(magehand.saved_token(), 'from-env')
+        self.assertEqual(err.getvalue().count('deprecated'), 1)
+        self.assertNotIn('from-env', err.getvalue())
+
+
 class SignIn(unittest.TestCase):
     """Time left on the session: shown, warned about, and renewed in place in a terminal."""
 
