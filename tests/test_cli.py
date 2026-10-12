@@ -3,6 +3,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import socket
 import sys
 import tempfile
@@ -1629,32 +1630,50 @@ class Release(unittest.TestCase):
         self.assertIn('[#8](https://github.com/davidlarrimore/app/pull/8)', notes)
         self.assertIn('compare/v1.0.0...v1.1.0', notes)
 
-    def fake_gh(self, calls=None, **overrides):
-        """gh_query/gh_probe/collect_status for plan_release over one app with two commits since v1.0.0."""
+    APP = 'repos/davidlarrimore/app/'
+    HEAD = 'a' * 40
+
+    def fake_gh(self, **overrides):
+        """gh_query/gh_probe/collect_status for plan_release over one app, two merged PRs (#8, #9) since v1.0.0.
+        Commits are c8 and c9; a commit's PRs, a PR's reviews and the checks default to a green, approved state."""
+        app, head = self.APP, self.HEAD
+        approved = lambda n: [{'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': f'h{n}'}]  # noqa: E731
         data = {
-            'repos/davidlarrimore/app/commits/main': {'sha': 'a' * 40, 'commit': {'message': 'x'}},
+            app + 'commits/main': {'sha': head, 'commit': {'message': 'x'}},
             'user': {'login': magehand.OWNER},
-            'repos/davidlarrimore/app/releases?per_page=20': [
+            app + 'releases?per_page=20': [
                 {'tag_name': 'v1.0.0', 'draft': False, 'prerelease': False, 'author': {'login': magehand.OWNER}}],
-            'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': {'ahead_by': 2, 'commits': [
-                {'commit': {'message': 'feat: add export (#8)\n\nbody'}},
-                {'commit': {'message': 'fix: crash (#9)'}}]},
-            'repos/davidlarrimore/app/pulls/8': {'labels': []}, 'repos/davidlarrimore/app/pulls/9': {'labels': []},
-            'repos/davidlarrimore/app/git/ref/tags/v1.1.0': None,
-            'repos/davidlarrimore/app/commits/' + 'a' * 40 + '/check-runs?per_page=100': {'check_runs': [
-                {'name': 'scan', 'status': 'completed', 'conclusion': 'success'}]},
+            app + f'compare/v1.0.0...{head}?per_page=100&page=1': {'ahead_by': 2, 'commits': [
+                {'sha': 'c8', 'commit': {'message': 'feat: add export (#8)\n\nbody'}},
+                {'sha': 'c9', 'commit': {'message': 'fix: crash (#9)'}}]},
+            app + 'git/ref/tags/v1.1.0': None,
+            app + f'commits/{head}/check-runs?per_page=100&page=1': {'total_count': 2, 'check_runs': [
+                {'name': 'security / scan', 'status': 'completed', 'conclusion': 'success'},
+                {'name': 'image', 'status': 'completed', 'conclusion': 'skipped'}]},
+            app + f'actions/runs?head_sha={head}&per_page=100': {'workflow_runs': [
+                {'path': magehand.BUILD_WORKFLOW, 'event': 'push', 'status': 'completed', 'conclusion': 'success'}]},
         }
         data.update(overrides)
 
         def query(*args):
-            value = data.get(args[1])
+            path = args[1]
+            value = data.get(path)
+            m = re.match(app + r'pulls/(\d+)(/reviews\?per_page=100&page=1)?$', path)
+            if path not in data and m:
+                n = m.group(1)
+                value = approved(n) if m.group(2) else {'labels': [], 'head': {'sha': f'h{n}'}}
+            m = re.match(app + r'commits/c(\d+)/pulls$', path)
+            if path not in data and m:  # GitHub's own commit-to-PR association
+                value = [{'number': int(m.group(1)), 'merged_at': 'x', 'base': {'ref': 'main'}}]
             return (None, 'HTTP 404') if value is None else (value, None)
+
+        files = {'homelab/contents/platform/prod-apps/apps.yaml': 'lab:\n  exposure: internal\n',
+                 'app/contents/deploy/prod': '[]', 'app/contents/deploy/app.yaml': 'services: {}\n'}
+        files.update(overrides.get('files', {}))
 
         def probe(*args):
             path = args[1].split('?')[0].replace('repos/', '', 1).replace('davidlarrimore/', '')
-            files = {'homelab/contents/platform/prod-apps/apps/lab.yaml': 'exposure: internal\n',
-                     'app/contents/deploy/prod': '[]', 'app/contents/deploy/app.yaml': 'services: {}\n'}
-            content = overrides.get('files', files).get(path)
+            content = files.get(path)
             if content is None:
                 return 1, '', 'HTTP 404: Not Found'
             if content.startswith('['):
@@ -1666,34 +1685,23 @@ class Release(unittest.TestCase):
         return mock.patch.multiple(magehand, gh_query=query, gh_probe=probe,
                                    collect_status=lambda *a, **k: {'stages': overrides.get('stages', stages)})
 
+    def plan(self, **overrides):
+        with self.fake_gh(**overrides):
+            return magehand.plan_release('davidlarrimore/app', 'lab')
+
     def test_plan_picks_minor_and_has_no_problems_when_everything_is_ready(self):
-        with self.fake_gh():
-            plan = magehand.plan_release('davidlarrimore/app', 'lab')
+        plan = self.plan()
         self.assertEqual((plan['version'], plan['bump'], plan['problems']), ('v1.1.0', 'minor', []))
         self.assertIn('feat: add export', plan['notes'])
 
-    def test_plan_refuses_what_would_not_deploy(self):
-        failing = {'check_runs': [{'name': 'scan', 'status': 'completed', 'conclusion': 'failure'},
-                                  {'name': 'build', 'status': 'in_progress', 'conclusion': None}]}
-        stages = [{'stage': 'build', 'state': 'pending', 'text': 'building'},
-                  {'stage': 'deploy', 'state': 'pending', 'text': 'no deploy PR'},
-                  {'stage': 'dev', 'state': 'pending', 'text': 'rolling out'}]
-        with self.fake_gh(stages=stages, **{'repos/davidlarrimore/app/commits/' + 'a' * 40 + '/check-runs?per_page=100': failing,
-                                            'user': {'login': 'someone-else'}, 'files': {}}):
-            problems = ' | '.join(magehand.plan_release('davidlarrimore/app', 'lab')['problems'])
-        for text in ('signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
-                     'failing checks: scan', 'still has checks running: build', 'build of', 'deploy of',
-                     'dev is not running'):
-            self.assertIn(text, problems)
-
     def test_plan_is_about_one_commit_even_if_main_moves(self):
         seen = []
-        moved = iter([{'sha': 'a' * 40, 'commit': {'message': 'x'}}, {'sha': 'b' * 40, 'commit': {'message': 'y'}}])
-        with self.fake_gh() as _:
+        moved = iter([{'sha': self.HEAD, 'commit': {'message': 'x'}}, {'sha': 'b' * 40, 'commit': {'message': 'y'}}])
+        with self.fake_gh():
             real = magehand.gh_query
 
             def query(*args):
-                if args[1] == 'repos/davidlarrimore/app/commits/main':
+                if args[1] == self.APP + 'commits/main':
                     return next(moved), None  # a second read of main would see B
                 return real(*args)
             with mock.patch.object(magehand, 'gh_query', query), mock.patch.object(
@@ -1702,41 +1710,153 @@ class Release(unittest.TestCase):
                         {'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''},
                         {'stage': 'dev', 'state': 'ok', 'text': ''}]}):
                 plan = magehand.plan_release('davidlarrimore/app', 'lab')
-        self.assertEqual((plan['commit'], seen), ('a' * 40, ['a' * 40]))
+        self.assertEqual((plan['commit'], seen), (self.HEAD, [self.HEAD]))
+
+    def test_plan_refuses_what_would_not_deploy(self):
+        failing = {'total_count': 2, 'check_runs': [{'name': 'scan', 'status': 'completed', 'conclusion': 'failure'},
+                                                    {'name': 'build', 'status': 'in_progress', 'conclusion': None}]}
+        stages = [{'stage': 'build', 'state': 'pending', 'text': 'building'},
+                  {'stage': 'deploy', 'state': 'pending', 'text': 'no deploy PR'},
+                  {'stage': 'dev', 'state': 'pending', 'text': 'rolling out'}]
+        plan = self.plan(stages=stages, files={'homelab/contents/platform/prod-apps/apps.yaml': 'other:\n  exposure: internal\n',
+                                               'app/contents/deploy/prod': None},
+                         **{self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1': failing,
+                            'user': {'login': 'someone-else'}})
+        problems = ' | '.join(plan['problems'])
+        for text in ('signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
+                     'failing checks: scan', 'still has checks running: build', 'build of', 'deploy of',
+                     'dev is not running'):
+            self.assertIn(text, problems)
+
+    def test_approval_is_read_from_the_register_or_the_old_per_app_file(self):
+        self.assertEqual(self.plan()['problems'], [])  # in the register
+        old = {'homelab/contents/platform/prod-apps/apps.yaml': None,
+               'homelab/contents/platform/prod-apps/apps/lab.yaml': 'exposure: internal\n'}
+        self.assertEqual(self.plan(files=old)['problems'], [])
+        self.assertTrue(any('not approved' in p for p in self.plan(files={
+            'homelab/contents/platform/prod-apps/apps.yaml': 'other: {exposure: internal}\n'})['problems']))
+
+    def test_review_verdict(self):
+        v = magehand.review_verdict
+        who = {magehand.OWNER, magehand.BOT}
+        ok = [{'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'h'}]
+        self.assertIsNone(v(5, 'h', ok, who))
+        self.assertIn('no approving review', v(5, 'h', [], who))
+        self.assertIn('no approving review', v(5, 'new', ok, who))  # approval of an older push
+        stranger = [{'user': {'login': 'someone'}, 'state': 'APPROVED', 'commit_id': 'h'}]
+        self.assertIn('no approving review', v(5, 'h', stranger, who))
+        asked = ok + [{'user': {'login': magehand.OWNER}, 'state': 'CHANGES_REQUESTED', 'commit_id': 'h'}]
+        self.assertIn('changes requested by ' + magehand.OWNER, v(5, 'h', asked, who))
+        # a later approval from the same reviewer replaces their change request
+        fixed = asked + [{'user': {'login': magehand.OWNER}, 'state': 'APPROVED', 'commit_id': 'h'}]
+        self.assertIsNone(v(5, 'h', fixed, who))
+
+    def test_the_prs_of_a_commit_come_from_github_not_its_message(self):
+        # a direct push that merely says (#8), and a PR that was closed or aimed at another branch
+        subject = 'unreviewed direct push (#8)'
+        compare = {'ahead_by': 3, 'commits': [
+            {'sha': 'd1', 'commit': {'message': subject}},
+            {'sha': 'd2', 'commit': {'message': 'Merge pull request #8 from x/y'}},
+            {'sha': 'd3', 'commit': {'message': 'work (#8)'}}]}
+        plan = self.plan(**{
+            self.APP + f'compare/v1.0.0...{self.HEAD}?per_page=100&page=1': compare,
+            self.APP + 'commits/d1/pulls': [],
+            self.APP + 'commits/d2/pulls': [{'number': 8, 'merged_at': None, 'base': {'ref': 'main'}}],
+            self.APP + 'commits/d3/pulls': [{'number': 8, 'merged_at': 'x', 'base': {'ref': 'staging'}}]})
+        straight = [p for p in plan['problems'] if 'pushed straight to main' in p]
+        self.assertEqual(len(straight), 3)
+        self.assertIn('unreviewed direct push (#8)', straight[0])
+
+    def test_reviews_are_read_across_pages(self):
+        key = self.APP + 'pulls/8/reviews?per_page=100&page='
+        ok = {'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'h8'}
+        filler = [{'user': {'login': f'u{i}'}, 'state': 'COMMENTED', 'commit_id': 'h8'} for i in range(99)]
+        # approval first, a change request on page 2: refused
+        asked = {'user': {'login': magehand.OWNER}, 'state': 'CHANGES_REQUESTED', 'commit_id': 'h8'}
+        plan = self.plan(**{key + '1': [ok] + filler, key + '2': [asked]})
+        self.assertTrue(any('changes requested' in p for p in plan['problems']))
+        # the approval only on page 2: accepted
+        plan = self.plan(**{key + '1': filler + [filler[0]], key + '2': [ok]})
+        self.assertEqual(plan['problems'], [])
+        # a page that can't be read refuses
+        plan = self.plan(**{key + '1': [ok] + filler, key + '2': None})
+        self.assertTrue(any('could not read the reviews of PR #8' in p for p in plan['problems']))
+
+    def first_release(self, commits, **extra):
+        """A repo with no release yet whose history (newest first) is `commits`, over two pages."""
+        return self.plan(**{self.APP + 'releases?per_page=20': [],
+                            self.APP + f'commits?sha={self.HEAD}&per_page=100&page=1': commits[:100],
+                            self.APP + f'commits?sha={self.HEAD}&per_page=100&page=2': commits[100:],
+                            **extra})
+
+    def test_first_release_reads_the_whole_history_and_forgives_only_the_bootstrap(self):
+        def commit(i, pr=True):
+            return {'sha': f'c{i}' if pr else f'x{i}', 'commit': {'message': f'fix: n{i} (#{i})'}}
+        # the bootstrap: two direct commits older than the first PR (page 2): a warning, not a refusal
+        plan = self.first_release([commit(8), commit(9), commit(0, pr=False), commit(-1, pr=False)],
+                                  **{self.APP + 'commits/x0/pulls': [], self.APP + 'commits/x-1/pulls': []})
+        self.assertEqual([p for p in plan['problems'] if 'straight' in p], [])
+        self.assertTrue(any('before the first PR' in w for w in plan['warnings']))
+        # a direct push newer than a reviewed PR refuses, even on the second page
+        many = [commit(8), commit(9)] + [commit(9)] * 98 + [commit(0, pr=False), commit(8)]
+        plan = self.first_release(many, **{self.APP + 'commits/x0/pulls': []})
+        self.assertTrue(any('pushed straight to main' in p for p in plan['problems']))
+        # nothing was ever reviewed: nothing to forgive
+        plan = self.first_release([commit(0, pr=False)], **{self.APP + 'commits/x0/pulls': []})
+        self.assertTrue(any('pushed straight to main' in p for p in plan['problems']))
+
+    def test_main_needs_its_security_scan_to_have_run_and_passed(self):
+        runs = self.APP + f'actions/runs?head_sha={self.HEAD}&per_page=100'
+        checks = self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1'
+        self.assertTrue(any('no checks ran' in p for p in self.plan(**{checks: {'total_count': 0, 'check_runs': []}})['problems']))
+        self.assertTrue(any('did not run' in p for p in self.plan(**{runs: {'workflow_runs': []}})['problems']))
+        failed = {'workflow_runs': [{'path': magehand.BUILD_WORKFLOW, 'event': 'push', 'status': 'completed',
+                                     'conclusion': 'failure'}]}
+        self.assertTrue(any('has not passed' in p for p in self.plan(**{runs: failed})['problems']))
+        # skipped jobs (the image build is skipped on a push) are fine when the scan itself passed
+        self.assertEqual(self.plan()['problems'], [])
+
+    def test_an_incomplete_list_of_checks_refuses(self):
+        key = self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page='
+        ok = lambda n: {'name': f'c{n}', 'status': 'completed', 'conclusion': 'success'}  # noqa: E731
+        # 1,001 checks advertised, 1,000 readable in the ten pages
+        pages = {key + str(p): {'total_count': 1001, 'check_runs': [ok(p * 1000 + i) for i in range(100)]}
+                 for p in range(1, 11)}
+        problems = self.plan(**pages)['problems']
+        self.assertTrue(any('could only read 1000 of the 1001 checks' in p for p in problems))
+        # an empty page before the advertised total
+        problems = self.plan(**{key + '1': {'total_count': 150, 'check_runs': [ok(i) for i in range(100)]},
+                                key + '2': {'total_count': 150, 'check_runs': []}})['problems']
+        self.assertTrue(any('could only read 100 of the 150 checks' in p for p in problems))
+        # two full pages that add up: fine
+        both = {key + '1': {'total_count': 101, 'check_runs': [ok(i) for i in range(100)]},
+                key + '2': {'total_count': 101, 'check_runs': [ok(100)]}}
+        self.assertEqual(self.plan(**both)['problems'], [])
+
+    def test_plan_nothing_new_and_existing_tag(self):
+        key = self.APP + f'compare/v1.0.0...{self.HEAD}?per_page=100&page=1'
+        self.assertIn('nothing new on main since v1.0.0', self.plan(**{key: {'ahead_by': 0, 'commits': []}})['problems'])
+        self.assertTrue(any('already exists' in p
+                            for p in self.plan(**{self.APP + 'git/ref/tags/v1.1.0': {'ref': 'x'}})['problems']))
 
     def test_unreadable_specs_and_labels_refuse_instead_of_guessing(self):
-        base = 'repos/davidlarrimore/app/'
-        with self.fake_gh(files={'homelab/contents/platform/prod-apps/apps/lab.yaml': 'x: 1\n',
-                                 'app/contents/deploy/prod': '[]'}):  # app.yaml absent at head: required
-            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        problems = self.plan(files={'app/contents/deploy/app.yaml': None})['problems']  # absent on main: required
         self.assertTrue(any('deploy/app.yaml is missing' in p for p in problems))
-        with self.fake_gh(**{base + 'pulls/8': None}):  # label lookup fails (404 in the fake)
-            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
-        self.assertTrue(any('labels of PR #8' in p for p in problems))
-        with self.fake_gh(files={'homelab/contents/platform/prod-apps/apps/lab.yaml': 'x: 1\n',
-                                 'app/contents/deploy/prod': '[]', 'app/contents/deploy/app.yaml': 'a: [\n'}):
-            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        problems = self.plan(**{self.APP + 'pulls/8': None})['problems']
+        self.assertTrue(any('could not read PR #8' in p for p in problems))
+        problems = self.plan(files={'app/contents/deploy/app.yaml': 'a: [\n'})['problems']
         self.assertTrue(any('not valid YAML' in p for p in problems))
 
     def test_comparison_is_read_across_pages_and_refused_when_incomplete(self):
-        head = 'a' * 40
-        page = lambda n, items: {'ahead_by': 101, 'commits': items}  # noqa: E731
-        first = [{'commit': {'message': f'fix: n{i} (#{100 + i})'}} for i in range(100)]
-        second = [{'commit': {'message': 'feat!: drop the v1 route (#300)'}}]
-        key = f'repos/davidlarrimore/app/compare/v1.0.0...{head}?per_page=100&page='
-        with self.fake_gh(**{key + '1': page(1, first), key + '2': page(2, second)}):
-            plan = magehand.plan_release('davidlarrimore/app', 'lab')
+        page = lambda items: {'ahead_by': 101, 'commits': items}  # noqa: E731
+        first = [{'sha': 'c8', 'commit': {'message': f'fix: n{i} (#8)'}} for i in range(100)]
+        second = [{'sha': 'c9', 'commit': {'message': 'feat!: drop the v1 route (#9)'}}]
+        key = self.APP + f'compare/v1.0.0...{self.HEAD}?per_page=100&page='
+        plan = self.plan(**{key + '1': page(first), key + '2': page(second)})
         self.assertEqual((plan['bump'], plan['commits'], len(plan['changes'])), ('major', 101, 101))
         self.assertEqual([p for p in plan['problems'] if 'commits' in p], [])
-        with self.fake_gh(**{key + '1': page(1, first), key + '2': None}):  # page 2 unreadable
-            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        problems = self.plan(**{key + '1': page(first), key + '2': None})['problems']  # page 2 unreadable
         self.assertTrue(any('could not compare' in p for p in problems))
-
-    def test_plan_nothing_new_and_existing_tag(self):
-        with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': {'ahead_by': 0, 'commits': []}}):
-            self.assertIn('nothing new on main since v1.0.0', magehand.plan_release('davidlarrimore/app', 'lab')['problems'])
-        with self.fake_gh(**{'repos/davidlarrimore/app/git/ref/tags/v1.1.0': {'ref': 'refs/tags/v1.1.0'}}):
-            self.assertTrue(any('already exists' in p for p in magehand.plan_release('davidlarrimore/app', 'lab')['problems']))
 
     def test_unreadable_dev_pods_only_warn(self):
         stages = [{'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''},
@@ -1746,7 +1866,7 @@ class Release(unittest.TestCase):
         self.assertEqual(plan['problems'], [])
         self.assertEqual(len(plan['warnings']), 1)
 
-    def test_command_creates_only_on_yes_and_targets_the_checked_commit(self):
+    def test_command_creates_when_every_check_passes_and_targets_the_checked_commit(self):
         import contextlib
         import io
         created = []
@@ -1766,9 +1886,9 @@ class Release(unittest.TestCase):
             code, out = run('--dry-run')
             self.assertEqual((code, created), (0, []))
             self.assertIn('v1.0.0 -> v1.1.0', out)
-            code, _ = run()  # no terminal and no --yes: refuse
+            code, _ = run('--confirm')  # asked to confirm without a terminal: refuse, create nothing
             self.assertEqual((code == 0, created), (False, []))
-            code, out = run('--yes', '--patch', '--json')
+            code, out = run('--patch', '--json')  # passes every check: created, no prompt, no --yes
             self.assertEqual(code, 0)
         args, notes = created[0]
         self.assertEqual(args[:3], ('release', 'create', 'v1.0.1'))
