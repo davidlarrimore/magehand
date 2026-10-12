@@ -1636,7 +1636,7 @@ class Release(unittest.TestCase):
             'user': {'login': magehand.OWNER},
             'repos/davidlarrimore/app/releases?per_page=20': [
                 {'tag_name': 'v1.0.0', 'draft': False, 'prerelease': False, 'author': {'login': magehand.OWNER}}],
-            'repos/davidlarrimore/app/compare/v1.0.0...main': {'ahead_by': 2, 'commits': [
+            'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': {'ahead_by': 2, 'commits': [
                 {'commit': {'message': 'feat: add export (#8)\n\nbody'}},
                 {'commit': {'message': 'fix: crash (#9)'}}]},
             'repos/davidlarrimore/app/pulls/8': {'labels': []}, 'repos/davidlarrimore/app/pulls/9': {'labels': []},
@@ -1686,8 +1686,54 @@ class Release(unittest.TestCase):
                      'dev is not running'):
             self.assertIn(text, problems)
 
+    def test_plan_is_about_one_commit_even_if_main_moves(self):
+        seen = []
+        moved = iter([{'sha': 'a' * 40, 'commit': {'message': 'x'}}, {'sha': 'b' * 40, 'commit': {'message': 'y'}}])
+        with self.fake_gh() as _:
+            real = magehand.gh_query
+
+            def query(*args):
+                if args[1] == 'repos/davidlarrimore/app/commits/main':
+                    return next(moved), None  # a second read of main would see B
+                return real(*args)
+            with mock.patch.object(magehand, 'gh_query', query), mock.patch.object(
+                    magehand, 'collect_status',
+                    lambda repo, name, cluster=True, ref='main': seen.append(ref) or {'stages': [
+                        {'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''},
+                        {'stage': 'dev', 'state': 'ok', 'text': ''}]}):
+                plan = magehand.plan_release('davidlarrimore/app', 'lab')
+        self.assertEqual((plan['commit'], seen), ('a' * 40, ['a' * 40]))
+
+    def test_unreadable_specs_and_labels_refuse_instead_of_guessing(self):
+        base = 'repos/davidlarrimore/app/'
+        with self.fake_gh(files={'homelab/contents/platform/prod-apps/apps/lab.yaml': 'x: 1\n',
+                                 'app/contents/deploy/prod': '[]'}):  # app.yaml absent at head: required
+            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        self.assertTrue(any('deploy/app.yaml is missing' in p for p in problems))
+        with self.fake_gh(**{base + 'pulls/8': None}):  # label lookup fails (404 in the fake)
+            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        self.assertTrue(any('labels of PR #8' in p for p in problems))
+        with self.fake_gh(files={'homelab/contents/platform/prod-apps/apps/lab.yaml': 'x: 1\n',
+                                 'app/contents/deploy/prod': '[]', 'app/contents/deploy/app.yaml': 'a: [\n'}):
+            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        self.assertTrue(any('not valid YAML' in p for p in problems))
+
+    def test_comparison_is_read_across_pages_and_refused_when_incomplete(self):
+        head = 'a' * 40
+        page = lambda n, items: {'ahead_by': 101, 'commits': items}  # noqa: E731
+        first = [{'commit': {'message': f'fix: n{i} (#{100 + i})'}} for i in range(100)]
+        second = [{'commit': {'message': 'feat!: drop the v1 route (#300)'}}]
+        key = f'repos/davidlarrimore/app/compare/v1.0.0...{head}?per_page=100&page='
+        with self.fake_gh(**{key + '1': page(1, first), key + '2': page(2, second)}):
+            plan = magehand.plan_release('davidlarrimore/app', 'lab')
+        self.assertEqual((plan['bump'], plan['commits'], len(plan['changes'])), ('major', 101, 101))
+        self.assertEqual([p for p in plan['problems'] if 'commits' in p], [])
+        with self.fake_gh(**{key + '1': page(1, first), key + '2': None}):  # page 2 unreadable
+            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        self.assertTrue(any('could not compare' in p for p in problems))
+
     def test_plan_nothing_new_and_existing_tag(self):
-        with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...main': {'ahead_by': 0, 'commits': []}}):
+        with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': {'ahead_by': 0, 'commits': []}}):
             self.assertIn('nothing new on main since v1.0.0', magehand.plan_release('davidlarrimore/app', 'lab')['problems'])
         with self.fake_gh(**{'repos/davidlarrimore/app/git/ref/tags/v1.1.0': {'ref': 'refs/tags/v1.1.0'}}):
             self.assertTrue(any('already exists' in p for p in magehand.plan_release('davidlarrimore/app', 'lab')['problems']))

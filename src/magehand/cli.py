@@ -881,10 +881,10 @@ def build_runs(repo, head):
     return runs, None
 
 
-def collect_status(repo, name, cluster=True):
-    """The stages for the app `name` whose code is `repo` (OWNER/NAME); a failed query is a stage in state
-    'error' naming what could not be read."""
-    commit, err = gh_query('api', f'repos/{repo}/commits/main')
+def collect_status(repo, name, cluster=True, ref='main'):
+    """The stages for the app `name` whose code is `repo` (OWNER/NAME) at `ref` (main, or the one commit
+    `release` is about to tag); a failed query is a stage in state 'error' naming what could not be read."""
+    commit, err = gh_query('api', f'repos/{repo}/commits/{ref}')
     if err:
         die(f'cannot read {repo} through gh: {err} (is it yours, and are you signed in: `gh auth login`)')
     head = commit['sha']
@@ -1081,6 +1081,44 @@ def file_at(repo, path, ref):
         return None, 'gh returned something unreadable'
 
 
+def compare_commits(repo, base, head):
+    """(commits, ahead_by, None) of base...head across every page of GitHub's comparison (it returns at most
+    250 commits, and `ahead_by` is the whole count), or ([], 0, why) when a page can't be read or the
+    result is incomplete: a release must not be versioned from part of its changes."""
+    commits, ahead, page = [], 0, 1
+    while page <= 30:
+        found, err = gh_query('api', f'repos/{repo}/compare/{base}...{head}?per_page=100&page={page}')
+        if err:
+            return [], 0, f'could not compare {base} with main: {err}'
+        ahead = found.get('ahead_by') or 0
+        got = found.get('commits') or []
+        commits += got
+        if len(commits) >= ahead or len(got) < 100:
+            break
+        page += 1
+    if len(commits) < ahead:
+        return [], ahead, f'only {len(commits)} of the {ahead} commits since {base} could be read'
+    return commits, ahead, None
+
+
+def read_spec(repo, ref, problems, required):
+    """deploy/app.yaml at `ref`, parsed: {} when the file is absent and not required. A read or parse error
+    is a problem, never an empty spec (an empty one would invent removals or hide them)."""
+    text, err = file_at(repo, 'deploy/app.yaml', ref)
+    if err:
+        problems.append(f'could not read deploy/app.yaml at {ref[:12]}: {err}')
+        return {}
+    if text is None:
+        if required:
+            problems.append(f'deploy/app.yaml is missing on main (production needs deploy/app.yaml, base/ and prod/)')
+        return {}
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as error:
+        problems.append(f'deploy/app.yaml at {ref[:12]} is not valid YAML: {str(error).splitlines()[0]}')
+        return {}
+
+
 def plan_release(repo, name, forced=None, cluster=True):
     """Everything `release` decides, from reads only: {app, repo, commit, previous, version, bump, why,
     changes, notes, problems, warnings}. A problem is a reason the release would not deploy."""
@@ -1093,7 +1131,10 @@ def plan_release(repo, name, forced=None, cluster=True):
     if err or (who or {}).get('login') != OWNER:
         problems.append(f'gh is signed in as {(who or {}).get("login") or "nobody"}: only {OWNER}\'s release '
                         f'deploys production (`gh auth login`)')
-    if file_at(f'{OWNER}/homelab', f'platform/prod-apps/apps/{name}.yaml', 'main')[0] is None:
+    approved, err = file_at(f'{OWNER}/homelab', f'platform/prod-apps/apps/{name}.yaml', 'main')
+    if err:
+        problems.append(f'could not read the production approval of {name}: {err}')
+    elif approved is None:
         problems.append(f'{name} is not approved for production: homelab platform/prod-apps/apps/{name}.yaml '
                         f'is added by the owner (see the guide, "Going to production")')
     prod_dir, err = file_at(repo, 'deploy/prod', head)
@@ -1107,12 +1148,11 @@ def plan_release(repo, name, forced=None, cluster=True):
     previous = (last or {}).get('tag_name')
     changes, ahead, old_spec = [], 0, None
     if previous:
-        compare, err = gh_query('api', f'repos/{repo}/compare/{previous}...main')
+        commits, ahead, err = compare_commits(repo, previous, head)
         if err:
-            die(f'cannot compare {previous} with main: {err}')
-        ahead = compare.get('ahead_by') or 0
+            problems.append(err)
         looked = 0
-        for c in compare.get('commits') or []:
+        for c in commits:
             message = (c.get('commit') or {}).get('message') or ''
             subject, _, body = message.partition('\n')
             labels = []
@@ -1120,21 +1160,24 @@ def plan_release(repo, name, forced=None, cluster=True):
             if tail and looked < MAX_LABEL_LOOKUPS:
                 looked += 1
                 pr, err = gh_query('api', f'repos/{repo}/pulls/{tail.group(1)}')
-                labels = [l.get('name') for l in (pr or {}).get('labels') or []] if not err else []
+                if err:  # a missed `breaking` label would pick the wrong version
+                    problems.append(f'could not read the labels of PR #{tail.group(1)}: {err}')
+                else:
+                    labels = [l.get('name') for l in (pr or {}).get('labels') or []]
             changes.append(classify_change(subject, body, labels))
         if looked == MAX_LABEL_LOOKUPS:
             warnings.append(f'only the first {MAX_LABEL_LOOKUPS} PRs were checked for labels')
-        text, _ = file_at(repo, 'deploy/app.yaml', previous)
-        old_spec = yaml.safe_load(text) if text else None
+        old_spec = read_spec(repo, previous, problems, required=False)
     else:
-        compare, err = gh_query('api', f'repos/{repo}/commits?sha=main&per_page=50')
-        ahead = len(compare or [])
-        for c in compare or []:
+        found, err = gh_query('api', f'repos/{repo}/commits?sha={head}&per_page=100')
+        if err:
+            problems.append(f'could not read the commits of main: {err}')
+        ahead = len(found or [])
+        for c in found or []:
             message = (c.get('commit') or {}).get('message') or ''
             subject, _, body = message.partition('\n')
             changes.append(classify_change(subject, body))
-    text, _ = file_at(repo, 'deploy/app.yaml', head)
-    new_spec = yaml.safe_load(text) if text else None
+    new_spec = read_spec(repo, head, problems, required=True)
     removed, added = spec_changes(old_spec, new_spec) if previous else ([], [])
     bump, why = choose_bump(changes, removed, added, forced) if previous else ('major', 'major: the first release')
     version = next_version(previous, bump)
@@ -1154,7 +1197,7 @@ def plan_release(repo, name, forced=None, cluster=True):
             problems.append(f'main {head[:7]} has failing checks: {", ".join(bad)}')
         if busy:
             problems.append(f'main {head[:7]} still has checks running: {", ".join(busy)}')
-    stages = {st['stage']: st for st in collect_status(repo, name, cluster)['stages']}
+    stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head)['stages']}
     for stage in ('build', 'deploy'):
         if stages[stage]['state'] != 'ok':
             problems.append(f'{stage} of {head[:7]} is not done: {stages[stage]["text"]}')
