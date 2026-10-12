@@ -15,6 +15,7 @@ platform/openbao/policies/dev-read.hcl).
 """
 import argparse
 import base64
+import datetime
 import difflib
 import http.client
 import http.server
@@ -610,6 +611,248 @@ def cmd_app(a):
             print(f'  {entry[0]} <- Secret {entry[2]} (not a block; magehand run leaves it unset)')
         else:
             print(f'  {entry[0]} <- block {entry[1]} ({entry[2]}) key {entry[3]}')
+
+
+# --- status: where a merge to main has got to ---------------------------------------
+# Everything comes from GitHub through gh (read-only), following the platform's own rules (homelab
+# `homelab app deploy-dev` / `deploy-prod`): the image is the Build workflow's pull_request or
+# workflow_dispatch run for main's commit (or for the merged PR's head when it has main's exact tree: a
+# push to main only runs the security scan); dev's deploy PR is deploy-dev/<app> marked with the commit;
+# prod follows the owner's latest published vX.Y.Z release and its deploy-prod/<app> PR.
+
+BUILD_WORKFLOW = '.github/workflows/build.yaml'
+BUILD_EVENTS = ('pull_request', 'workflow_dispatch')
+RELEASE_TAG = re.compile(r'^v\d+(\.\d+){0,2}$')
+DEPLOY_MARK = re.compile(r'<!-- homelab deploy-dev (\w+) (\S+)')
+PROD_TITLE = re.compile(r': release (\S+) to production$')
+STATUS_MARK = {'ok': '✓', 'pending': '…', 'failed': '✗', 'unknown': '?', 'error': '!'}
+
+
+def gh_query(*args):
+    """(parsed JSON, None) of `gh ARGS`, or (None, why) when gh fails (no access, rate limit, offline): a failed
+    query is not an empty result."""
+    code, out, err = gh_probe(*args)
+    if code != 0:
+        return None, err or 'gh failed'
+    try:
+        return json.loads(out), None
+    except ValueError:
+        return None, 'gh returned something that is not JSON'
+
+
+def clock(stamp):
+    """HH:MMZ of an ISO-8601 UTC time from GitHub."""
+    return (stamp or '')[11:16] + 'Z'
+
+
+def seconds_between(start, end):
+    fmt = '%Y-%m-%dT%H:%M:%SZ'
+    try:
+        return int((datetime.datetime.strptime(end, fmt) - datetime.datetime.strptime(start, fmt)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def query_error(stage, what, why):
+    return {'stage': stage, 'state': 'error',
+            'text': f'could not read {what}: {why} (`gh auth status`; is this one of your repos?)'}
+
+
+def build_stage(runs, head):
+    """The image build of `head`, from the app repo's Build runs (API workflow_runs; those for main's commit
+    and for the merged PR's head with main's tree). Mirrors the controller: any success is built, else a
+    running one is building, else the newest failed one failed."""
+    builds = [r for r in runs if r.get('path') == BUILD_WORKFLOW and r.get('event') in BUILD_EVENTS]
+    newest = lambda rs: max(rs, key=lambda r: r.get('created_at') or '', default=None)  # noqa: E731
+    done = newest([r for r in builds if r.get('status') == 'completed' and r.get('conclusion') == 'success'])
+    if done:
+        took = seconds_between(done.get('run_started_at') or done.get('created_at'), done.get('updated_at'))
+        span = f' {took // 60}m{took % 60:02d}s' if took is not None else ''
+        why = ('built for the PR, reused: main has its exact tree' if done['event'] == 'pull_request'
+               else 'built by a dispatched build of main')
+        return {'stage': 'build', 'state': 'ok', 'text': f'image built{span} ({why})'}
+    running = newest([r for r in builds if r.get('status') != 'completed'])
+    if running:
+        return {'stage': 'build', 'state': 'pending', 'text': f'building: {running.get("html_url", "")}'}
+    failed = newest(builds)
+    if failed:
+        return {'stage': 'build', 'state': 'failed',
+                'text': f'the image build of {head[:7]} failed ({failed["event"]}): {failed.get("html_url", "")}'}
+    return {'stage': 'build', 'state': 'pending',
+            'text': f'no image build of {head[:7]} yet (the platform starts one when no PR build has main\'s tree)'}
+
+
+def failing_checks(rollup):
+    """Names of the failed entries of a PR's statusCheckRollup: CheckRuns (conclusion, name) and
+    StatusContexts (state, context) both appear in it."""
+    names = []
+    for c in rollup or []:
+        if c.get('conclusion') in ('FAILURE', 'CANCELLED', 'TIMED_OUT', 'STARTUP_FAILURE') \
+                or c.get('state') in ('FAILURE', 'ERROR'):
+            names.append(c.get('name') or c.get('context') or '?')
+    return names
+
+
+def deploy_marks(prs):
+    """[(pr, commit sha, image)] for the deploy PRs whose body carries the deploy-dev marker."""
+    out = []
+    for pr in prs or []:
+        m = DEPLOY_MARK.search(pr.get('body') or '')
+        if m:
+            out.append((pr, m.group(1), m.group(2)))
+    return out
+
+
+def deploy_stage(prs, head):
+    """Dev's deploy PR (newest first) for the commit `head`."""
+    for pr, sha, image in deploy_marks(prs):
+        if sha != head:
+            continue
+        ref = f'homelab-apps#{pr["number"]}'
+        digest = image.rsplit('@', 1)[-1][:19]
+        if pr.get('state') == 'MERGED':
+            return {'stage': 'deploy', 'state': 'ok', 'text': f'dev: {ref} merged {clock(pr.get("mergedAt"))}',
+                    'image': image, 'pr': pr['number'], 'digest': digest}
+        if pr.get('state') == 'CLOSED':
+            return {'stage': 'deploy', 'state': 'failed', 'text': f'dev: {ref} was closed without merging'}
+        bad = failing_checks(pr.get('statusCheckRollup'))
+        if bad:
+            return {'stage': 'deploy', 'state': 'failed', 'text': f'dev: {ref} has failing checks: {", ".join(bad)}'}
+        return {'stage': 'deploy', 'state': 'pending', 'text': f'dev: {ref} open, it merges itself once its checks pass'}
+    return {'stage': 'deploy', 'state': 'pending',
+            'text': f'dev: no deploy PR for {head[:7]} yet (opened after the build, within a few minutes)'}
+
+
+def eligible_release(releases):
+    """The owner's newest published release vX.Y.Z (drafts, prereleases, other tags and other authors'
+    releases never deploy production), or None. `releases` is GitHub's list, newest first."""
+    for r in releases or []:
+        if r.get('draft') or r.get('prerelease') or not RELEASE_TAG.match(r.get('tag_name') or ''):
+            continue
+        if (r.get('author') or {}).get('login') == OWNER:
+            return r
+    return None
+
+
+def prod_stage(tag, ahead, prs):
+    """Prod: the latest eligible release, whether its deploy PR merged, and the commits on main since."""
+    if not tag:
+        return {'stage': 'prod', 'state': 'unknown',
+                'text': "no release yet (the owner's GitHub Release vX.Y.Z deploys to prod)"}
+    since = f'  ({ahead} commit{"" if ahead == 1 else "s"} on main since {tag})' if ahead else ''
+    mine = [p for p in prs or [] if (PROD_TITLE.search(p.get('title') or '') or [None, None])[1] == tag]
+    if mine and mine[0].get('state') == 'MERGED':
+        return {'stage': 'prod', 'state': 'ok', 'text': f'{tag} deployed{since}', 'tag': tag, 'ahead': ahead}
+    if mine and mine[0].get('state') == 'OPEN':
+        return {'stage': 'prod', 'state': 'pending', 'text': f'{tag}: homelab-apps#{mine[0]["number"]} is open{since}',
+                'tag': tag, 'ahead': ahead}
+    return {'stage': 'prod', 'state': 'unknown', 'text': f'{tag} released; its deploy PR was not found{since}',
+            'tag': tag, 'ahead': ahead}
+
+
+def build_runs(repo, head):
+    """(workflow_runs, error) for main's commit and, when the PR that merged it has main's exact tree, for
+    that PR's head too (the image of a squash merge is the PR's build)."""
+    commit, err = gh_query('api', f'repos/{repo}/commits/{head}')
+    if err:
+        return None, err
+    shas = [head]
+    pulls, err = gh_query('api', f'repos/{repo}/commits/{head}/pulls')
+    if err:
+        return None, err
+    merged = next((p for p in pulls if p.get('merge_commit_sha') == head), None)
+    if merged:
+        pr_head = merged['head']['sha']
+        tip, err = gh_query('api', f'repos/{repo}/commits/{pr_head}')
+        if err:
+            return None, err
+        if tip['commit']['tree']['sha'] == commit['commit']['tree']['sha']:
+            shas.append(pr_head)
+    runs = []
+    for sha in shas:
+        found, err = gh_query('api', f'repos/{repo}/actions/runs?head_sha={sha}&per_page=50')
+        if err:
+            return None, err
+        runs += found.get('workflow_runs', [])
+    return runs, None
+
+
+def collect_status(repo, name):
+    """The stages for the app `name` whose code is `repo` (OWNER/NAME); a failed query is a stage in state
+    'error' naming what could not be read."""
+    commit, err = gh_query('api', f'repos/{repo}/commits/main')
+    if err:
+        die(f'cannot read {repo} through gh: {err} (is it yours, and are you signed in: `gh auth login`)')
+    head = commit['sha']
+    subject = commit['commit']['message'].splitlines()[0]
+    runs, err = build_runs(repo, head)
+    build = query_error('build', f"{repo}'s Build runs", err) if err else build_stage(runs, head)
+    pr_fields = 'number,state,mergedAt,title,body,statusCheckRollup'
+    dev, err = gh_query('pr', 'list', '-R', APPS_REPO, '--head', f'deploy-dev/{name}', '--state', 'all',
+                        '--limit', '10', '--json', pr_fields)
+    deploy = query_error('deploy', f'{APPS_REPO} deploy PRs', err) if err else deploy_stage(dev, head)
+    prod_prs, err_prs = gh_query('pr', 'list', '-R', APPS_REPO, '--head', f'deploy-prod/{name}', '--state', 'all',
+                                 '--limit', '10', '--json', 'number,state,title')
+    releases, err = gh_query('api', f'repos/{repo}/releases?per_page=20')
+    if err or err_prs:
+        prod = query_error('prod', 'the releases or their deploy PRs', err or err_prs)
+    else:
+        release = eligible_release(releases)
+        tag, ahead = (release or {}).get('tag_name'), None
+        err = None
+        if tag:
+            compare, err = gh_query('api', f'repos/{repo}/compare/{tag}...main')
+            ahead = None if err else compare.get('ahead_by')
+        prod = (query_error('prod', f'the comparison of {tag} with main', err) if err
+                else prod_stage(tag, ahead, prod_prs))
+    stages = [build, deploy, prod]
+    if deploy['state'] == 'ok':
+        stages.insert(2, {'stage': 'dev', 'state': 'unknown',
+                          'text': f'config for {head[:7]} deployed ({deploy["digest"]}); the running pod is not '
+                                  'checked here (the app is behind sign-in)'})
+    return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
+
+
+def render_status(report):
+    lines = [f'{report["app"]}  ({report["repo"]} main {report["commit"][:7]}: {report["subject"]})']
+    for st in report['stages']:
+        lines.append(f'  {st["stage"]:<7}{STATUS_MARK[st["state"]]} {st["text"]}')
+    return '\n'.join(lines)
+
+
+def cmd_status(a):
+    app = app_here(a.app_flag or a.app)
+    spec = app['spec'].get('source') or {}
+    source = spec.get('repo') or (remote_repo(app['root']) if app['root'] else None)
+    if not source:
+        die(f'{app["name"]} has no code repo (its image is built in homelab-apps), so there is no main to follow')
+    repo = f'{OWNER}/{source}'
+    deadline = time.monotonic() + a.timeout * 60
+    last = None
+    while True:
+        report = collect_status(repo, app['name'])
+        states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy')]
+        failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages'])
+        done = states == ['ok', 'ok']
+        if not a.watch or failed or done:
+            break
+        if time.monotonic() > deadline:
+            report['timeout'] = True
+            break
+        text = render_status(report)
+        if text != last:
+            print(text, file=sys.stderr)
+            last = text
+        time.sleep(a.interval)
+    report['ok'] = done and not failed  # build and the dev deploy both finished for the newest commit
+    if a.json:
+        print(json.dumps(report, indent=1))
+    else:
+        print(render_status(report))
+        if report.get('timeout'):
+            print(f'magehand: still not deployed to dev after {a.timeout} min; run it again to keep waiting',
+                  file=sys.stderr)
+    sys.exit(1 if failed or report.get('timeout') else 0)
 
 
 # --- new: start an app's repo --------------------------------------------------------
@@ -2235,7 +2478,7 @@ class Parser(argparse.ArgumentParser):
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new',)),
-          ('learn the platform and check an app', ('guide', 'app', 'check', 'update-agents')),
+          ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'update-agents')),
           ('run an app locally', ('run', 'dev', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
@@ -2323,6 +2566,17 @@ def build_parser():
                 'examples:\n  magehand app                   in an app repo\n  magehand app scavenger-hunt\n'
                 '  magehand app --json')
     app_option(p)
+    json_option(p)
+    p = command('status', cmd_status, 'where a merge to main has got to: build, dev, prod', "show an app's build, dev deploy and prod release for its latest main commit",
+                'Reads GitHub only (through gh). The dev line says the deploy PR for the commit merged; it does\n'
+                'not look at the running pod. A skipped image job is normal: the PR build\'s image is reused.\n'
+                '--watch waits until dev has the newest main commit; exit 1 on a failed stage or a timeout.\n\n'
+                'examples:\n  magehand status\n  magehand status elvis --json\n'
+                '  magehand status --watch            wait for the merge to reach dev')
+    app_option(p)
+    p.add_argument('--watch', action='store_true', help='wait for build and the dev deploy to finish')
+    p.add_argument('--timeout', type=int, default=20, metavar='MIN', help='with --watch: give up after MIN (default: 20)')
+    p.add_argument('--interval', type=int, default=15, metavar='SEC', help=argparse.SUPPRESS)
     json_option(p)
     p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
                 'Run it before every push; CI runs the same check. Each finding names the guide section\n'

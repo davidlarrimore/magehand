@@ -1722,3 +1722,192 @@ class SignIn(unittest.TestCase):
         self.assertNotIn('secret-token', out + err)
         self.assertEqual(stored, ['secret-token'])
         self.assertIn('Sign in through authentik', err)
+
+
+class Status(unittest.TestCase):
+    """status reads GitHub only: stages from a Build run, the deploy-dev PR and the latest release."""
+
+    HEAD = 'd8b34766a6182b44b83fe9c7faeaee37b3746ba2'
+    run_main = CommandLine.run_main
+    IMAGE = 'ghcr.io/example/app@sha256:' + 'a' * 64
+
+    def pr(self, number, state, sha=None, checks=(), merged='2026-10-11T02:31:58Z', title='deploy'):
+        body = f'x\n<!-- homelab deploy-dev {sha or self.HEAD} {self.IMAGE} -->'
+        return {'number': number, 'state': state, 'mergedAt': merged if state == 'MERGED' else None,
+                'title': title, 'body': body, 'statusCheckRollup': [{'name': n, 'conclusion': c} for n, c in checks]}
+
+    def build_run(self, event='pull_request', status='completed', conclusion='success', created='2026-10-11T02:29:36Z',
+            path=magehand.BUILD_WORKFLOW):
+        return {'path': path, 'event': event, 'status': status, 'conclusion': conclusion, 'created_at': created,
+                'run_started_at': created, 'updated_at': '2026-10-11T02:30:53Z', 'html_url': 'https://example.com/r'}
+
+    def test_build_stage(self):
+        built = magehand.build_stage([self.build_run()], self.HEAD)
+        self.assertEqual(built['state'], 'ok')
+        self.assertIn('1m17s', built['text'])
+        self.assertIn('reused', built['text'])  # a squash merge's image is the PR build's
+        self.assertEqual(magehand.build_stage([], self.HEAD)['state'], 'pending')
+        self.assertEqual(magehand.build_stage([self.build_run(status='in_progress', conclusion=None)],
+                                              self.HEAD)['state'], 'pending')
+        self.assertEqual(magehand.build_stage([self.build_run(conclusion='failure')], self.HEAD)['state'], 'failed')
+
+    def test_a_push_run_is_not_the_image_build(self):
+        # push to main only runs the security scan: its success says nothing about the image...
+        self.assertEqual(magehand.build_stage([self.build_run(event='push')], self.HEAD)['state'], 'pending')
+        # ...and a failed dispatched build is reported even beside a successful push run
+        runs = [self.build_run(event='push'), self.build_run(event='workflow_dispatch', conclusion='failure')]
+        stage = magehand.build_stage(runs, self.HEAD)
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('workflow_dispatch', stage['text'])
+        # another workflow's run is ignored
+        other = self.build_run(path='.github/workflows/other.yaml')
+        self.assertEqual(magehand.build_stage([other], self.HEAD)['state'], 'pending')
+
+    def test_deploy_stage(self):
+        merged = magehand.deploy_stage([self.pr(122, 'MERGED')], self.HEAD)
+        self.assertEqual((merged['state'], merged['pr']), ('ok', 122))
+        self.assertIn('homelab-apps#122 merged 02:31Z', merged['text'])
+        old = self.pr(119, 'MERGED', sha='1' * 40)
+        self.assertEqual(magehand.deploy_stage([old], self.HEAD)['state'], 'pending')  # not for this commit yet
+        open_pr = self.pr(122, 'OPEN', checks=[('scan', 'SUCCESS')])
+        self.assertEqual(magehand.deploy_stage([open_pr], self.HEAD)['state'], 'pending')
+        bad = self.pr(122, 'OPEN', checks=[('validate', 'FAILURE')])
+        stage = magehand.deploy_stage([bad], self.HEAD)
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('validate', stage['text'])
+        self.assertEqual(magehand.deploy_stage([self.pr(122, 'CLOSED')], self.HEAD)['state'], 'failed')
+
+    def test_prod_stage(self):
+        prs = [{'number': 120, 'state': 'MERGED', 'title': 'elvis: release v1.2.0 to production'}]
+        stage = magehand.prod_stage('v1.2.0', 3, prs)
+        self.assertEqual(stage['state'], 'ok')
+        self.assertIn('3 commits on main since v1.2.0', stage['text'])
+        self.assertEqual(magehand.prod_stage(None, None, [])['state'], 'unknown')
+        self.assertEqual(magehand.prod_stage('v1.3.0', 0, prs)['state'], 'unknown')
+
+    def test_prod_matches_the_whole_tag_not_a_prefix(self):
+        longer = [{'number': 5, 'state': 'MERGED', 'title': 'demo: release v1.2.01 to production'},
+                  {'number': 6, 'state': 'MERGED', 'title': 'demo: release v1.2.10 to production'}]
+        self.assertEqual(magehand.prod_stage('v1.2.0', 0, longer)['state'], 'unknown')
+        self.assertEqual(magehand.prod_stage('v1.2.1', 0, longer)['state'], 'unknown')
+        self.assertEqual(magehand.prod_stage('v1.2.10', 0, longer)['state'], 'ok')
+
+    def test_release_eligibility_follows_the_controller(self):
+        owner = magehand.OWNER
+        mine = {'tag_name': 'v1.2.0', 'author': {'login': owner}}
+        newer = [{'tag_name': 'v1.3.0', 'author': {'login': 'someone-else'}},
+                 {'tag_name': 'v1.2.9', 'author': {'login': owner}, 'prerelease': True},
+                 {'tag_name': 'v1.2.8', 'author': {'login': owner}, 'draft': True},
+                 {'tag_name': 'nightly', 'author': {'login': owner}}]
+        self.assertEqual(magehand.eligible_release(newer + [mine]), mine)
+        self.assertIsNone(magehand.eligible_release(newer))
+        self.assertEqual(magehand.eligible_release([{'tag_name': 'v2', 'author': {'login': owner}}])['tag_name'], 'v2')
+
+    def test_failed_queries_are_errors_not_empty_results(self):
+        names = ('gh_probe',)
+        before = {n: getattr(magehand, n) for n in names}
+
+        def probe(*args):
+            if args[:2] == ('api', 'repos/davidlarrimore/demo/commits/main'):
+                return 0, json.dumps({'sha': self.HEAD, 'commit': {'message': 'subject\n\nbody'}}), ''
+            return 1, '', 'HTTP 403: rate limit exceeded'
+        magehand.gh_probe = probe
+        try:
+            report = magehand.collect_status('davidlarrimore/demo', 'demo')
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
+        self.assertEqual([s['state'] for s in report['stages']], ['error', 'error', 'error'])
+        self.assertIn('rate limit', report['stages'][0]['text'])
+        self.assertNotIn('no ', report['stages'][2]['text'].split(':')[0])  # not "no release yet"
+
+    def status_with(self, deploy_checks=(), fail=None):
+        """Run `status` through a fake gh: an app whose build and release are fine, a dev deploy PR with
+        `deploy_checks`, and every query whose arguments contain `fail` (a string) failing."""
+        owner = magehand.OWNER
+        run = self.build_run()
+
+        def probe(*args):
+            line = ' '.join(args)
+            if fail and fail in line:
+                return 1, '', 'HTTP 403: forbidden'
+            if line.endswith('/commits/main'):
+                return 0, json.dumps({'sha': self.HEAD, 'commit': {'message': 'subject', 'tree': {'sha': 't'}}}), ''
+            if line.endswith('/pulls'):
+                return 0, '[]', ''
+            if f'/commits/{self.HEAD}' in line:
+                return 0, json.dumps({'sha': self.HEAD, 'commit': {'tree': {'sha': 't'}}}), ''
+            if '/actions/runs' in line:
+                return 0, json.dumps({'workflow_runs': [run]}), ''
+            if 'deploy-dev/' in line:
+                pr = self.pr(122, 'OPEN', checks=())
+                pr['statusCheckRollup'] = list(deploy_checks)
+                return 0, json.dumps([pr]), ''
+            if 'deploy-prod/' in line:
+                return 0, json.dumps([{'number': 120, 'state': 'MERGED',
+                                       'title': 'demo: release v1.2.0 to production'}]), ''
+            if '/releases' in line:
+                return 0, json.dumps([{'tag_name': 'v1.2.0', 'author': {'login': owner}}]), ''
+            if '/compare/' in line:
+                return 0, json.dumps({'ahead_by': 2}), ''
+            return 1, '', 'unexpected: ' + line
+        names = ('app_here', 'gh_probe')
+        before = {n: getattr(magehand, n) for n in names}
+        magehand.app_here = lambda name=None: {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.gh_probe = probe
+        try:
+            code, out, err = self.run_main('status', '-a', 'demo', '--json')
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
+        return code, json.loads(out), err
+
+    def test_a_failed_comparison_is_an_error_not_a_prod_success(self):
+        code, report, _ = self.status_with(fail='/compare/')
+        self.assertEqual(code, 1)
+        prod = report['stages'][-1]
+        self.assertEqual(prod['state'], 'error')
+        self.assertIn('comparison of v1.2.0 with main', prod['text'])
+        self.assertIn('forbidden', prod['text'])
+
+    def test_status_contexts_count_as_failing_checks(self):
+        for entry in ({'context': 'policy', 'state': 'FAILURE'}, {'context': 'policy', 'state': 'ERROR'}):
+            code, report, _ = self.status_with(deploy_checks=[entry])
+            self.assertEqual(code, 1, entry)
+            deploy = report['stages'][1]
+            self.assertEqual(deploy['state'], 'failed')
+            self.assertIn('policy', deploy['text'])
+        ok = [{'context': 'policy', 'state': 'SUCCESS'}, {'name': 'scan', 'conclusion': 'SUCCESS'}]
+        code, report, _ = self.status_with(deploy_checks=ok)
+        self.assertEqual((code, report['stages'][1]['state']), (0, 'pending'))
+
+    def test_status_command_and_watch_exit_codes(self):
+        names = ('app_here', 'collect_status')
+        before = {n: getattr(magehand, n) for n in names}
+        app = {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.app_here = lambda name=None: app
+        stages = {'state': 'ok'}
+
+        def collect(repo, name):
+            ok = stages['state']
+            return {'app': name, 'repo': repo, 'commit': self.HEAD, 'subject': 's',
+                    'stages': [{'stage': 'build', 'state': 'ok', 'text': 'success'},
+                               {'stage': 'deploy', 'state': ok, 'text': 'dev'}]}
+        magehand.collect_status = collect
+        run = self.run_main
+        try:
+            code, out, _ = run('status', '-a', 'demo', '--watch')
+            self.assertEqual(code, 0)
+            self.assertIn('demo  (davidlarrimore/demo main d8b3476', out)
+            stages['state'] = 'failed'
+            self.assertEqual(run('status', '-a', 'demo', '--watch')[0], 1)
+            stages['state'] = 'error'
+            self.assertEqual(run('status', '-a', 'demo')[0], 1)  # could not read GitHub: not a success
+            stages['state'] = 'pending'
+            self.assertEqual(run('status', '-a', 'demo')[0], 0)  # no --watch: a snapshot, pending is not a failure
+            code, out, _ = run('status', '-a', 'demo', '--json')
+            self.assertEqual(code, 0)
+            self.assertFalse(json.loads(out)['ok'])  # a snapshot with dev still pending
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
