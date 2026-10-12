@@ -1847,6 +1847,24 @@ class Status(unittest.TestCase):
         gone = self.pod('app-0', image_id='x', deleting=True)
         self.assertEqual(magehand.pod_stage({'items': [self.pod(), gone]}, self.argo(), self.IMAGE)['state'], 'ok')
 
+    def block(self, name='db-0', ready=True, waiting=None):
+        pod = self.pod(name, image_id='docker.io/library/postgres@sha256:' + 'c' * 64, ready=ready, waiting=waiting)
+        pod['metadata']['labels'] = {'homelab.davidlarrimore.com/block': 'postgres'}
+        return pod
+
+    def test_pod_stage_building_blocks_run_their_own_image(self):
+        items = {'items': [self.pod(), self.block()]}
+        stage = magehand.pod_stage(items, self.argo(), self.IMAGE)
+        self.assertEqual((stage['state'], '2/2 pods ready' in stage['text']), ('ok', True))
+        # a block that is not ready yet holds the rollout back, and one that cannot start fails it
+        waiting = magehand.pod_stage({'items': [self.pod(), self.block(ready=False)]}, self.argo(), self.IMAGE)
+        self.assertEqual((waiting['state'], '1/2 pods ready' in waiting['text']), ('pending', True))
+        crash = self.block(ready=False, waiting='CrashLoopBackOff')
+        self.assertEqual(magehand.pod_stage({'items': [self.pod(), crash]}, self.argo(), self.IMAGE)['state'],
+                         'failed')
+        # blocks alone are not the app: wait for its pods
+        self.assertEqual(magehand.pod_stage({'items': [self.block()]}, self.argo(), self.IMAGE)['state'], 'pending')
+
     def test_pod_stage_argo_and_failures(self):
         self.assertEqual(magehand.pod_stage({'items': [self.pod()]}, self.argo(sync='OutOfSync'),
                                             self.IMAGE)['state'], 'pending')

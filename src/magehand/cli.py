@@ -750,6 +750,8 @@ def prod_stage(tag, ahead, prs):
             'tag': tag, 'ahead': ahead}
 
 
+BLOCK_LABEL = 'homelab.davidlarrimore.com/block'  # on a building block's pods (postgres, redis): not the app's image
+
 STUCK_PODS = ('CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError',
               'InvalidImageName', 'RunContainerError')
 
@@ -774,29 +776,31 @@ def kubectl_json(*args):
 
 def pod_stage(pods, application, image, argo_error=None):
     """What dev's pods run: `pods` and `application` are kubectl's JSON (application may be None), `image` the
-    deploy PR's pinned ref. ok when every live pod is ready on that digest (and Argo reports synced and
-    healthy), failed when a pod on the new image can't start, otherwise a rollout in progress. Without the
+    deploy PR's pinned ref. ok when every live app pod is ready on that digest and every building-block pod
+    (postgres, redis: they run their own images) is ready (and Argo reports synced and healthy), failed when
+    a pod can't start, otherwise a rollout in progress. Without the
     application (`argo_error`: why) pods that are ready are 'unknown', never a verified rollout."""
     digest = image.rsplit('@', 1)[-1]
     live = [p for p in (pods or {}).get('items') or []
             if not (p.get('metadata') or {}).get('deletionTimestamp')
             and (p.get('status') or {}).get('phase') not in ('Succeeded', 'Failed')]
-    if not live:
+    if not any(BLOCK_LABEL not in ((p.get('metadata') or {}).get('labels') or {}) for p in live):
         return {'stage': 'dev', 'state': 'pending', 'text': f'no pods yet for {digest[:19]}'}
     ready = stuck = 0
     for pod in live:
+        block = BLOCK_LABEL in ((pod.get('metadata') or {}).get('labels') or {})
         statuses = (pod.get('status') or {}).get('containerStatuses') or []
         declared = {c.get('name'): c.get('image') or '' for c in (pod.get('spec') or {}).get('containers') or []}
 
         def ident(c):
             """The image a container runs, or (not pulled yet: no imageID) is declared to run."""
             return c.get('imageID') or c.get('image') or declared.get(c.get('name'), '')
-        on_new = bool(statuses) and all(digest in ident(c) for c in statuses)
+        on_new = bool(statuses) and (block or all(digest in ident(c) for c in statuses))
         if on_new and all(c.get('ready') for c in statuses):
             ready += 1
         for c in statuses:
             reason = ((c.get('state') or {}).get('waiting') or {}).get('reason')
-            if reason in STUCK_PODS and digest in ident(c):
+            if reason in STUCK_PODS and (block or digest in ident(c)):
                 stuck += 1
                 why = f'{pod["metadata"]["name"]}: {reason}'
     if stuck:
