@@ -1604,6 +1604,29 @@ class ArgoAccess(unittest.TestCase):
         self.assertIsNone(magehand.argo_problem(self.app('OrphanedResourceWarning', 'x')))
         self.assertIsNone(magehand.argo_problem(None))
 
+    def test_only_a_git_read_of_the_app_repo_is_an_access_problem(self):
+        for label, message in {
+                'local kustomize permission error': 'kustomize build failed: open base/x.yaml: permission denied',
+                'ssh platform source': 'rpc error: ssh: handshake failed: Permission denied (publickey) '
+                                       'for git@github.com:davidlarrimore/homelab.git',
+                'another source authentication failure': 'failed to fetch davidlarrimore/homelab.git: authentication failed',
+                'kustomize remote base': 'kustomize build failed: authentication required'}.items():
+            with self.subTest(label):
+                self.assertEqual(magehand.argo_problem(self.app('ComparisonError', message))['state'], 'pending')
+        named = 'failed to list refs https://github.com/davidlarrimore/elvis.git: authentication required'
+        self.assertEqual(magehand.argo_problem(self.app('ComparisonError', named))['state'], 'failed')
+
+    def test_a_failing_pod_wins_over_a_pending_render_error(self):
+        app = self.app('ComparisonError', 'kustomize build failed: no such file')
+        image = 'x@sha256:' + 'a' * 64
+        pod = {'metadata': {'name': 'elvis-1'}, 'status': {'phase': 'Running', 'containerStatuses': [
+            {'name': 'app', 'ready': False, 'imageID': image, 'state': {'waiting': {'reason': 'CrashLoopBackOff'}}}]}}
+        calls = {'pods': ({'items': [pod]}, None), 'application.argoproj.io': (app, None)}
+        with mock.patch.object(magehand, 'kubectl_json', lambda kind, *a: calls[kind]):
+            stage = magehand.dev_stage('elvis', {'digest': 'sha256:abc', 'image': image})
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('CrashLoopBackOff', stage['text'])
+
     def test_dev_stage_reports_it_before_the_pods(self):
         app = self.app('ComparisonError', 'repository not found')
         calls = {'pods': ({'items': []}, None), 'application.argoproj.io': (app, None)}

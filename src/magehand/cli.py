@@ -872,22 +872,34 @@ def pod_stage(pods, application, image, argo_error=None):
 
 
 ARGO_REPO_ACCESS = re.compile(r'repository not found|authentication (required|failed)|could not read username'
-                              r'|permission denied|remote: not found|invalid username or password', re.IGNORECASE)
+                              r'|remote: not found|invalid username or password', re.IGNORECASE)
+
+
+def repo_names(url):
+    """The spellings Argo's errors use for a repo URL: owner/name and name, without .git."""
+    path = re.sub(r'^(https://[^/]+/|git@[^:]+:|ssh://[^/]+/)', '', str(url or '')).removesuffix('.git')
+    return {n for n in (path, path.rsplit('/', 1)[-1]) if n}
 
 
 def argo_problem(application):
     """What Argo CD says stops it rendering or syncing the app (a stage dict without the name), or None. A
-    repo it cannot read (not in the GitHub App installation) is a failure with the fix; any other
-    comparison error may clear by itself, so it is only pending (and shown)."""
+    refused Git read of the app's repo (not in the GitHub App installation) is a failure with the fix; it has
+    to be a Git transport error that is not Kustomize's and not about another source (the platform repo is
+    read over SSH). Any other comparison error may clear by itself, so it is only pending (and shown)."""
     for condition in ((application or {}).get('status') or {}).get('conditions') or []:
         if condition.get('type') not in ('ComparisonError', 'InvalidSpecError'):
             continue
         message = ' '.join(str(condition.get('message') or '').split())
-        sources = (application.get('spec') or {}).get('sources') or [(application.get('spec') or {}).get('source') or {}]
+        spec = application.get('spec') or {}
+        sources = spec.get('sources') or [spec.get('source') or {}]
         repo = next((str(s.get('repoURL')) for s in sources if 'github.com/' in str(s.get('repoURL')) and
                      str(s.get('repoURL')).startswith('https://')), '')
+        others = {n for s in sources if str(s.get('repoURL')) != repo for n in repo_names(s.get('repoURL'))}
         shown = repo.rsplit('/', 1)[-1].removesuffix('.git') if repo else 'the app repo'
-        if ARGO_REPO_ACCESS.search(message):
+        lower = message.lower()
+        about_other = any(n.lower() in lower for n in others - repo_names(repo)) and \
+            not any(n.lower() in lower for n in repo_names(repo) if '/' in n)
+        if ARGO_REPO_ACCESS.search(message) and 'kustomize' not in lower and not about_other:
             return {'state': 'failed',
                     'text': f'Argo CD cannot read {shown}: add it to the GitHub App installation it reads app repos '
                             f'through (GitHub > Settings > Applications > Configure > Repository access). '
@@ -907,9 +919,10 @@ def dev_stage(name, deploy, cluster=True):
         return unknown(err)
     application, argo_error = kubectl_json('application.argoproj.io', f'{name}-dev', '-n', 'argocd')
     problem = argo_problem(application)
-    if problem:
-        return {'stage': 'dev', **problem}
-    return pod_stage(pods, application, deploy['image'], argo_error)
+    stage = pod_stage(pods, application, deploy['image'], argo_error)
+    if problem and not (stage['state'] == 'failed' and problem['state'] != 'failed'):
+        return {'stage': 'dev', **problem}  # a pod that cannot start is more specific than a render still pending
+    return stage
 
 
 def build_runs(repo, head):
