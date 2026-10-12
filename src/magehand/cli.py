@@ -2189,20 +2189,25 @@ def check_merged_branch(root):
         return []
     if any(p.get('state') == 'OPEN' for p in prs):
         return []
+    covered = []  # merged PRs whose head is in this branch's history (HEAD itself included)
     for pr in prs:
         old = pr.get('headRefOid') or ''
-        if pr.get('state') != 'MERGED' or not old or old == tip:
+        if pr.get('state') != 'MERGED' or not old:
             continue
-        # the merged PR's head is in this branch's history: everything since is new work on a merged branch
+        if old == tip:
+            return []  # a merged PR already covers HEAD: nothing new to move
         ancestor = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', old, tip],  # nosec B603 B607
                                   capture_output=True)
         if ancestor.returncode == 0:
-            return [finding('warning', f'branch {branch}',
-                            f'its PR #{pr["number"]} was already merged (a squash merge keeps other hashes, so '
-                            f'`git log main..` still lists these commits) and the branch has new commits since: '
-                            f'start a fresh branch from origin/main (`git fetch && git switch -c NAME '
-                            f'origin/main`) and cherry-pick the new commits', 'recipes')]
-    return []
+            covered.append(pr)
+    if not covered:
+        return []
+    pr = max(covered, key=lambda p: p.get('number') or 0)  # the latest merge the new commits follow
+    return [finding('warning', f'branch {branch}',
+                    f'its PR #{pr["number"]} was already merged (a squash merge keeps other hashes, so '
+                    f'`git log main..` still lists these commits) and the branch has new commits since: '
+                    f'start a fresh branch from origin/main (`git fetch && git switch -c NAME '
+                    f'origin/main`) and cherry-pick the new commits', 'recipes')]
 
 
 def cmd_check(a):

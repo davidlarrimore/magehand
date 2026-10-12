@@ -2083,3 +2083,15 @@ class MergedBranch(unittest.TestCase):
         self.git('switch', '-q', 'feature/x')
         magehand.gh_probe = lambda *a: (None, '', 'gh is not installed')
         self.assertEqual(magehand.check_merged_branch(self.root), [])
+
+    def test_several_merged_prs_use_the_latest_and_stay_quiet_when_head_is_covered(self):
+        first = self.merged_head
+        self.git('commit', '-q', '--allow-empty', '-m', 'second round')
+        second = self.git('rev-parse', 'HEAD')
+        self.prs = [{'number': 9, 'state': 'MERGED', 'headRefOid': second},
+                    {'number': 5, 'state': 'MERGED', 'headRefOid': first}]
+        self.assertEqual(magehand.check_merged_branch(self.root), [])  # everything through HEAD merged in #9
+        self.git('commit', '-q', '--allow-empty', '-m', 'third round')
+        found = magehand.check_merged_branch(self.root)
+        self.assertEqual(len(found), 1)
+        self.assertIn('PR #9', found[0]['text'])  # the latest merge, not #5
