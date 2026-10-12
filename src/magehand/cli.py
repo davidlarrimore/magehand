@@ -177,6 +177,7 @@ def load_app(name, root=None):
     """The app's block requests and pod spec: from `root`/deploy/ when that checkout has one, else from
     homelab-apps apps/<name>/. `where` says which."""
     local = deploy_dir(root) if root else None
+    pinned = None
     if local:
         where = DEPLOY
         spec = yaml.safe_load((local / 'app.yaml').read_text()) or {}
@@ -199,6 +200,7 @@ def load_app(name, root=None):
             if not names:
                 die(f'{name} is pinned to {repo} at {ref[:7]}, which has no deploy/base/*.yaml')
             files = [(f'{DEPLOY}/base/{n}', github_file(repo, f'deploy/base/{n}', ref=ref)) for n in names]
+            pinned = pin
         else:
             files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
     found = []
@@ -212,7 +214,8 @@ def load_app(name, root=None):
     path, deployment = found[0]
     pod = deployment['spec']['template']['spec']
     return {'name': name, 'spec': spec, 'services': spec.get('services') or {}, 'container': pod['containers'][0],
-            'pod': pod, 'where': where, 'deployment_file': path, 'root': local.parent if local else None}
+            'pod': pod, 'where': where, 'deployment_file': path, 'root': local.parent if local else None,
+            'pin': pinned}
 
 
 def app_here(name=None):
@@ -2361,11 +2364,18 @@ def check_manifests(app, catalog):
     container = app['container']
     image = container.get('image') or ''
     own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name'])
-    if where == DEPLOY and not re.fullmatch(own + r'(@sha256:[0-9a-f]{64})?', image):
+    pin = app.get('pin')
+    if pin and not re.fullmatch(own + r'@sha256:[0-9a-f]{64}', str(pin.get('image') or '')):
+        found.append(finding('error', f"homelab-apps apps/{app['name']}/app.yaml",
+                             f'the pinned image {pin.get("image") or "(none)"} is not the app\'s own '
+                             f'ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...', 'README "How an app is put together"'))
+    # An app repo's deploy/base (the checkout's, or the one a pin points at) names the image without a digest:
+    # the pin's `image` is applied on top of it by the ApplicationSet.
+    if (where == DEPLOY or pin) and not re.fullmatch(own + r'(@sha256:[0-9a-f]{64})?', image):
         found.append(finding('error', deployment_file, f'image {image or "(none)"}: write the app\'s own image '
                              f'without a digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}); merging pins '
                              'the build of that commit', 'README "How an app is put together"'))
-    elif where != DEPLOY and not re.fullmatch(own + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
+    elif where != DEPLOY and not pin and not re.fullmatch(own + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
         found.append(finding('error', deployment_file, f'image {image or "(none)"}: an app runs only '
                              f'its own image, pinned by digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...)',
                              'README "How an app is put together"'))
@@ -2577,15 +2587,27 @@ def check_dotenv(root, app):
     return found
 
 
-def provided_secrets(name, root=None):
-    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets): in base/ (the
-    checkout's deploy/base/ when `root` has one, else homelab-apps') and in homelab-apps dev/."""
+def provided_secrets(name, root=None, pin=None):
+    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets): in base/ and dev/ of
+    the checkout's deploy/ when `root` has one, else of the app repo at the commit homelab-apps pins (`pin`),
+    else (an app whose manifests are in homelab-apps) of homelab-apps apps/<app>/."""
     local = deploy_dir(root) if root else None
-    texts = [f.read_text() for f in sorted((local / 'base').glob('*.y*ml'))] if local else []
-    for part in ('dev',) if local else ('base', 'dev'):
-        for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
-            if file.endswith(('.yaml', '.yml')):
-                texts.append(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or '')
+    texts = []
+    if local:
+        for part in ('base', 'dev'):
+            if (local / part).is_dir():
+                texts += [f.read_text() for f in sorted((local / part).glob('*.y*ml'))]
+    elif pin:
+        repo, ref = f"{OWNER}/{pin.get('repo') or name}", str(pin['ref'])
+        for part in ('base', 'dev'):
+            for file in github_dir(repo, f'deploy/{part}', ref):
+                if file.endswith(('.yaml', '.yml')):
+                    texts.append(github_file(repo, f'deploy/{part}/{file}', ref=ref) or '')
+    else:
+        for part in ('base', 'dev'):
+            for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
+                if file.endswith(('.yaml', '.yml')):
+                    texts.append(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or '')
     names = set()
     for text in texts:
         try:
@@ -2612,7 +2634,7 @@ def try_load_app(name, root=None):
     if not local and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
     app = load_app(name, root)
-    app['provided'] = provided_secrets(name, root)
+    app['provided'] = provided_secrets(name, root, pin=app.get('pin'))
     return app
 
 
