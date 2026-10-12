@@ -1577,6 +1577,52 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+class PinnedLayout(unittest.TestCase):
+    """homelab-apps holds only a pin for an app whose manifests are in its own repo."""
+    PIN = {'repo': 'elvis', 'ref': 'a' * 40, 'image': 'ghcr.io/davidlarrimore/homelab-apps/elvis@sha256:' + 'b' * 64}
+    DEPLOYMENT = ('apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: elvis}\n'
+                  'spec: {template: {spec: {containers: [{name: app, image: ghcr.io/davidlarrimore/homelab-apps/elvis}]}}}\n')
+
+    def test_pinned_source_is_a_source_with_a_ref(self):
+        self.assertEqual(magehand.pinned_source({'source': self.PIN}), self.PIN)
+        self.assertIsNone(magehand.pinned_source({'source': {'repo': 'elvis'}}))  # today's app.yaml
+        self.assertIsNone(magehand.pinned_source({'services': {}}))
+        self.assertIsNone(magehand.pinned_source(None))
+
+    def test_load_app_reads_the_manifests_from_the_app_repo_at_the_ref(self):
+        asked = []
+
+        def file(repo, path, required=True, ref='main'):
+            asked.append((repo, path, ref))
+            return self.DEPLOYMENT
+        with mock.patch.object(magehand, 'APPS_DIR', None), \
+                mock.patch.object(magehand, 'registration', lambda name: {'source': self.PIN, 'services': {}}), \
+                mock.patch.object(magehand, 'github_dir', lambda repo, path, ref='main': ['deployment.yaml', 'README.md']), \
+                mock.patch.object(magehand, 'github_file', file):
+            app = magehand.load_app('elvis')
+        self.assertEqual(asked, [('davidlarrimore/elvis', 'deploy/base/deployment.yaml', 'a' * 40)])
+        self.assertEqual(app['container']['name'], 'app')
+        self.assertIn('davidlarrimore/elvis', app['where'])
+
+    def test_a_homelab_apps_checkout_has_nothing_to_check_for_a_pinned_app(self):
+        import contextlib
+        import io
+        with mock.patch.object(magehand, 'APPS_DIR', '/nonexistent'), \
+                mock.patch.object(magehand, 'registration', lambda name: {'source': self.PIN}):
+            with self.assertRaises(magehand.PinnedApp):
+                magehand.load_app('elvis')
+        out = io.StringIO()
+        argv = ['magehand', 'check', 'elvis', '--apps-dir', '/nonexistent', '--manifests-only']
+        with mock.patch.object(magehand.sys, 'argv', argv), \
+                mock.patch.object(magehand, 'try_load_app', side_effect=magehand.PinnedApp('elvis', self.PIN)), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as raised:
+            magehand.main()
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn('pinned to', out.getvalue())
+        self.assertIn('a' * 7, out.getvalue())
+
+
 class Release(unittest.TestCase):
     """`release` picks the next semver version from what merged, and refuses what would not deploy."""
 
