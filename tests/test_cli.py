@@ -1577,6 +1577,116 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+class PinnedLayout(unittest.TestCase):
+    """homelab-apps holds only a pin for an app whose manifests are in its own repo."""
+    PIN = {'repo': 'elvis', 'ref': 'a' * 40, 'image': 'ghcr.io/davidlarrimore/homelab-apps/elvis@sha256:' + 'b' * 64}
+    DEPLOYMENT = ('apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: elvis}\n'
+                  'spec: {template: {spec: {containers: [{name: app, image: ghcr.io/davidlarrimore/homelab-apps/elvis}]}}}\n')
+
+    def test_pinned_source_is_a_source_with_a_ref(self):
+        self.assertEqual(magehand.pinned_source({'source': self.PIN}), self.PIN)
+        self.assertIsNone(magehand.pinned_source({'source': {'repo': 'elvis'}}))  # today's app.yaml
+        self.assertIsNone(magehand.pinned_source({'services': {}}))
+        self.assertIsNone(magehand.pinned_source(None))
+
+    def test_load_app_reads_the_manifests_from_the_app_repo_at_the_ref(self):
+        asked = []
+
+        def file(repo, path, required=True, ref='main'):
+            asked.append((repo, path, ref))
+            return self.DEPLOYMENT
+        with mock.patch.object(magehand, 'APPS_DIR', None), \
+                mock.patch.object(magehand, 'registration', lambda name: {'source': self.PIN, 'services': {}}), \
+                mock.patch.object(magehand, 'github_dir', lambda repo, path, ref='main': ['deployment.yaml', 'README.md']), \
+                mock.patch.object(magehand, 'github_file', file):
+            app = magehand.load_app('elvis')
+        self.assertEqual(asked, [('davidlarrimore/elvis', 'deploy/base/deployment.yaml', 'a' * 40)])
+        self.assertEqual(app['container']['name'], 'app')
+        self.assertIn('davidlarrimore/elvis', app['where'])
+
+    def pinned_world(self, base_texts, dev_texts=None, image=None):
+        """A homelab-apps that only pins `elvis`, and the app repo's deploy/ at the pinned commit."""
+        pin = dict(PinnedLayout.PIN, **({'image': image} if image else {}))
+        repo_files = {f'deploy/base/{n}': t for n, t in base_texts.items()}
+        repo_files.update({f'deploy/dev/{n}': t for n, t in (dev_texts or {}).items()})
+
+        def listing(repo, path, ref='main'):
+            self.assertEqual((repo, ref), ('davidlarrimore/elvis', 'a' * 40))
+            return sorted(p.rsplit('/', 1)[1] for p in repo_files if p.rsplit('/', 1)[0] == path)
+
+        def file(repo, path, required=True, ref='main'):
+            if repo == magehand.APPS_REPO:  # try_load_app asks whether the app is registered
+                self.assertEqual(path, 'apps/elvis/app.yaml')
+                return 'services: {}\n'
+            self.assertEqual((repo, ref), ('davidlarrimore/elvis', 'a' * 40))
+            return repo_files[path]
+        return (mock.patch.object(magehand, 'APPS_DIR', None),
+                mock.patch.object(magehand, 'registration', lambda name: {'source': pin, 'services': {}}),
+                mock.patch.object(magehand, 'github_dir', listing), mock.patch.object(magehand, 'github_file', file))
+
+    def check_pinned(self, *args, **kw):
+        patches = self.pinned_world(*args, **kw)
+        with patches[0], patches[1], patches[2], patches[3], \
+                mock.patch.object(magehand, 'check_app_name', lambda app: []):
+            app = magehand.try_load_app('elvis')
+            return app, magehand.check_manifests(app, {})
+
+    def test_a_pinned_app_repo_base_may_name_its_image_without_a_digest(self):
+        app, found = self.check_pinned({'deployment.yaml': self.DEPLOYMENT})
+        self.assertEqual(texts(found, 'error'), [])
+        self.assertEqual(app['pin']['ref'], 'a' * 40)
+
+    def test_the_registered_pin_must_be_the_apps_own_digest(self):
+        for image in ('ghcr.io/davidlarrimore/homelab-apps/other@sha256:' + 'b' * 64,
+                      'ghcr.io/davidlarrimore/homelab-apps/elvis:v1', 'example.com/elvis@sha256:' + 'b' * 64):
+            with self.subTest(image):
+                _, found = self.check_pinned({'deployment.yaml': self.DEPLOYMENT}, image=image)
+                self.assertTrue(any('pinned image' in t for t in texts(found, 'error')), texts(found))
+
+    def test_secrets_the_pinned_repo_makes_are_found_at_the_same_ref(self):
+        deployment = self.DEPLOYMENT.replace(
+            'containers: [{name: app, image: ghcr.io/davidlarrimore/homelab-apps/elvis}]',
+            'containers: [{name: app, image: ghcr.io/davidlarrimore/homelab-apps/elvis, '
+            'env: [{name: TOKEN, valueFrom: {secretKeyRef: {name: own, key: token}}}]}]')
+        es = 'kind: ExternalSecret\nmetadata: {name: own}\nspec: {target: {name: own}}\n'
+        app, found = self.check_pinned({'deployment.yaml': deployment, 'es.yaml': es})
+        self.assertIn('own', app['provided'])
+        self.assertEqual(texts(found, 'error'), [])
+        # and one in deploy/dev (the overlay), which homelab-apps no longer has a copy of
+        app, found = self.check_pinned({'deployment.yaml': deployment}, {'s.yaml': 'kind: Secret\nmetadata: {name: own}\n'})
+        self.assertEqual(texts(found, 'error'), [])
+        # without it the Secret is reported, as it is for any app
+        _, found = self.check_pinned({'deployment.yaml': deployment})
+        self.assertTrue(any("'own'" in t or 'own' in t for t in texts(found, 'error')), texts(found))
+
+    def test_a_checkouts_dev_overlay_is_read_from_the_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deploy = pathlib.Path(tmp) / 'deploy'
+            (deploy / 'base').mkdir(parents=True)
+            (deploy / 'dev').mkdir()
+            (deploy / 'app.yaml').write_text('services: {}\n')
+            (deploy / 'dev' / 's.yaml').write_text('kind: Secret\nmetadata: {name: devonly}\n')
+            self.assertEqual(magehand.provided_secrets('elvis', pathlib.Path(tmp)), {'devonly'})
+
+    def test_a_homelab_apps_checkout_has_nothing_to_check_for_a_pinned_app(self):
+        import contextlib
+        import io
+        with mock.patch.object(magehand, 'APPS_DIR', '/nonexistent'), \
+                mock.patch.object(magehand, 'registration', lambda name: {'source': self.PIN}):
+            with self.assertRaises(magehand.PinnedApp):
+                magehand.load_app('elvis')
+        out = io.StringIO()
+        argv = ['magehand', 'check', 'elvis', '--apps-dir', '/nonexistent', '--manifests-only']
+        with mock.patch.object(magehand.sys, 'argv', argv), \
+                mock.patch.object(magehand, 'try_load_app', side_effect=magehand.PinnedApp('elvis', self.PIN)), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as raised:
+            magehand.main()
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn('pinned to', out.getvalue())
+        self.assertIn('a' * 7, out.getvalue())
+
+
 class Release(unittest.TestCase):
     """`release` picks the next semver version from what merged, and refuses what would not deploy."""
 

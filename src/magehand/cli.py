@@ -76,8 +76,8 @@ def github_token():
     die('no GitHub access: run `gh auth login` (or set GITHUB_TOKEN)')
 
 
-def github_file(repo, path, required=True):
-    """A file on main, cached for offline use; None if it doesn't exist."""
+def github_file(repo, path, required=True, ref='main'):
+    """A file on main (or at `ref`), cached for offline use; None if it doesn't exist."""
     if repo == APPS_REPO and APPS_DIR:
         local = pathlib.Path(APPS_DIR) / path
         if local.is_file():
@@ -85,9 +85,9 @@ def github_file(repo, path, required=True):
         if required:
             die(f'{local} not found')
         return None
-    cached = CACHE / repo / path
+    cached = CACHE / repo / (path if ref == 'main' else f'@{ref}/{path}')
     req = urllib.request.Request(
-        f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref=main',
+        f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref)}',
         headers={'Authorization': f'Bearer {github_token()}', 'Accept': 'application/vnd.github.raw',
                  'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'magehand'})
     try:
@@ -96,7 +96,7 @@ def github_file(repo, path, required=True):
     except urllib.error.HTTPError as error:
         if error.code == 404:
             if required:
-                die(f'{repo}: {path} not found on main')
+                die(f'{repo}: {path} not found at {ref}')
             return None
         text = None
     except OSError:
@@ -111,13 +111,13 @@ def github_file(repo, path, required=True):
     return text
 
 
-def github_dir(repo, path):
-    """Names in a directory on main ([] if it doesn't exist)."""
+def github_dir(repo, path, ref='main'):
+    """Names in a directory on main (or at `ref`) ([] if it doesn't exist)."""
     if repo == APPS_REPO and APPS_DIR:
         local = pathlib.Path(APPS_DIR) / path
         return sorted(child.name for child in local.iterdir()) if local.is_dir() else []
     req = urllib.request.Request(
-        f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref=main',
+        f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref)}',
         headers={'Authorization': f'Bearer {github_token()}', 'Accept': 'application/vnd.github+json',
                  'User-Agent': 'magehand'})
     try:
@@ -158,10 +158,26 @@ def repo_root(name):
     return top if top and checkout_app() == name else None
 
 
+class PinnedApp(Exception):
+    """The app's deployment is not in homelab-apps: apps/<name>/app.yaml pins a commit of its own repo, and
+    this homelab-apps checkout (--apps-dir) has no copy of the manifests to read."""
+
+    def __init__(self, name, pin):
+        super().__init__(name)
+        self.name, self.pin = name, pin
+
+
+def pinned_source(spec):
+    """The `source: {repo, ref, image}` of a pinned app.yaml (docs/pinned-refs-plan.md), or None."""
+    source = (spec or {}).get('source')
+    return source if isinstance(source, dict) and source.get('ref') else None
+
+
 def load_app(name, root=None):
     """The app's block requests and pod spec: from `root`/deploy/ when that checkout has one, else from
     homelab-apps apps/<name>/. `where` says which."""
     local = deploy_dir(root) if root else None
+    pinned = None
     if local:
         where = DEPLOY
         spec = yaml.safe_load((local / 'app.yaml').read_text()) or {}
@@ -173,7 +189,20 @@ def load_app(name, root=None):
             die(f'{name} has no deployment yet: no deploy/app.yaml in this checkout and not registered on the platform '
                 f'(no homelab-apps apps/{name}/). Write deploy/app.yaml and deploy/base/ (`magehand guide search '
                 'deploy`); the platform registers the app by itself when they are merged to main')
-        files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
+        pin = pinned_source(spec)
+        if pin:
+            if APPS_DIR:  # a homelab-apps checkout holds only the pin; the app repo's build checks the manifests
+                raise PinnedApp(name, pin)
+            repo = f"{OWNER}/{pin.get('repo') or name}"
+            ref = str(pin['ref'])
+            where = f'{repo} deploy/ at {ref[:7]}'
+            names = [n for n in github_dir(repo, 'deploy/base', ref) if n.endswith(('.yaml', '.yml'))]
+            if not names:
+                die(f'{name} is pinned to {repo} at {ref[:7]}, which has no deploy/base/*.yaml')
+            files = [(f'{DEPLOY}/base/{n}', github_file(repo, f'deploy/base/{n}', ref=ref)) for n in names]
+            pinned = pin
+        else:
+            files = [(f'{where}/base/deployment.yaml', github_file(APPS_REPO, f'apps/{name}/base/deployment.yaml'))]
     found = []
     for path, text in files:
         try:
@@ -185,7 +214,8 @@ def load_app(name, root=None):
     path, deployment = found[0]
     pod = deployment['spec']['template']['spec']
     return {'name': name, 'spec': spec, 'services': spec.get('services') or {}, 'container': pod['containers'][0],
-            'pod': pod, 'where': where, 'deployment_file': path, 'root': local.parent if local else None}
+            'pod': pod, 'where': where, 'deployment_file': path, 'root': local.parent if local else None,
+            'pin': pinned}
 
 
 def app_here(name=None):
@@ -2334,11 +2364,18 @@ def check_manifests(app, catalog):
     container = app['container']
     image = container.get('image') or ''
     own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name'])
-    if where == DEPLOY and not re.fullmatch(own + r'(@sha256:[0-9a-f]{64})?', image):
+    pin = app.get('pin')
+    if pin and not re.fullmatch(own + r'@sha256:[0-9a-f]{64}', str(pin.get('image') or '')):
+        found.append(finding('error', f"homelab-apps apps/{app['name']}/app.yaml",
+                             f'the pinned image {pin.get("image") or "(none)"} is not the app\'s own '
+                             f'ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...', 'README "How an app is put together"'))
+    # An app repo's deploy/base (the checkout's, or the one a pin points at) names the image without a digest:
+    # the pin's `image` is applied on top of it by the ApplicationSet.
+    if (where == DEPLOY or pin) and not re.fullmatch(own + r'(@sha256:[0-9a-f]{64})?', image):
         found.append(finding('error', deployment_file, f'image {image or "(none)"}: write the app\'s own image '
                              f'without a digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}); merging pins '
                              'the build of that commit', 'README "How an app is put together"'))
-    elif where != DEPLOY and not re.fullmatch(own + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
+    elif where != DEPLOY and not pin and not re.fullmatch(own + r'(:[\w.-]+)?@sha256:[0-9a-f]{64}', image):
         found.append(finding('error', deployment_file, f'image {image or "(none)"}: an app runs only '
                              f'its own image, pinned by digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...)',
                              'README "How an app is put together"'))
@@ -2550,15 +2587,27 @@ def check_dotenv(root, app):
     return found
 
 
-def provided_secrets(name, root=None):
-    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets): in base/ (the
-    checkout's deploy/base/ when `root` has one, else homelab-apps') and in homelab-apps dev/."""
+def provided_secrets(name, root=None, pin=None):
+    """Secrets the app's own manifests make (ExternalSecrets from OpenBao, plain Secrets): in base/ and dev/ of
+    the checkout's deploy/ when `root` has one, else of the app repo at the commit homelab-apps pins (`pin`),
+    else (an app whose manifests are in homelab-apps) of homelab-apps apps/<app>/."""
     local = deploy_dir(root) if root else None
-    texts = [f.read_text() for f in sorted((local / 'base').glob('*.y*ml'))] if local else []
-    for part in ('dev',) if local else ('base', 'dev'):
-        for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
-            if file.endswith(('.yaml', '.yml')):
-                texts.append(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or '')
+    texts = []
+    if local:
+        for part in ('base', 'dev'):
+            if (local / part).is_dir():
+                texts += [f.read_text() for f in sorted((local / part).glob('*.y*ml'))]
+    elif pin:
+        repo, ref = f"{OWNER}/{pin.get('repo') or name}", str(pin['ref'])
+        for part in ('base', 'dev'):
+            for file in github_dir(repo, f'deploy/{part}', ref):
+                if file.endswith(('.yaml', '.yml')):
+                    texts.append(github_file(repo, f'deploy/{part}/{file}', ref=ref) or '')
+    else:
+        for part in ('base', 'dev'):
+            for file in github_dir(APPS_REPO, f'apps/{name}/{part}'):
+                if file.endswith(('.yaml', '.yml')):
+                    texts.append(github_file(APPS_REPO, f'apps/{name}/{part}/{file}') or '')
     names = set()
     for text in texts:
         try:
@@ -2585,7 +2634,7 @@ def try_load_app(name, root=None):
     if not local and github_file(APPS_REPO, f'apps/{name}/app.yaml', required=False) is None:
         return None
     app = load_app(name, root)
-    app['provided'] = provided_secrets(name, root)
+    app['provided'] = provided_secrets(name, root, pin=app.get('pin'))
     return app
 
 
@@ -2666,7 +2715,17 @@ def cmd_check(a):
     name = a.app_flag or a.app or current_app(root)
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
-    app = try_load_app(name, root)
+    try:
+        app = try_load_app(name, root)
+    except PinnedApp as pinned:
+        repo, ref = pinned.pin.get('repo') or name, str(pinned.pin['ref'])
+        note = (f'{name} is pinned to {OWNER}/{repo} at {ref[:7]}: its manifests are in that repo and are checked by its '
+                'build (`magehand check` there); nothing to check in this homelab-apps checkout')
+        if a.json:
+            print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': []}, indent=1))
+        else:
+            print(f'magehand check {name}: {note}')
+        sys.exit(0)
     found = (check_manifests(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
     if not manifests_only:
@@ -3276,6 +3335,9 @@ def main(argv=None):
         a.func(a)
     except KeyboardInterrupt:
         sys.exit(130)
+    except PinnedApp as pinned:  # a homelab-apps checkout (--apps-dir) has no manifests for a pinned app
+        die(f"{pinned.name} is pinned to {pinned.pin.get('repo') or pinned.name} at {str(pinned.pin['ref'])[:7]}: "
+            'its deployment is in that repo; run this in its checkout, or without --apps-dir')
 
 
 if __name__ == '__main__':
