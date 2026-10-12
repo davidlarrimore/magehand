@@ -1101,6 +1101,24 @@ def compare_commits(repo, base, head):
     return commits, ahead, None
 
 
+def gh_pages(path, per_page=100, max_pages=10):
+    """(items, None) of every page of a GitHub list endpoint, or ([], why): a read error, or a list still
+    full after max_pages, is refused rather than used in part (reviews and commits are in date order, so the
+    last page can overturn the first)."""
+    items = []
+    sep = '&' if '?' in path else '?'
+    for page in range(1, max_pages + 1):
+        found, err = gh_query('api', f'{path}{sep}per_page={per_page}&page={page}')
+        if err:
+            return [], err
+        if not isinstance(found, list):
+            return [], 'GitHub answered with something that is not a list'
+        items += found
+        if len(found) < per_page:
+            return items, None
+    return [], f'more than {per_page * max_pages} entries'
+
+
 def review_verdict(number, head, reviews, reviewers):
     """None when PR `number` was approved at its final push `head` by one of `reviewers` and nobody's latest
     word is a change request, else why not. `reviews` is GitHub's list, oldest first."""
@@ -1124,12 +1142,77 @@ def pr_review(repo, number):
     pr, err = gh_query('api', f'repos/{repo}/pulls/{number}')
     if err:
         return {'labels': [], 'problem': f'could not read PR #{number}: {err}'}
-    reviews, err = gh_query('api', f'repos/{repo}/pulls/{number}/reviews?per_page=100')
+    reviews, err = gh_pages(f'repos/{repo}/pulls/{number}/reviews')
     if err:
         return {'labels': [], 'problem': f'could not read the reviews of PR #{number}: {err}'}
     labels = [l.get('name') for l in pr.get('labels') or []]
     head = (pr.get('head') or {}).get('sha')
     return {'labels': labels, 'problem': review_verdict(number, head, reviews, {OWNER, BOT})}
+
+
+def merged_prs(repo, sha):
+    """([PR numbers], None): the PRs merged into main that GitHub itself says brought in `sha` (never the
+    number in a commit message, which anyone can write), or (None, why)."""
+    found, err = gh_query('api', f'repos/{repo}/commits/{sha}/pulls')
+    if err:
+        return None, err
+    return [p['number'] for p in found or []
+            if p.get('merged_at') and (p.get('base') or {}).get('ref') == 'main'], None
+
+
+def production_approval(name):
+    """(True | False, None), or (None, why): is `name` in homelab's production register
+    (platform/prod-apps/apps.yaml)? A repo that still has a file per app in platform/prod-apps/apps/ is read
+    too, so this works on either side of that move."""
+    home = f'{OWNER}/homelab'
+    text, err = file_at(home, 'platform/prod-apps/apps.yaml', 'main')
+    if err:
+        return None, err
+    if text is not None:
+        try:
+            registered = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            return None, 'platform/prod-apps/apps.yaml is not valid YAML'
+        return isinstance(registered, dict) and name in registered, None
+    text, err = file_at(home, f'platform/prod-apps/apps/{name}.yaml', 'main')
+    return (None, err) if err else (text is not None, None)
+
+
+def main_checks_problems(repo, head):
+    """Reasons main's own checks don't certify `head`: none ran, one failed or is running, or the Build
+    workflow's push run (the security scan; its image job is skipped on a push) is missing or not green."""
+    problems = []
+    runs, total, page = [], None, 1
+    while page <= 10:
+        found, err = gh_query('api', f'repos/{repo}/commits/{head}/check-runs?per_page=100&page={page}')
+        if err:
+            return [f'could not read the checks of main: {err}']
+        total = found.get('total_count', 0)
+        runs += found.get('check_runs') or []
+        if len(runs) >= total or not found.get('check_runs'):
+            break
+        page += 1
+    if total is not None and len(runs) < total:  # a failing or running check may be in the part not read
+        return [f'could only read {len(runs)} of the {total} checks on main {head[:7]}']
+    if not runs:
+        problems.append(f'no checks ran on main {head[:7]}: its security scan has not run')
+    bad = [r.get('name') for r in runs if r.get('conclusion') in FAILED_CHECK]
+    busy = [r.get('name') for r in runs if r.get('status') != 'completed']
+    if bad:
+        problems.append(f'main {head[:7]} has failing checks: {", ".join(bad)}')
+    if busy:
+        problems.append(f'main {head[:7]} still has checks running: {", ".join(busy)}')
+    workflows, err = gh_query('api', f'repos/{repo}/actions/runs?head_sha={head}&per_page=100')
+    if err:
+        problems.append(f'could not read the workflow runs of main: {err}')
+    else:
+        pushes = [w for w in workflows.get('workflow_runs') or []
+                  if w.get('path') == BUILD_WORKFLOW and w.get('event') == 'push']
+        if not pushes:
+            problems.append(f"the security scan of main {head[:7]} did not run (no push run of {BUILD_WORKFLOW})")
+        elif not any(w.get('status') == 'completed' and w.get('conclusion') == 'success' for w in pushes):
+            problems.append(f"the security scan of main {head[:7]} has not passed ({pushes[0].get('html_url', '')})")
+    return problems
 
 
 def read_spec(repo, ref, problems, required):
@@ -1162,12 +1245,12 @@ def plan_release(repo, name, forced=None, cluster=True):
     if err or (who or {}).get('login') != OWNER:
         problems.append(f'gh is signed in as {(who or {}).get("login") or "nobody"}: only {OWNER}\'s release '
                         f'deploys production (`gh auth login`)')
-    approved, err = file_at(f'{OWNER}/homelab', f'platform/prod-apps/apps/{name}.yaml', 'main')
+    approved, err = production_approval(name)
     if err:
         problems.append(f'could not read the production approval of {name}: {err}')
-    elif approved is None:
-        problems.append(f'{name} is not approved for production: homelab platform/prod-apps/apps/{name}.yaml '
-                        f'is added by the owner (see the guide, "Going to production")')
+    elif not approved:
+        problems.append(f'{name} is not approved for production: add it to homelab platform/prod-apps/apps.yaml '
+                        f'(the owner approves that PR; see the guide, "Going to production")')
     prod_dir, err = file_at(repo, 'deploy/prod', head)
     if prod_dir is None:
         problems.append(f'deploy/prod/ is missing on main (production needs deploy/app.yaml, base/ and prod/)'
@@ -1184,41 +1267,49 @@ def plan_release(repo, name, forced=None, cluster=True):
             problems.append(err)
         old_spec = read_spec(repo, previous, problems, required=False)
     else:
-        commits, err = gh_query('api', f'repos/{repo}/commits?sha={head}&per_page=100')
+        commits, err = gh_pages(f'repos/{repo}/commits?sha={head}')
         if err:
-            problems.append(f'could not read the commits of main: {err}')
-        commits = commits or []
+            problems.append(f'could not read the history of main: {err}')
         ahead = len(commits)
-    entries = []  # (sha, subject, body, PR number or None)
-    for c in commits:
+    prs, covered, direct, limit_hit = {}, [], [], False
+    for c in commits:  # newest first
+        sha = c.get('sha') or ''
         message = (c.get('commit') or {}).get('message') or ''
         subject, _, body = message.partition('\n')
-        tail = PR_SUFFIX.search(subject) or PR_MERGE.match(subject)
-        entries.append((c.get('sha') or '', subject, body, int(tail.group(1)) if tail else None))
-    if len({n for *_, n in entries if n}) > MAX_PR_LOOKUPS:
+        numbers, err = merged_prs(repo, sha)
+        labels = []
+        if err:
+            problems.append(f'could not tell which PR brought in {sha[:7]}: {err}')
+        elif not numbers:
+            direct.append((sha, subject))
+        for n in numbers or []:
+            if n not in prs and len(prs) >= MAX_PR_LOOKUPS:
+                limit_hit = True
+                continue
+            prs.setdefault(n, None)
+            if prs[n] is None:
+                prs[n] = pr_review(repo, n)
+                if prs[n]['problem']:
+                    problems.append(prs[n]['problem'])
+            labels += prs[n]['labels']
+        covered.append(bool(numbers))
+        changes.append(classify_change(subject, body, labels))
+    if limit_hit:
         problems.append(f'more than {MAX_PR_LOOKUPS} PRs since {previous or "the start"}: release more often, '
                         'so every one can be checked for its review')
-        entries = entries[:0]
-    prs = {}
-    for sha, subject, body, number in entries:
-        if number is None:  # not a squash or merge commit of a PR: ask GitHub which PR brought it in
-            found, err = gh_query('api', f'repos/{repo}/commits/{sha}/pulls')
-            merged = [p for p in found or [] if p.get('merged_at')] if not err else []
-            number = merged[0]['number'] if merged else None
-            if err:
-                problems.append(f'could not tell which PR brought in {sha[:7]}: {err}')
-            elif number is None:
-                problems.append(f'{sha[:7]} "{subject[:50]}" was pushed straight to main: no PR, no review')
-        labels = []
-        if number is not None:
-            if number not in prs:
-                prs[number] = pr_review(repo, number)
-            pr = prs[number]
-            labels = pr['labels']
-            if pr['problem']:
-                problems.append(pr['problem'])
-        changes.append(classify_change(subject, body, labels))
-    new_spec = read_spec(repo, head, problems, required=True)
+    if previous is None and any(covered):
+        # the repo's own bootstrap (the template copy, magehand new's deploy/app.yaml) predates any PR
+        oldest = max(i for i, hit in enumerate(covered) if hit)
+        shas_before = {commits[i].get('sha') for i in range(oldest + 1, len(commits))}
+        bootstrap = [d for d in direct if d[0] in shas_before]
+        direct = [d for d in direct if d[0] not in shas_before]
+        if bootstrap:
+            warnings.append(f'{len(bootstrap)} commit{"" if len(bootstrap) == 1 else "s"} before the first PR '
+                            "(the repo's creation) were pushed straight to main: not reviewed")
+    for sha, subject in direct[:5]:
+        problems.append(f'{sha[:7]} "{subject[:50]}" was pushed straight to main: no merged PR, no review')
+    if len(direct) > 5:
+        problems.append(f'and {len(direct) - 5} more commits pushed straight to main')
     new_spec = read_spec(repo, head, problems, required=True)
     removed, added = spec_changes(old_spec, new_spec) if previous else ([], [])
     bump, why = choose_bump(changes, removed, added, forced) if previous else ('major', 'major: the first release')
@@ -1228,17 +1319,7 @@ def plan_release(repo, name, forced=None, cluster=True):
     ref, err = gh_query('api', f'repos/{repo}/git/ref/tags/{version}')
     if ref and not err:
         problems.append(f'the tag {version} already exists (a draft or prerelease?): delete it or pick a bump')
-    checks, err = gh_query('api', f'repos/{repo}/commits/{head}/check-runs?per_page=100')
-    if err:
-        problems.append(f'could not read the checks of main: {err}')
-    else:
-        runs = checks.get('check_runs') or []
-        bad = [r.get('name') for r in runs if r.get('conclusion') in FAILED_CHECK]
-        busy = [r.get('name') for r in runs if r.get('status') != 'completed']
-        if bad:
-            problems.append(f'main {head[:7]} has failing checks: {", ".join(bad)}')
-        if busy:
-            problems.append(f'main {head[:7]} still has checks running: {", ".join(busy)}')
+    problems += main_checks_problems(repo, head)
     stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head)['stages']}
     for stage in ('build', 'deploy'):
         if stages[stage]['state'] != 'ok':

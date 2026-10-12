@@ -3,3 +3,9 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# editor recovery and backup files must never be committed (and would ship in the sdist)
+*.swp
+*.swo
+.*.sw?
+*~
