@@ -3,6 +3,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import socket
 import sys
 import tempfile
@@ -1639,7 +1640,6 @@ class Release(unittest.TestCase):
             'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': {'ahead_by': 2, 'commits': [
                 {'commit': {'message': 'feat: add export (#8)\n\nbody'}},
                 {'commit': {'message': 'fix: crash (#9)'}}]},
-            'repos/davidlarrimore/app/pulls/8': {'labels': []}, 'repos/davidlarrimore/app/pulls/9': {'labels': []},
             'repos/davidlarrimore/app/git/ref/tags/v1.1.0': None,
             'repos/davidlarrimore/app/commits/' + 'a' * 40 + '/check-runs?per_page=100': {'check_runs': [
                 {'name': 'scan', 'status': 'completed', 'conclusion': 'success'}]},
@@ -1647,7 +1647,12 @@ class Release(unittest.TestCase):
         data.update(overrides)
 
         def query(*args):
-            value = data.get(args[1])
+            path = args[1]
+            value = data.get(path)
+            m = re.match(r'repos/davidlarrimore/app/pulls/(\d+)(/reviews\?per_page=100)?$', path)
+            if path not in data and m:  # a merged PR approved by the bot at its final push
+                value = ([{'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'h' + m.group(1)}]
+                         if m.group(2) else {'labels': [], 'head': {'sha': 'h' + m.group(1)}})
             return (None, 'HTTP 404') if value is None else (value, None)
 
         def probe(*args):
@@ -1712,7 +1717,7 @@ class Release(unittest.TestCase):
         self.assertTrue(any('deploy/app.yaml is missing' in p for p in problems))
         with self.fake_gh(**{base + 'pulls/8': None}):  # label lookup fails (404 in the fake)
             problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
-        self.assertTrue(any('labels of PR #8' in p for p in problems))
+        self.assertTrue(any('could not read PR #8' in p for p in problems))
         with self.fake_gh(files={'homelab/contents/platform/prod-apps/apps/lab.yaml': 'x: 1\n',
                                  'app/contents/deploy/prod': '[]', 'app/contents/deploy/app.yaml': 'a: [\n'}):
             problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
@@ -1721,7 +1726,7 @@ class Release(unittest.TestCase):
     def test_comparison_is_read_across_pages_and_refused_when_incomplete(self):
         head = 'a' * 40
         page = lambda n, items: {'ahead_by': 101, 'commits': items}  # noqa: E731
-        first = [{'commit': {'message': f'fix: n{i} (#{100 + i})'}} for i in range(100)]
+        first = [{'commit': {'message': f'fix: n{i} (#100)'}} for i in range(100)]
         second = [{'commit': {'message': 'feat!: drop the v1 route (#300)'}}]
         key = f'repos/davidlarrimore/app/compare/v1.0.0...{head}?per_page=100&page='
         with self.fake_gh(**{key + '1': page(1, first), key + '2': page(2, second)}):
@@ -1731,6 +1736,37 @@ class Release(unittest.TestCase):
         with self.fake_gh(**{key + '1': page(1, first), key + '2': None}):  # page 2 unreadable
             problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
         self.assertTrue(any('could not compare' in p for p in problems))
+
+    def test_review_verdict(self):
+        v = magehand.review_verdict
+        who = {magehand.OWNER, magehand.BOT}
+        ok = [{'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'h'}]
+        self.assertIsNone(v(5, 'h', ok, who))
+        self.assertIn('no approving review', v(5, 'h', [], who))
+        self.assertIn('no approving review', v(5, 'new', ok, who))  # approval of an older push
+        stranger = [{'user': {'login': 'someone'}, 'state': 'APPROVED', 'commit_id': 'h'}]
+        self.assertIn('no approving review', v(5, 'h', stranger, who))
+        asked = ok + [{'user': {'login': magehand.OWNER}, 'state': 'CHANGES_REQUESTED', 'commit_id': 'h'}]
+        self.assertIn('changes requested by ' + magehand.OWNER, v(5, 'h', asked, who))
+        # a later approval from the same reviewer replaces their change request
+        fixed = asked + [{'user': {'login': magehand.OWNER}, 'state': 'APPROVED', 'commit_id': 'h'}]
+        self.assertIsNone(v(5, 'h', fixed, who))
+
+    def test_plan_refuses_unreviewed_prs_and_direct_pushes(self):
+        key = 'repos/davidlarrimore/app/pulls/8/reviews?per_page=100'
+        with self.fake_gh(**{key: [{'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'stale'}]}):
+            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        self.assertTrue(any('PR #8 has no approving review of its final push' in p for p in problems))
+        direct = {'commits': [{'sha': 'd' * 40, 'commit': {'message': 'hotfix without a PR'}}], 'ahead_by': 1}
+        with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': direct,
+                             'repos/davidlarrimore/app/commits/' + 'd' * 40 + '/pulls': []}):
+            problems = magehand.plan_release('davidlarrimore/app', 'lab')['problems']
+        self.assertTrue(any('pushed straight to main' in p for p in problems))
+        # the PR is found through the commit when its subject has no number
+        direct_ok = {'repos/davidlarrimore/app/commits/' + 'd' * 40 + '/pulls': [{'number': 8, 'merged_at': 'x'}]}
+        with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': direct,
+                             **direct_ok}):
+            self.assertEqual(magehand.plan_release('davidlarrimore/app', 'lab')['problems'], [])
 
     def test_plan_nothing_new_and_existing_tag(self):
         with self.fake_gh(**{'repos/davidlarrimore/app/compare/v1.0.0...' + 'a' * 40 + '?per_page=100&page=1': {'ahead_by': 0, 'commits': []}}):
@@ -1746,7 +1782,7 @@ class Release(unittest.TestCase):
         self.assertEqual(plan['problems'], [])
         self.assertEqual(len(plan['warnings']), 1)
 
-    def test_command_creates_only_on_yes_and_targets_the_checked_commit(self):
+    def test_command_creates_when_every_check_passes_and_targets_the_checked_commit(self):
         import contextlib
         import io
         created = []
@@ -1766,9 +1802,9 @@ class Release(unittest.TestCase):
             code, out = run('--dry-run')
             self.assertEqual((code, created), (0, []))
             self.assertIn('v1.0.0 -> v1.1.0', out)
-            code, _ = run()  # no terminal and no --yes: refuse
+            code, _ = run('--confirm')  # asked to confirm without a terminal: refuse, create nothing
             self.assertEqual((code == 0, created), (False, []))
-            code, out = run('--yes', '--patch', '--json')
+            code, out = run('--patch', '--json')  # passes every check: created, no prompt, no --yes
             self.assertEqual(code, 0)
         args, notes = created[0]
         self.assertEqual(args[:3], ('release', 'create', 'v1.0.1'))

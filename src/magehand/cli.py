@@ -975,7 +975,7 @@ PR_MERGE = re.compile(r'^Merge pull request #(\d+)')
 BREAKING_FOOTER = re.compile(r'^BREAKING[ -]CHANGE:', re.MULTILINE)
 KINDS = (('breaking', 'Breaking changes'), ('feature', 'Features'), ('fix', 'Fixes'), ('other', 'Other changes'))
 BUMP_OF = {'breaking': 'major', 'feature': 'minor', 'fix': 'patch', 'other': 'patch'}
-MAX_LABEL_LOOKUPS = 40
+MAX_PR_LOOKUPS = 100  # PRs read per release (labels and reviews): past it the release is refused
 FAILED_CHECK = ('failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required')
 
 
@@ -1101,6 +1101,37 @@ def compare_commits(repo, base, head):
     return commits, ahead, None
 
 
+def review_verdict(number, head, reviews, reviewers):
+    """None when PR `number` was approved at its final push `head` by one of `reviewers` and nobody's latest
+    word is a change request, else why not. `reviews` is GitHub's list, oldest first."""
+    latest = {}
+    for r in reviews or []:
+        if r.get('state') in ('APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'):
+            latest[(r.get('user') or {}).get('login')] = r
+    asked = sorted(u for u, r in latest.items() if r['state'] == 'CHANGES_REQUESTED')
+    if asked:
+        return f'PR #{number} has changes requested by {", ".join(asked)}'
+    if not any(r['state'] == 'APPROVED' and u in reviewers and r.get('commit_id') == head
+               for u, r in latest.items()):
+        return (f'PR #{number} has no approving review of its final push from {" or ".join(sorted(reviewers))} '
+                '(approve it on GitHub: a review of a merged PR counts)')
+    return None
+
+
+def pr_review(repo, number):
+    """{'labels': [...], 'problem': None | why} for a merged PR: its labels, and whether its final push was
+    approved. A read error is a problem, never an assumption."""
+    pr, err = gh_query('api', f'repos/{repo}/pulls/{number}')
+    if err:
+        return {'labels': [], 'problem': f'could not read PR #{number}: {err}'}
+    reviews, err = gh_query('api', f'repos/{repo}/pulls/{number}/reviews?per_page=100')
+    if err:
+        return {'labels': [], 'problem': f'could not read the reviews of PR #{number}: {err}'}
+    labels = [l.get('name') for l in pr.get('labels') or []]
+    head = (pr.get('head') or {}).get('sha')
+    return {'labels': labels, 'problem': review_verdict(number, head, reviews, {OWNER, BOT})}
+
+
 def read_spec(repo, ref, problems, required):
     """deploy/app.yaml at `ref`, parsed: {} when the file is absent and not required. A read or parse error
     is a problem, never an empty spec (an empty one would invent removals or hide them)."""
@@ -1151,32 +1182,43 @@ def plan_release(repo, name, forced=None, cluster=True):
         commits, ahead, err = compare_commits(repo, previous, head)
         if err:
             problems.append(err)
-        looked = 0
-        for c in commits:
-            message = (c.get('commit') or {}).get('message') or ''
-            subject, _, body = message.partition('\n')
-            labels = []
-            tail = PR_SUFFIX.search(subject) or PR_MERGE.match(subject)
-            if tail and looked < MAX_LABEL_LOOKUPS:
-                looked += 1
-                pr, err = gh_query('api', f'repos/{repo}/pulls/{tail.group(1)}')
-                if err:  # a missed `breaking` label would pick the wrong version
-                    problems.append(f'could not read the labels of PR #{tail.group(1)}: {err}')
-                else:
-                    labels = [l.get('name') for l in (pr or {}).get('labels') or []]
-            changes.append(classify_change(subject, body, labels))
-        if looked == MAX_LABEL_LOOKUPS:
-            warnings.append(f'only the first {MAX_LABEL_LOOKUPS} PRs were checked for labels')
         old_spec = read_spec(repo, previous, problems, required=False)
     else:
-        found, err = gh_query('api', f'repos/{repo}/commits?sha={head}&per_page=100')
+        commits, err = gh_query('api', f'repos/{repo}/commits?sha={head}&per_page=100')
         if err:
             problems.append(f'could not read the commits of main: {err}')
-        ahead = len(found or [])
-        for c in found or []:
-            message = (c.get('commit') or {}).get('message') or ''
-            subject, _, body = message.partition('\n')
-            changes.append(classify_change(subject, body))
+        commits = commits or []
+        ahead = len(commits)
+    entries = []  # (sha, subject, body, PR number or None)
+    for c in commits:
+        message = (c.get('commit') or {}).get('message') or ''
+        subject, _, body = message.partition('\n')
+        tail = PR_SUFFIX.search(subject) or PR_MERGE.match(subject)
+        entries.append((c.get('sha') or '', subject, body, int(tail.group(1)) if tail else None))
+    if len({n for *_, n in entries if n}) > MAX_PR_LOOKUPS:
+        problems.append(f'more than {MAX_PR_LOOKUPS} PRs since {previous or "the start"}: release more often, '
+                        'so every one can be checked for its review')
+        entries = entries[:0]
+    prs = {}
+    for sha, subject, body, number in entries:
+        if number is None:  # not a squash or merge commit of a PR: ask GitHub which PR brought it in
+            found, err = gh_query('api', f'repos/{repo}/commits/{sha}/pulls')
+            merged = [p for p in found or [] if p.get('merged_at')] if not err else []
+            number = merged[0]['number'] if merged else None
+            if err:
+                problems.append(f'could not tell which PR brought in {sha[:7]}: {err}')
+            elif number is None:
+                problems.append(f'{sha[:7]} "{subject[:50]}" was pushed straight to main: no PR, no review')
+        labels = []
+        if number is not None:
+            if number not in prs:
+                prs[number] = pr_review(repo, number)
+            pr = prs[number]
+            labels = pr['labels']
+            if pr['problem']:
+                problems.append(pr['problem'])
+        changes.append(classify_change(subject, body, labels))
+    new_spec = read_spec(repo, head, problems, required=True)
     new_spec = read_spec(repo, head, problems, required=True)
     removed, added = spec_changes(old_spec, new_spec) if previous else ([], [])
     bump, why = choose_bump(changes, removed, added, forced) if previous else ('major', 'major: the first release')
@@ -1239,9 +1281,9 @@ def cmd_release(a):
         sys.exit(1 if refuse else 0)
     if not a.json:
         print(render_release(plan))
-    if not a.yes:
+    if a.confirm:
         if not sys.stdin.isatty():
-            die('not a terminal: add --yes to create the release, or --dry-run to only see the plan')
+            die('not a terminal: drop --confirm (a release that passes every check is created without asking)')
         if input(f'\nCreate release {plan["version"]} of {plan["repo"]} (deploys {plan["app"]} to production)? '
                  '[y/N] ').strip().lower() not in ('y', 'yes'):
             die('cancelled; nothing was created')
@@ -3029,19 +3071,22 @@ def build_parser():
     p = command('release', cmd_release, "cut an app's production release (the next vX.Y.Z)", "create an app's GitHub release: the next semver version, release notes, and the checks that it will deploy",
                 "Picks the next version from what merged to main since the last release (Conventional Commit\n"
                 "types, `!` or BREAKING CHANGE, PR labels `breaking` and `enhancement`, blocks and models added or\n"
-                "removed in deploy/app.yaml), drafts grouped notes and, on your yes, creates the tag and release\n"
-                "as you through gh. Refuses unless main is green, dev runs its newest commit, the app is approved\n"
-                "for production and deploy/prod/ exists. The platform deploys the release; follow it with `status`.\n\n"
+                "removed in deploy/app.yaml), drafts grouped notes and, when every check passes, creates the tag and\n"
+                "release as you through gh, without asking (--confirm asks). Refuses unless main's checks and\n"
+                "security scan are green, its image built and scanned, dev runs the commit, every merged PR was\n"
+                "approved at its final push, the app is approved for production and deploy/prod/ exists. The\n"
+                "platform deploys the release; follow it with `status`.\n\n"
                 'examples:\n  magehand release --dry-run           the version, notes and checks only\n'
-                '  magehand release                     ask, then create it\n'
-                '  magehand release --minor --yes       force the bump, no prompt')
+                '  magehand release                     create it when every check passes\n'
+                '  magehand release --minor --confirm   force the bump, ask first')
     app_option(p)
     bump = p.add_mutually_exclusive_group()
     bump.add_argument('--major', action='store_true', help='release the next major version whatever the changes')
     bump.add_argument('--minor', action='store_true', help='release the next minor version whatever the changes')
     bump.add_argument('--patch', action='store_true', help='release the next patch version whatever the changes')
     p.add_argument('--dry-run', action='store_true', dest='dry_run', help='print the version, notes and checks; create nothing')
-    p.add_argument('--yes', action='store_true', help="create the release without asking (when it isn't refused)")
+    p.add_argument('--confirm', action='store_true', help='ask before creating (default: a release that passes every check is created)')
+    p.add_argument('--yes', action='store_true', help=argparse.SUPPRESS)  # released form: now the default
     p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read the dev pods with kubectl (GitHub only)")
     json_option(p)
