@@ -2170,6 +2170,41 @@ def check_agents_drift(root):
                     'homelab-apps AGENTS.md')]
 
 
+def check_merged_branch(root):
+    """A warning when the checked-out branch already had a pull request merged (squash merges keep other
+    hashes, so `git log main..` still lists its commits) and has gone on since: new work on a merged branch
+    is a new PR from a fresh branch off origin/main. Skipped outside an app's own repo, on a detached HEAD
+    (CI), without gh or a merged PR for this branch's history, and while the branch has an open PR."""
+    if not is_app_checkout(root):
+        return []
+    branch, tip = git_out(['branch', '--show-current'], root), git_out(['rev-parse', 'HEAD'], root)
+    repo = current_repo(root)
+    if not branch or not tip or not repo or branch in ('main', 'master'):
+        return []
+    code, out, _ = gh_probe('pr', 'list', '-R', repo, '--head', branch, '--state', 'all', '--limit', '20',
+                            '--json', 'number,state,headRefOid')
+    try:
+        prs = json.loads(out) if code == 0 else []
+    except ValueError:
+        return []
+    if any(p.get('state') == 'OPEN' for p in prs):
+        return []
+    for pr in prs:
+        old = pr.get('headRefOid') or ''
+        if pr.get('state') != 'MERGED' or not old or old == tip:
+            continue
+        # the merged PR's head is in this branch's history: everything since is new work on a merged branch
+        ancestor = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', old, tip],  # nosec B603 B607
+                                  capture_output=True)
+        if ancestor.returncode == 0:
+            return [finding('warning', f'branch {branch}',
+                            f'its PR #{pr["number"]} was already merged (a squash merge keeps other hashes, so '
+                            f'`git log main..` still lists these commits) and the branch has new commits since: '
+                            f'start a fresh branch from origin/main (`git fetch && git switch -c NAME '
+                            f'origin/main`) and cherry-pick the new commits', 'recipes')]
+    return []
+
+
 def cmd_check(a):
     global APPS_DIR
     manifests_only = a.manifests_only
@@ -2183,7 +2218,7 @@ def cmd_check(a):
     found = (check_manifests(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
     if not manifests_only:
-        found += check_code(root, app, catalog) + check_agents_drift(root)
+        found += check_code(root, app, catalog) + check_agents_drift(root) + check_merged_branch(root)
     errors = sum(f['level'] == 'error' for f in found)
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),

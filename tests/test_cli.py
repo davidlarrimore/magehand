@@ -2025,3 +2025,61 @@ class Status(unittest.TestCase):
         finally:
             for n, v in before.items():
                 setattr(magehand, n, v)
+
+
+class MergedBranch(unittest.TestCase):
+    """check warns about new commits on a branch whose PR already merged."""
+
+    def setUp(self):
+        import subprocess
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        self.git = lambda *a: subprocess.run(['git', '-C', self.root, *a], check=True, capture_output=True,
+                                             text=True).stdout.strip()
+        subprocess.run(['git', 'init', '-q', '-b', 'main', self.root], check=True)
+        for k, v in (('user.name', 'T'), ('user.email', 't@example.com'), ('commit.gpgsign', 'false')):
+            self.git('config', k, v)
+        self.git('commit', '-q', '--allow-empty', '-m', 'base')
+        self.git('switch', '-q', '-c', 'feature/x')
+        self.git('commit', '-q', '--allow-empty', '-m', 'work')
+        self.merged_head = self.git('rev-parse', 'HEAD')
+        self.names = ('is_app_checkout', 'current_repo', 'gh_probe')
+        self.saved = {n: getattr(magehand, n) for n in self.names}
+        magehand.is_app_checkout = lambda root: True
+        magehand.current_repo = lambda root='.': 'davidlarrimore/demo'
+        self.prs = []
+        magehand.gh_probe = lambda *a: (0, json.dumps(self.prs), '')
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(magehand, n, v)
+        self.tmp.cleanup()
+
+    def test_new_commits_on_a_merged_branch_warn(self):
+        self.prs = [{'number': 5, 'state': 'MERGED', 'headRefOid': self.merged_head}]
+        self.assertEqual(magehand.check_merged_branch(self.root), [])  # nothing new since the merge
+        self.git('commit', '-q', '--allow-empty', '-m', 'more')
+        found = magehand.check_merged_branch(self.root)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]['level'], 'warning')
+        self.assertIn('PR #5', found[0]['text'])
+        self.assertIn('origin/main', found[0]['text'])
+
+    def test_no_warning_with_an_open_pr_unrelated_history_main_or_no_gh(self):
+        self.git('commit', '-q', '--allow-empty', '-m', 'more')
+        self.prs = [{'number': 5, 'state': 'MERGED', 'headRefOid': self.merged_head},
+                    {'number': 7, 'state': 'OPEN', 'headRefOid': 'f' * 40}]
+        self.assertEqual(magehand.check_merged_branch(self.root), [])  # the branch has an open PR
+        self.prs = [{'number': 5, 'state': 'MERGED', 'headRefOid': 'e' * 40}]
+        self.assertEqual(magehand.check_merged_branch(self.root), [])  # that head isn't in this history
+        self.prs = [{'number': 5, 'state': 'CLOSED', 'headRefOid': self.merged_head}]
+        self.assertEqual(magehand.check_merged_branch(self.root), [])  # closed, not merged
+        self.prs = [{'number': 5, 'state': 'MERGED', 'headRefOid': self.merged_head}]
+        self.git('switch', '-q', 'main')
+        self.assertEqual(magehand.check_merged_branch(self.root), [])
+        self.git('switch', '-q', '--detach')
+        self.assertEqual(magehand.check_merged_branch(self.root), [])  # detached HEAD (CI)
+        self.git('switch', '-q', 'feature/x')
+        magehand.gh_probe = lambda *a: (None, '', 'gh is not installed')
+        self.assertEqual(magehand.check_merged_branch(self.root), [])
