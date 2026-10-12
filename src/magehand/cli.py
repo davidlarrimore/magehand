@@ -614,23 +614,30 @@ def cmd_app(a):
 
 
 # --- status: where a merge to main has got to ---------------------------------------
-# Everything comes from GitHub through gh (read-only): the app repo's Build run, the deploy PR that
-# `homelab app deploy-dev` opens in homelab-apps (branch deploy-dev/<app>, marked with the commit it
-# deploys), and the latest vX.Y.Z release with its deploy-prod/<app> PR.
+# Everything comes from GitHub through gh (read-only), following the platform's own rules (homelab
+# `homelab app deploy-dev` / `deploy-prod`): the image is the Build workflow's pull_request or
+# workflow_dispatch run for main's commit (or for the merged PR's head when it has main's exact tree: a
+# push to main only runs the security scan); dev's deploy PR is deploy-dev/<app> marked with the commit;
+# prod follows the owner's latest published vX.Y.Z release and its deploy-prod/<app> PR.
 
+BUILD_WORKFLOW = '.github/workflows/build.yaml'
+BUILD_EVENTS = ('pull_request', 'workflow_dispatch')
+RELEASE_TAG = re.compile(r'^v\d+(\.\d+){0,2}$')
 DEPLOY_MARK = re.compile(r'<!-- homelab deploy-dev (\w+) (\S+)')
-STATUS_MARK = {'ok': '✓', 'pending': '…', 'failed': '✗', 'unknown': '?'}
+PROD_TITLE = re.compile(r': release (\S+) to production$')
+STATUS_MARK = {'ok': '✓', 'pending': '…', 'failed': '✗', 'unknown': '?', 'error': '!'}
 
 
-def gh_json(*args):
-    """The parsed JSON of `gh ARGS`, or None when gh fails (no access, rate limit, not found)."""
-    code, out, _ = gh_probe(*args)
+def gh_query(*args):
+    """(parsed JSON, None) of `gh ARGS`, or (None, why) when gh fails (no access, rate limit, offline): a failed
+    query is not an empty result."""
+    code, out, err = gh_probe(*args)
     if code != 0:
-        return None
+        return None, err or 'gh failed'
     try:
-        return json.loads(out)
+        return json.loads(out), None
     except ValueError:
-        return None
+        return None, 'gh returned something that is not JSON'
 
 
 def clock(stamp):
@@ -646,19 +653,33 @@ def seconds_between(start, end):
         return None
 
 
-def build_stage(runs, head, image_skipped=None):
-    """The app repo's Build run for `head` among its push runs on main (newest first)."""
-    run = next((r for r in runs or [] if r.get('headSha') == head), None)
-    if run is None:
-        return {'stage': 'build', 'state': 'pending', 'text': f'no Build run for {head[:7]} yet'}
-    if run.get('status') != 'completed':
-        return {'stage': 'build', 'state': 'pending', 'text': f'{run.get("status", "queued")}: {run.get("url", "")}'}
-    took = seconds_between(run.get('startedAt') or run.get('createdAt'), run.get('updatedAt'))
-    span = f' {took // 60}m{took % 60:02d}s' if took is not None else ''
-    if run.get('conclusion') != 'success':
-        return {'stage': 'build', 'state': 'failed', 'text': f'{run.get("conclusion")}{span}: {run.get("url", "")}'}
-    note = "  (the image job was skipped: the platform reuses the image built for the PR)" if image_skipped else ''
-    return {'stage': 'build', 'state': 'ok', 'text': f'success{span}{note}'}
+def query_error(stage, what, why):
+    return {'stage': stage, 'state': 'error',
+            'text': f'could not read {what}: {why} (`gh auth status`; is this one of your repos?)'}
+
+
+def build_stage(runs, head):
+    """The image build of `head`, from the app repo's Build runs (API workflow_runs; those for main's commit
+    and for the merged PR's head with main's tree). Mirrors the controller: any success is built, else a
+    running one is building, else the newest failed one failed."""
+    builds = [r for r in runs if r.get('path') == BUILD_WORKFLOW and r.get('event') in BUILD_EVENTS]
+    newest = lambda rs: max(rs, key=lambda r: r.get('created_at') or '', default=None)  # noqa: E731
+    done = newest([r for r in builds if r.get('status') == 'completed' and r.get('conclusion') == 'success'])
+    if done:
+        took = seconds_between(done.get('run_started_at') or done.get('created_at'), done.get('updated_at'))
+        span = f' {took // 60}m{took % 60:02d}s' if took is not None else ''
+        why = ('built for the PR, reused: main has its exact tree' if done['event'] == 'pull_request'
+               else 'built by a dispatched build of main')
+        return {'stage': 'build', 'state': 'ok', 'text': f'image built{span} ({why})'}
+    running = newest([r for r in builds if r.get('status') != 'completed'])
+    if running:
+        return {'stage': 'build', 'state': 'pending', 'text': f'building: {running.get("html_url", "")}'}
+    failed = newest(builds)
+    if failed:
+        return {'stage': 'build', 'state': 'failed',
+                'text': f'the image build of {head[:7]} failed ({failed["event"]}): {failed.get("html_url", "")}'}
+    return {'stage': 'build', 'state': 'pending',
+            'text': f'no image build of {head[:7]} yet (the platform starts one when no PR build has main\'s tree)'}
 
 
 def deploy_marks(prs):
@@ -692,51 +713,90 @@ def deploy_stage(prs, head):
             'text': f'dev: no deploy PR for {head[:7]} yet (opened after the build, within a few minutes)'}
 
 
-def prod_stage(tag, ahead, prs, app):
-    """Prod: the latest release, whether its deploy PR merged, and the commits on main since."""
+def eligible_release(releases):
+    """The owner's newest published release vX.Y.Z (drafts, prereleases, other tags and other authors'
+    releases never deploy production), or None. `releases` is GitHub's list, newest first."""
+    for r in releases or []:
+        if r.get('draft') or r.get('prerelease') or not RELEASE_TAG.match(r.get('tag_name') or ''):
+            continue
+        if (r.get('author') or {}).get('login') == OWNER:
+            return r
+    return None
+
+
+def prod_stage(tag, ahead, prs):
+    """Prod: the latest eligible release, whether its deploy PR merged, and the commits on main since."""
     if not tag:
-        return {'stage': 'prod', 'state': 'unknown', 'text': 'no release yet (a GitHub Release vX.Y.Z deploys to prod)'}
+        return {'stage': 'prod', 'state': 'unknown',
+                'text': "no release yet (the owner's GitHub Release vX.Y.Z deploys to prod)"}
     since = f'  ({ahead} commit{"" if ahead == 1 else "s"} on main since {tag})' if ahead else ''
-    done = [p for p in prs or [] if tag in (p.get('title') or '')]
-    if done and done[0].get('state') == 'MERGED':
+    mine = [p for p in prs or [] if (PROD_TITLE.search(p.get('title') or '') or [None, None])[1] == tag]
+    if mine and mine[0].get('state') == 'MERGED':
         return {'stage': 'prod', 'state': 'ok', 'text': f'{tag} deployed{since}', 'tag': tag, 'ahead': ahead}
-    if done and done[0].get('state') == 'OPEN':
-        return {'stage': 'prod', 'state': 'pending', 'text': f'{tag}: homelab-apps#{done[0]["number"]} is open{since}',
+    if mine and mine[0].get('state') == 'OPEN':
+        return {'stage': 'prod', 'state': 'pending', 'text': f'{tag}: homelab-apps#{mine[0]["number"]} is open{since}',
                 'tag': tag, 'ahead': ahead}
     return {'stage': 'prod', 'state': 'unknown', 'text': f'{tag} released; its deploy PR was not found{since}',
             'tag': tag, 'ahead': ahead}
 
 
+def build_runs(repo, head):
+    """(workflow_runs, error) for main's commit and, when the PR that merged it has main's exact tree, for
+    that PR's head too (the image of a squash merge is the PR's build)."""
+    commit, err = gh_query('api', f'repos/{repo}/commits/{head}')
+    if err:
+        return None, err
+    shas = [head]
+    pulls, err = gh_query('api', f'repos/{repo}/commits/{head}/pulls')
+    if err:
+        return None, err
+    merged = next((p for p in pulls if p.get('merge_commit_sha') == head), None)
+    if merged:
+        pr_head = merged['head']['sha']
+        tip, err = gh_query('api', f'repos/{repo}/commits/{pr_head}')
+        if err:
+            return None, err
+        if tip['commit']['tree']['sha'] == commit['commit']['tree']['sha']:
+            shas.append(pr_head)
+    runs = []
+    for sha in shas:
+        found, err = gh_query('api', f'repos/{repo}/actions/runs?head_sha={sha}&per_page=50')
+        if err:
+            return None, err
+        runs += found.get('workflow_runs', [])
+    return runs, None
+
+
 def collect_status(repo, name):
-    """The stages for the app `name` whose code is `repo` (OWNER/NAME)."""
-    commit = gh_json('api', f'repos/{repo}/commits/main')
-    if not commit:
-        die(f'cannot read {repo} through gh (is it yours, and are you signed in: `gh auth login`)')
+    """The stages for the app `name` whose code is `repo` (OWNER/NAME); a failed query is a stage in state
+    'error' naming what could not be read."""
+    commit, err = gh_query('api', f'repos/{repo}/commits/main')
+    if err:
+        die(f'cannot read {repo} through gh: {err} (is it yours, and are you signed in: `gh auth login`)')
     head = commit['sha']
     subject = commit['commit']['message'].splitlines()[0]
-    fields = 'databaseId,headSha,status,conclusion,startedAt,createdAt,updatedAt,url'
-    runs = gh_json('run', 'list', '-R', repo, '--branch', 'main', '--event', 'push', '--workflow', 'Build',
-                   '--limit', '10', '--json', fields)
-    skipped = None
-    mine = next((r for r in runs or [] if r.get('headSha') == head and r.get('conclusion') == 'success'), None)
-    if mine:
-        jobs = gh_json('run', 'view', str(mine['databaseId']), '-R', repo, '--json', 'jobs')
-        skipped = any(j.get('name') == 'image' and j.get('conclusion') == 'skipped' for j in (jobs or {}).get('jobs', []))
+    runs, err = build_runs(repo, head)
+    build = query_error('build', f"{repo}'s Build runs", err) if err else build_stage(runs, head)
     pr_fields = 'number,state,mergedAt,title,body,statusCheckRollup'
-    dev = gh_json('pr', 'list', '-R', APPS_REPO, '--head', f'deploy-dev/{name}', '--state', 'all',
-                  '--limit', '10', '--json', pr_fields)
-    prod = gh_json('pr', 'list', '-R', APPS_REPO, '--head', f'deploy-prod/{name}', '--state', 'all',
-                   '--limit', '5', '--json', pr_fields)
-    release = gh_json('api', f'repos/{repo}/releases/latest')
-    tag = (release or {}).get('tag_name')
-    ahead = None
-    if tag:
-        compare = gh_json('api', f'repos/{repo}/compare/{tag}...main')
-        ahead = (compare or {}).get('ahead_by')
-    stages = [build_stage(runs, head, skipped), deploy_stage(dev, head), prod_stage(tag, ahead, prod, name)]
-    if stages[1]['state'] == 'ok':
+    dev, err = gh_query('pr', 'list', '-R', APPS_REPO, '--head', f'deploy-dev/{name}', '--state', 'all',
+                        '--limit', '10', '--json', pr_fields)
+    deploy = query_error('deploy', f'{APPS_REPO} deploy PRs', err) if err else deploy_stage(dev, head)
+    prod_prs, err_prs = gh_query('pr', 'list', '-R', APPS_REPO, '--head', f'deploy-prod/{name}', '--state', 'all',
+                                 '--limit', '10', '--json', 'number,state,title')
+    releases, err = gh_query('api', f'repos/{repo}/releases?per_page=20')
+    if err or err_prs:
+        prod = query_error('prod', 'the releases or their deploy PRs', err or err_prs)
+    else:
+        release = eligible_release(releases)
+        tag, ahead = (release or {}).get('tag_name'), None
+        if tag:
+            compare, err = gh_query('api', f'repos/{repo}/compare/{tag}...main')
+            ahead = None if err else compare.get('ahead_by')
+        prod = prod_stage(tag, ahead, prod_prs)
+    stages = [build, deploy, prod]
+    if deploy['state'] == 'ok':
         stages.insert(2, {'stage': 'dev', 'state': 'unknown',
-                          'text': f'config for {head[:7]} deployed ({stages[1]["digest"]}); the running pod is not '
+                          'text': f'config for {head[:7]} deployed ({deploy["digest"]}); the running pod is not '
                                   'checked here (the app is behind sign-in)'})
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
@@ -760,7 +820,7 @@ def cmd_status(a):
     while True:
         report = collect_status(repo, app['name'])
         states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy')]
-        failed = 'failed' in states
+        failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages'])
         done = states == ['ok', 'ok']
         if not a.watch or failed or done:
             break
@@ -772,8 +832,8 @@ def cmd_status(a):
             print(text, file=sys.stderr)
             last = text
         time.sleep(a.interval)
+    report['ok'] = done and not failed  # build and the dev deploy both finished for the newest commit
     if a.json:
-        report['ok'] = done  # build and the dev deploy both finished for the newest commit
         print(json.dumps(report, indent=1))
     else:
         print(render_status(report))
