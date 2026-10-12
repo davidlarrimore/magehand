@@ -1858,11 +1858,40 @@ class Status(unittest.TestCase):
         self.assertEqual(stage['state'], 'failed')
         self.assertIn('CrashLoopBackOff', stage['text'])
         pull = self.pod('app-2', image_id='', ready=False, waiting='ImagePullBackOff')
-        self.assertEqual(magehand.pod_stage({'items': [pull]}, None, self.IMAGE)['state'], 'failed')
+        pull['status']['containerStatuses'][0]['image'] = self.IMAGE  # not pulled yet: the declared image counts
+        self.assertEqual(magehand.pod_stage({'items': [pull]}, self.argo(), self.IMAGE)['state'], 'failed')
+        # an old pod that can't pull its OLD image has no imageID either: not this deploy's failure
+        old_pull = self.pod('app-0', image_id='', ready=False, waiting='ImagePullBackOff')
+        old_pull['status']['containerStatuses'][0]['image'] = 'ghcr.io/example/app@sha256:' + 'b' * 64
+        self.assertEqual(magehand.pod_stage({'items': [old_pull, self.pod()]}, self.argo(), self.IMAGE)['state'],
+                         'pending')
+        # the pod spec's image is used when the status has none yet
+        spec_only = self.pod('app-3', image_id='', ready=False, waiting='ErrImagePull')
+        spec_only['spec'] = {'containers': [{'name': 'c', 'image': self.IMAGE}]}
+        spec_only['status']['containerStatuses'][0]['name'] = 'c'
+        self.assertEqual(magehand.pod_stage({'items': [spec_only]}, self.argo(), self.IMAGE)['state'], 'failed')
         # an old pod crash-looping while the new one comes up is the old rollout's business
         old = self.pod('app-0', image_id='ghcr.io/example/app@sha256:' + 'b' * 64, ready=False,
                        waiting='CrashLoopBackOff')
-        self.assertEqual(magehand.pod_stage({'items': [old]}, None, self.IMAGE)['state'], 'pending')
+        self.assertEqual(magehand.pod_stage({'items': [old]}, self.argo(), self.IMAGE)['state'], 'pending')
+
+    def test_unreadable_argo_is_not_a_verified_rollout(self):
+        stage = magehand.pod_stage({'items': [self.pod()]}, None, self.IMAGE, 'Error: forbidden')
+        self.assertEqual(stage['state'], 'unknown')
+        self.assertIn('Argo not checked (Error: forbidden)', stage['text'])
+        # pods that are still rolling out keep --watch waiting, whatever Argo says
+        old = self.pod('app-0', image_id='ghcr.io/example/app@sha256:' + 'b' * 64)
+        self.assertEqual(magehand.pod_stage({'items': [old]}, None, self.IMAGE, 'forbidden')['state'], 'pending')
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        saved = magehand.kubectl_json
+        magehand.kubectl_json = lambda *a: (({'items': [self.pod()]}, None) if a[0] == 'pods'
+                                            else (None, 'applications.argoproj.io is forbidden'))
+        try:
+            stage = magehand.dev_stage('demo', deploy)
+        finally:
+            magehand.kubectl_json = saved
+        self.assertEqual(stage['state'], 'unknown')
+        self.assertIn('forbidden', stage['text'])
 
     def test_dev_stage_without_a_cluster_says_why_and_does_not_block(self):
         deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}

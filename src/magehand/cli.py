@@ -772,10 +772,11 @@ def kubectl_json(*args):
         return None, 'kubectl returned something that is not JSON'
 
 
-def pod_stage(pods, application, image):
+def pod_stage(pods, application, image, argo_error=None):
     """What dev's pods run: `pods` and `application` are kubectl's JSON (application may be None), `image` the
     deploy PR's pinned ref. ok when every live pod is ready on that digest (and Argo reports synced and
-    healthy), failed when a pod on the new image can't start, otherwise a rollout in progress."""
+    healthy), failed when a pod on the new image can't start, otherwise a rollout in progress. Without the
+    application (`argo_error`: why) pods that are ready are 'unknown', never a verified rollout."""
     digest = image.rsplit('@', 1)[-1]
     live = [p for p in (pods or {}).get('items') or []
             if not (p.get('metadata') or {}).get('deletionTimestamp')
@@ -785,12 +786,17 @@ def pod_stage(pods, application, image):
     ready = stuck = 0
     for pod in live:
         statuses = (pod.get('status') or {}).get('containerStatuses') or []
-        on_new = bool(statuses) and all(digest in (c.get('imageID') or '') for c in statuses)
+        declared = {c.get('name'): c.get('image') or '' for c in (pod.get('spec') or {}).get('containers') or []}
+
+        def ident(c):
+            """The image a container runs, or (not pulled yet: no imageID) is declared to run."""
+            return c.get('imageID') or c.get('image') or declared.get(c.get('name'), '')
+        on_new = bool(statuses) and all(digest in ident(c) for c in statuses)
         if on_new and all(c.get('ready') for c in statuses):
             ready += 1
         for c in statuses:
             reason = ((c.get('state') or {}).get('waiting') or {}).get('reason')
-            if reason in STUCK_PODS and (not c.get('imageID') or digest in c['imageID']):
+            if reason in STUCK_PODS and digest in ident(c):
                 stuck += 1
                 why = f'{pod["metadata"]["name"]}: {reason}'
     if stuck:
@@ -798,10 +804,13 @@ def pod_stage(pods, application, image):
                 'text': f'{why}; `kubectl logs` and `kubectl describe pod` in the app\'s dev namespace say why'}
     argo = ((application or {}).get('status') or {})
     sync, health = (argo.get('sync') or {}).get('status'), (argo.get('health') or {}).get('status')
-    if ready == len(live) and (application is None or (sync, health) == ('Synced', 'Healthy')):
-        note = f', Argo {sync}/{health}'.lower() if application else ''
+    if ready == len(live) and application is None:
+        return {'stage': 'dev', 'state': 'unknown',
+                'text': f'{ready}/{len(live)} pods ready on {digest[:19]}; Argo not checked '
+                        f'({argo_error or "no application"})'}
+    if ready == len(live) and (sync, health) == ('Synced', 'Healthy'):
         return {'stage': 'dev', 'state': 'ok',
-                'text': f'running {digest[:19]} ({ready}/{len(live)} pods ready{note})'}
+                'text': f'running {digest[:19]} ({ready}/{len(live)} pods ready, Argo synced/healthy)'}
     return {'stage': 'dev', 'state': 'pending',
             'text': f'rolling out {digest[:19]}: {ready}/{len(live)} pods ready on it'
                     + (f', Argo {sync}/{health}' if application else '')}
@@ -816,8 +825,8 @@ def dev_stage(name, deploy, cluster=True):
     pods, err = kubectl_json('pods', '-n', f'{name}-dev')
     if err:
         return unknown(err)
-    application, _ = kubectl_json('application.argoproj.io', f'{name}-dev', '-n', 'argocd')
-    return pod_stage(pods, application, deploy['image'])
+    application, argo_error = kubectl_json('application.argoproj.io', f'{name}-dev', '-n', 'argocd')
+    return pod_stage(pods, application, deploy['image'], argo_error)
 
 
 def build_runs(repo, head):
