@@ -1821,6 +1821,120 @@ class Status(unittest.TestCase):
         self.assertIn('rate limit', report['stages'][0]['text'])
         self.assertNotIn('no ', report['stages'][2]['text'].split(':')[0])  # not "no release yet"
 
+    IMAGE_ID = 'docker-pullable://' + IMAGE
+
+    def pod(self, name='app-1', image_id=None, ready=True, waiting=None, deleting=False, phase='Running'):
+        status = {'ready': ready, 'imageID': self.IMAGE_ID if image_id is None else image_id,
+                  'state': {'waiting': {'reason': waiting}} if waiting else {'running': {}}}
+        meta = {'name': name}
+        if deleting:
+            meta['deletionTimestamp'] = '2026-10-12T00:00:00Z'
+        return {'metadata': meta, 'status': {'phase': phase, 'containerStatuses': [status]}}
+
+    def argo(self, sync='Synced', health='Healthy'):
+        return {'status': {'sync': {'status': sync}, 'health': {'status': health}}}
+
+    def test_pod_stage_ok_only_when_every_live_pod_runs_the_digest(self):
+        ok = magehand.pod_stage({'items': [self.pod()]}, self.argo(), self.IMAGE)
+        self.assertEqual(ok['state'], 'ok')
+        self.assertIn('1/1 pods ready', ok['text'])
+        old = self.pod('app-0', image_id='ghcr.io/example/app@sha256:' + 'b' * 64)
+        rolling = magehand.pod_stage({'items': [self.pod(), old]}, self.argo(), self.IMAGE)
+        self.assertEqual((rolling['state'], 'rolling out' in rolling['text']), ('pending', True))
+        # a healthy older rollout is not the deploy
+        self.assertEqual(magehand.pod_stage({'items': [old]}, self.argo(), self.IMAGE)['state'], 'pending')
+        # a terminating old pod is ignored
+        gone = self.pod('app-0', image_id='x', deleting=True)
+        self.assertEqual(magehand.pod_stage({'items': [self.pod(), gone]}, self.argo(), self.IMAGE)['state'], 'ok')
+
+    def test_pod_stage_argo_and_failures(self):
+        self.assertEqual(magehand.pod_stage({'items': [self.pod()]}, self.argo(sync='OutOfSync'),
+                                            self.IMAGE)['state'], 'pending')
+        self.assertEqual(magehand.pod_stage({'items': [self.pod(ready=False)]}, self.argo(), self.IMAGE)['state'],
+                         'pending')
+        self.assertEqual(magehand.pod_stage({'items': []}, self.argo(), self.IMAGE)['state'], 'pending')
+        crash = self.pod(ready=False, waiting='CrashLoopBackOff')
+        stage = magehand.pod_stage({'items': [crash]}, self.argo(), self.IMAGE)
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('CrashLoopBackOff', stage['text'])
+        pull = self.pod('app-2', image_id='', ready=False, waiting='ImagePullBackOff')
+        pull['status']['containerStatuses'][0]['image'] = self.IMAGE  # not pulled yet: the declared image counts
+        self.assertEqual(magehand.pod_stage({'items': [pull]}, self.argo(), self.IMAGE)['state'], 'failed')
+        # an old pod that can't pull its OLD image has no imageID either: not this deploy's failure
+        old_pull = self.pod('app-0', image_id='', ready=False, waiting='ImagePullBackOff')
+        old_pull['status']['containerStatuses'][0]['image'] = 'ghcr.io/example/app@sha256:' + 'b' * 64
+        self.assertEqual(magehand.pod_stage({'items': [old_pull, self.pod()]}, self.argo(), self.IMAGE)['state'],
+                         'pending')
+        # the pod spec's image is used when the status has none yet
+        spec_only = self.pod('app-3', image_id='', ready=False, waiting='ErrImagePull')
+        spec_only['spec'] = {'containers': [{'name': 'c', 'image': self.IMAGE}]}
+        spec_only['status']['containerStatuses'][0]['name'] = 'c'
+        self.assertEqual(magehand.pod_stage({'items': [spec_only]}, self.argo(), self.IMAGE)['state'], 'failed')
+        # an old pod crash-looping while the new one comes up is the old rollout's business
+        old = self.pod('app-0', image_id='ghcr.io/example/app@sha256:' + 'b' * 64, ready=False,
+                       waiting='CrashLoopBackOff')
+        self.assertEqual(magehand.pod_stage({'items': [old]}, self.argo(), self.IMAGE)['state'], 'pending')
+
+    def test_unreadable_argo_is_not_a_verified_rollout(self):
+        stage = magehand.pod_stage({'items': [self.pod()]}, None, self.IMAGE, 'Error: forbidden')
+        self.assertEqual(stage['state'], 'unknown')
+        self.assertIn('Argo not checked (Error: forbidden)', stage['text'])
+        # pods that are still rolling out keep --watch waiting, whatever Argo says
+        old = self.pod('app-0', image_id='ghcr.io/example/app@sha256:' + 'b' * 64)
+        self.assertEqual(magehand.pod_stage({'items': [old]}, None, self.IMAGE, 'forbidden')['state'], 'pending')
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        saved = magehand.kubectl_json
+        magehand.kubectl_json = lambda *a: (({'items': [self.pod()]}, None) if a[0] == 'pods'
+                                            else (None, 'applications.argoproj.io is forbidden'))
+        try:
+            stage = magehand.dev_stage('demo', deploy)
+        finally:
+            magehand.kubectl_json = saved
+        self.assertEqual(stage['state'], 'unknown')
+        self.assertIn('forbidden', stage['text'])
+
+    def test_dev_stage_without_a_cluster_says_why_and_does_not_block(self):
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        saved = magehand.kubectl_json
+        try:
+            magehand.kubectl_json = lambda *a: (None, 'kubectl is not installed')
+            stage = magehand.dev_stage('demo', deploy)
+            self.assertEqual(stage['state'], 'unknown')
+            self.assertIn('kubectl is not installed', stage['text'])
+            self.assertIn('--no-cluster', magehand.dev_stage('demo', deploy, cluster=False)['text'])
+            magehand.kubectl_json = lambda *a: (({'items': [self.pod()]} if a[0] == 'pods' else self.argo()), None)
+            self.assertEqual(magehand.dev_stage('demo', deploy)['state'], 'ok')
+        finally:
+            magehand.kubectl_json = saved
+
+    def test_watch_waits_for_the_pods_and_ignores_unreadable_ones(self):
+        names = ('app_here', 'collect_status', 'time')
+        before = {n: getattr(magehand, n) for n in names}
+        magehand.app_here = lambda name=None: {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.time = type('T', (), {'monotonic': staticmethod(lambda: 0), 'sleep': staticmethod(lambda s: None)})
+        seen = []
+        script = [['ok', 'ok', 'pending'], ['ok', 'ok', 'ok']]
+
+        def collect(repo, name, cluster=True):
+            build, deploy, dev = script[min(len(seen), len(script) - 1)]
+            seen.append(1)
+            return {'app': name, 'repo': repo, 'commit': self.HEAD, 'subject': 's',
+                    'stages': [{'stage': 'build', 'state': build, 'text': 'b'},
+                               {'stage': 'deploy', 'state': deploy, 'text': 'd'},
+                               {'stage': 'dev', 'state': dev, 'text': 'p'}]}
+        magehand.collect_status = collect
+        try:
+            code, out, _ = self.run_main('status', '-a', 'demo', '--watch')
+            self.assertEqual((code, len(seen)), (0, 2))  # waited one round for the pods
+            script[:] = [['ok', 'ok', 'unknown']]  # no kubectl: build and deploy decide
+            seen.clear()
+            self.assertEqual(self.run_main('status', '-a', 'demo', '--watch')[0], 0)
+            script[:] = [['ok', 'ok', 'failed']]
+            self.assertEqual(self.run_main('status', '-a', 'demo', '--watch')[0], 1)
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
+
     def status_with(self, deploy_checks=(), fail=None):
         """Run `status` through a fake gh: an app whose build and release are fine, a dev deploy PR with
         `deploy_checks`, and every query whose arguments contain `fail` (a string) failing."""
@@ -1888,7 +2002,7 @@ class Status(unittest.TestCase):
         magehand.app_here = lambda name=None: app
         stages = {'state': 'ok'}
 
-        def collect(repo, name):
+        def collect(repo, name, cluster=True):
             ok = stages['state']
             return {'app': name, 'repo': repo, 'commit': self.HEAD, 'subject': 's',
                     'stages': [{'stage': 'build', 'state': 'ok', 'text': 'success'},
