@@ -682,6 +682,17 @@ def build_stage(runs, head):
             'text': f'no image build of {head[:7]} yet (the platform starts one when no PR build has main\'s tree)'}
 
 
+def failing_checks(rollup):
+    """Names of the failed entries of a PR's statusCheckRollup: CheckRuns (conclusion, name) and
+    StatusContexts (state, context) both appear in it."""
+    names = []
+    for c in rollup or []:
+        if c.get('conclusion') in ('FAILURE', 'CANCELLED', 'TIMED_OUT', 'STARTUP_FAILURE') \
+                or c.get('state') in ('FAILURE', 'ERROR'):
+            names.append(c.get('name') or c.get('context') or '?')
+    return names
+
+
 def deploy_marks(prs):
     """[(pr, commit sha, image)] for the deploy PRs whose body carries the deploy-dev marker."""
     out = []
@@ -704,8 +715,7 @@ def deploy_stage(prs, head):
                     'image': image, 'pr': pr['number'], 'digest': digest}
         if pr.get('state') == 'CLOSED':
             return {'stage': 'deploy', 'state': 'failed', 'text': f'dev: {ref} was closed without merging'}
-        bad = [c.get('name') for c in pr.get('statusCheckRollup') or []
-               if c.get('conclusion') in ('FAILURE', 'CANCELLED', 'TIMED_OUT')]
+        bad = failing_checks(pr.get('statusCheckRollup'))
         if bad:
             return {'stage': 'deploy', 'state': 'failed', 'text': f'dev: {ref} has failing checks: {", ".join(bad)}'}
         return {'stage': 'deploy', 'state': 'pending', 'text': f'dev: {ref} open, it merges itself once its checks pass'}
@@ -789,10 +799,12 @@ def collect_status(repo, name):
     else:
         release = eligible_release(releases)
         tag, ahead = (release or {}).get('tag_name'), None
+        err = None
         if tag:
             compare, err = gh_query('api', f'repos/{repo}/compare/{tag}...main')
             ahead = None if err else compare.get('ahead_by')
-        prod = prod_stage(tag, ahead, prod_prs)
+        prod = (query_error('prod', f'the comparison of {tag} with main', err) if err
+                else prod_stage(tag, ahead, prod_prs))
     stages = [build, deploy, prod]
     if deploy['state'] == 'ok':
         stages.insert(2, {'stage': 'dev', 'state': 'unknown',

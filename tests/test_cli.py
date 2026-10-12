@@ -1821,6 +1821,66 @@ class Status(unittest.TestCase):
         self.assertIn('rate limit', report['stages'][0]['text'])
         self.assertNotIn('no ', report['stages'][2]['text'].split(':')[0])  # not "no release yet"
 
+    def status_with(self, deploy_checks=(), fail=None):
+        """Run `status` through a fake gh: an app whose build and release are fine, a dev deploy PR with
+        `deploy_checks`, and every query whose arguments contain `fail` (a string) failing."""
+        owner = magehand.OWNER
+        run = self.build_run()
+
+        def probe(*args):
+            line = ' '.join(args)
+            if fail and fail in line:
+                return 1, '', 'HTTP 403: forbidden'
+            if line.endswith('/commits/main'):
+                return 0, json.dumps({'sha': self.HEAD, 'commit': {'message': 'subject', 'tree': {'sha': 't'}}}), ''
+            if line.endswith('/pulls'):
+                return 0, '[]', ''
+            if f'/commits/{self.HEAD}' in line:
+                return 0, json.dumps({'sha': self.HEAD, 'commit': {'tree': {'sha': 't'}}}), ''
+            if '/actions/runs' in line:
+                return 0, json.dumps({'workflow_runs': [run]}), ''
+            if 'deploy-dev/' in line:
+                pr = self.pr(122, 'OPEN', checks=())
+                pr['statusCheckRollup'] = list(deploy_checks)
+                return 0, json.dumps([pr]), ''
+            if 'deploy-prod/' in line:
+                return 0, json.dumps([{'number': 120, 'state': 'MERGED',
+                                       'title': 'demo: release v1.2.0 to production'}]), ''
+            if '/releases' in line:
+                return 0, json.dumps([{'tag_name': 'v1.2.0', 'author': {'login': owner}}]), ''
+            if '/compare/' in line:
+                return 0, json.dumps({'ahead_by': 2}), ''
+            return 1, '', 'unexpected: ' + line
+        names = ('app_here', 'gh_probe')
+        before = {n: getattr(magehand, n) for n in names}
+        magehand.app_here = lambda name=None: {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.gh_probe = probe
+        try:
+            code, out, err = self.run_main('status', '-a', 'demo', '--json')
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
+        return code, json.loads(out), err
+
+    def test_a_failed_comparison_is_an_error_not_a_prod_success(self):
+        code, report, _ = self.status_with(fail='/compare/')
+        self.assertEqual(code, 1)
+        prod = report['stages'][-1]
+        self.assertEqual(prod['state'], 'error')
+        self.assertIn('comparison of v1.2.0 with main', prod['text'])
+        self.assertIn('forbidden', prod['text'])
+
+    def test_status_contexts_count_as_failing_checks(self):
+        for entry in ({'context': 'policy', 'state': 'FAILURE'}, {'context': 'policy', 'state': 'ERROR'}):
+            code, report, _ = self.status_with(deploy_checks=[entry])
+            self.assertEqual(code, 1, entry)
+            deploy = report['stages'][1]
+            self.assertEqual(deploy['state'], 'failed')
+            self.assertIn('policy', deploy['text'])
+        ok = [{'context': 'policy', 'state': 'SUCCESS'}, {'name': 'scan', 'conclusion': 'SUCCESS'}]
+        code, report, _ = self.status_with(deploy_checks=ok)
+        self.assertEqual((code, report['stages'][1]['state']), (0, 'pending'))
+
     def test_status_command_and_watch_exit_codes(self):
         names = ('app_here', 'collect_status')
         before = {n: getattr(magehand, n) for n in names}
