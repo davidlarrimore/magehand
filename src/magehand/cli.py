@@ -331,21 +331,41 @@ def bao(method, path, token=None, body=None, soft=False):
         die(f'cannot reach {OPENBAO}: {NOT_SET_UP}')
 
 
+TOKEN_CHARS = re.compile(r'^[A-Za-z0-9._~+/=-]+$')  # what an OpenBao token is made of
+_warned_env = []
+
+
+def keychain_add(token):
+    """Put the token in the macOS Keychain without it ever being an argument: `security -i` reads the
+    command from stdin, so `ps` never shows the token."""
+    if not TOKEN_CHARS.match(token):
+        die('OpenBao returned a token in a form magehand will not store; sign in again: magehand login')
+    command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a openbao-token -w {token}\n'
+    subprocess.run(['security', '-i'], input=command, text=True,  # nosec B603 B607
+                   check=True, capture_output=True)
+
+
 def store_token(token, identity):
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STATE.chmod(0o700)  # an older release made it world-readable
     if sys.platform == 'darwin':
-        subprocess.run(['security', 'add-generic-password', '-U', '-s', KEYCHAIN_SERVICE,  # nosec B603 B607
-                        '-a', 'openbao-token', '-w', token], check=True, capture_output=True)
+        keychain_add(token)
     else:
-        STATE.mkdir(parents=True, exist_ok=True)
+        # No credential store in the standard library: a file only its owner can read, never created wider.
         path = STATE / 'openbao-token'
-        path.touch(mode=0o600)
-        path.write_text(token)
-    STATE.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(token)
     (STATE / 'identity.json').write_text(json.dumps(identity))
 
 
 def saved_token():
     if os.environ.get('MAGEHAND_BAO_TOKEN'):
+        if not _warned_env:  # still honoured (it was released), but a secret in the environment is exposed
+            _warned_env.append(True)
+            print('magehand: MAGEHAND_BAO_TOKEN is deprecated and will be ignored in 1.0; '
+                  'unset it and sign in with `magehand login`', file=sys.stderr)
         return os.environ['MAGEHAND_BAO_TOKEN']
     if sys.platform == 'darwin':
         out = subprocess.run(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE,  # nosec B603 B607

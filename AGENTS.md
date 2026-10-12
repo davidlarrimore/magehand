@@ -11,8 +11,9 @@
   pods and Argo application), skipped without kubectl and by `--no-cluster`.
   Its one write is `magehand new`: an app's repo on GitHub, as the owner
   (through `gh`).
-- Secrets never touch disk or argv (`-e NAME` for docker, Keychain for the
-  token).
+- Secrets never touch argv (`-e NAME` for docker; the token goes to the
+  Keychain on stdin, `security -i`) and never touch disk, except the token's
+  0600 file off macOS, where the standard library has no credential store.
 - `check` rules: each is a mistake an app can make about the platform, with a
   guide section to point at (`see`) and a unit test. Errors only for what
   certainly breaks; anything heuristic is a warning. When the platform changes
