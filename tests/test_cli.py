@@ -1722,3 +1722,78 @@ class SignIn(unittest.TestCase):
         self.assertNotIn('secret-token', out + err)
         self.assertEqual(stored, ['secret-token'])
         self.assertIn('Sign in through authentik', err)
+
+
+class Status(unittest.TestCase):
+    """status reads GitHub only: stages from a Build run, the deploy-dev PR and the latest release."""
+
+    HEAD = 'd8b34766a6182b44b83fe9c7faeaee37b3746ba2'
+    run_main = CommandLine.run_main
+    IMAGE = 'ghcr.io/example/app@sha256:' + 'a' * 64
+
+    def pr(self, number, state, sha=None, checks=(), merged='2026-10-11T02:31:58Z', title='deploy'):
+        body = f'x\n<!-- homelab deploy-dev {sha or self.HEAD} {self.IMAGE} -->'
+        return {'number': number, 'state': state, 'mergedAt': merged if state == 'MERGED' else None,
+                'title': title, 'body': body, 'statusCheckRollup': [{'name': n, 'conclusion': c} for n, c in checks]}
+
+    def test_build_stage(self):
+        run = {'headSha': self.HEAD, 'status': 'completed', 'conclusion': 'success',
+               'startedAt': '2026-10-11T02:29:36Z', 'updatedAt': '2026-10-11T02:30:53Z'}
+        done = magehand.build_stage([run], self.HEAD, image_skipped=True)
+        self.assertEqual(done['state'], 'ok')
+        self.assertIn('1m17s', done['text'])
+        self.assertIn('reuses the image', done['text'])  # a skipped image job is explained, not alarming
+        self.assertEqual(magehand.build_stage([run], 'f' * 40)['state'], 'pending')
+        self.assertEqual(magehand.build_stage([{**run, 'conclusion': 'failure'}], self.HEAD)['state'], 'failed')
+        self.assertEqual(magehand.build_stage([{**run, 'status': 'in_progress'}], self.HEAD)['state'], 'pending')
+
+    def test_deploy_stage(self):
+        merged = magehand.deploy_stage([self.pr(122, 'MERGED')], self.HEAD)
+        self.assertEqual((merged['state'], merged['pr']), ('ok', 122))
+        self.assertIn('homelab-apps#122 merged 02:31Z', merged['text'])
+        old = self.pr(119, 'MERGED', sha='1' * 40)
+        self.assertEqual(magehand.deploy_stage([old], self.HEAD)['state'], 'pending')  # not for this commit yet
+        open_pr = self.pr(122, 'OPEN', checks=[('scan', 'SUCCESS')])
+        self.assertEqual(magehand.deploy_stage([open_pr], self.HEAD)['state'], 'pending')
+        bad = self.pr(122, 'OPEN', checks=[('validate', 'FAILURE')])
+        stage = magehand.deploy_stage([bad], self.HEAD)
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('validate', stage['text'])
+        self.assertEqual(magehand.deploy_stage([self.pr(122, 'CLOSED')], self.HEAD)['state'], 'failed')
+
+    def test_prod_stage(self):
+        prs = [{'number': 120, 'state': 'MERGED', 'title': 'elvis: release v1.2.0 to production'}]
+        stage = magehand.prod_stage('v1.2.0', 3, prs, 'elvis')
+        self.assertEqual(stage['state'], 'ok')
+        self.assertIn('3 commits on main since v1.2.0', stage['text'])
+        self.assertEqual(magehand.prod_stage(None, None, [], 'elvis')['state'], 'unknown')
+        self.assertEqual(magehand.prod_stage('v1.3.0', 0, prs, 'elvis')['state'], 'unknown')
+
+    def test_status_command_and_watch_exit_codes(self):
+        names = ('app_here', 'collect_status')
+        before = {n: getattr(magehand, n) for n in names}
+        app = {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.app_here = lambda name=None: app
+        stages = {'state': 'ok'}
+
+        def collect(repo, name):
+            ok = stages['state']
+            return {'app': name, 'repo': repo, 'commit': self.HEAD, 'subject': 's',
+                    'stages': [{'stage': 'build', 'state': 'ok', 'text': 'success'},
+                               {'stage': 'deploy', 'state': ok, 'text': 'dev'}]}
+        magehand.collect_status = collect
+        run = self.run_main
+        try:
+            code, out, _ = run('status', '-a', 'demo', '--watch')
+            self.assertEqual(code, 0)
+            self.assertIn('demo  (davidlarrimore/demo main d8b3476', out)
+            stages['state'] = 'failed'
+            self.assertEqual(run('status', '-a', 'demo', '--watch')[0], 1)
+            stages['state'] = 'pending'
+            self.assertEqual(run('status', '-a', 'demo')[0], 0)  # no --watch: a snapshot, pending is not a failure
+            code, out, _ = run('status', '-a', 'demo', '--json')
+            self.assertEqual(code, 0)
+            self.assertFalse(json.loads(out)['ok'])  # a snapshot with dev still pending
+        finally:
+            for n, v in before.items():
+                setattr(magehand, n, v)
