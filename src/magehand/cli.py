@@ -1870,15 +1870,39 @@ def cmd_runtime(a):
     print(f'Supported: {SUPPORTED}. Change: magehand runtime docker|podman|none|auto')
 
 
+# What an older magehand wrote into the state file and a newer one never does: secrets belong to the
+# containers (and are made per run), not to disk.
+STATE_SECRET_KEYS = ('password', 'value', 'secret_access_key', 'admin_token')
+
+
 def local_state(app_name):
+    """The app's local state ({block: {port, container, ...}}). A file written by an older magehand that
+    still holds a password, a generated secret value or a key's secret is cleaned on first read, and
+    rewritten, so upgrading removes them from disk (a removed block's too)."""
     path = STATE / f'{app_name}.json'
-    return json.loads(path.read_text()) if path.is_file() else {}
+    if not path.is_file():
+        return {}
+    state = json.loads(path.read_text())
+    dirty = False
+    for block, entry in list(state.items()):
+        if not isinstance(entry, dict):
+            continue
+        for key in STATE_SECRET_KEYS:
+            if key in entry:
+                del entry[key]
+                dirty = True
+        if not entry:   # a generated secret block held nothing else
+            del state[block]
+    if dirty:
+        save_local_state(app_name, state)
+    return state
 
 
 def save_local_state(app_name, data):
     STATE.mkdir(parents=True, exist_ok=True)
     path = STATE / f'{app_name}.json'
     path.touch(mode=0o600)
+    path.chmod(0o600)   # touch never narrows a file that already exists
     path.write_text(json.dumps(data, indent=1))
 
 
@@ -2145,6 +2169,8 @@ def resolve_env(app, container=False):
         if entry[1] in ('value', 'unknown'):
             continue
         var, block, kind, key = entry
+        if kind == 'secret' and not container and var in os.environ:
+            continue   # a value you set in your shell wins: it is how to keep a generated secret stable
         if kind == 'bucket' and block not in local:
             # No local object store running: keep a value supplied in .magehand.env or the shell,
             # and say how to get one when there is none (it is optional: a bucket is not needed to start).

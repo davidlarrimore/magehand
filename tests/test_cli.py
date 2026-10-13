@@ -83,6 +83,38 @@ class Plan(unittest.TestCase):
                 magehand.local_connection('postgres', 'db', LOCAL)
         self.assertIn('magehand dev down', str(caught.exception.code))
 
+    def test_an_older_state_file_loses_its_secrets_on_first_read(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(magehand, 'STATE', pathlib.Path(tmp)):
+            path = pathlib.Path(tmp) / 'demo.json'
+            path.write_text(json.dumps({
+                'db': {'password': 'oldpw', 'port': '5555'},                        # a database, old format
+                'session': {'value': 'v' * 48},                                      # a generated secret block
+                'removed': {'password': 'forgotten'},                                # a block no longer in app.yaml
+                'files': {'access_key_id': 'GK1', 'secret_access_key': 's', 'admin_token': 't', 'port': '1'}}))
+            state = magehand.local_state('demo')
+            self.assertEqual(state, {'db': {'port': '5555'}, 'files': {'access_key_id': 'GK1', 'port': '1'}})
+            on_disk = path.read_text()                                               # and it is cleaned on disk too
+            for leaked in ('oldpw', 'forgotten', 'v' * 48, '"s"', '"t"'):
+                self.assertNotIn(leaked, on_disk)
+            self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600')
+
+    def test_a_secret_set_in_the_shell_is_kept_and_unset_one_is_made_per_run(self):
+        app = {**APP, 'container': {**APP['container'], 'env': [
+            {'name': 'SESSION_KEY', 'valueFrom': {'secretKeyRef': {'name': 'session', 'key': 'value'}}}]}}
+        saved = os.environ.pop('SESSION_KEY', None)
+        try:
+            first = magehand.resolve_env(app)['SESSION_KEY']
+            second = magehand.resolve_env(app)['SESSION_KEY']
+            self.assertNotEqual(first, second)                         # unset: made for each run
+            os.environ['SESSION_KEY'] = 'shell-stable'
+            env = magehand.resolve_env(app)
+            self.assertNotIn('SESSION_KEY', env)                       # left to the shell, which the child inherits
+            self.assertEqual(os.environ['SESSION_KEY'], 'shell-stable')
+        finally:
+            os.environ.pop('SESSION_KEY', None)
+            if saved is not None:
+                os.environ['SESSION_KEY'] = saved
+
     def test_a_secret_block_is_made_for_the_run_and_kept_nowhere(self):
         one = magehand.local_connection('secret', 'session', {})['value']
         two = magehand.local_connection('secret', 'session', {})['value']
