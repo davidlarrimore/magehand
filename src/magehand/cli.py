@@ -1973,8 +1973,6 @@ def cmd_dev(a):
     for block, svc in app['services'].items():
         kind = (svc or {}).get('type')
         container = f'magehand-{app["name"]}-{block}'
-        if kind == 'secret' and action == 'up':
-            state.setdefault(block, {'value': secrets.token_urlsafe(36)[:48]})
         if kind not in ('postgres', 'redis', 'bucket'):
             continue
         if not cli:
@@ -1994,22 +1992,23 @@ def cmd_dev(a):
         if kind == 'bucket':
             local_bucket(app, block, svc, state, container, network, running)
             continue
-        if not running:
-            password = state.get(block, {}).get('password') or secrets.token_urlsafe(24)
+        # The password is the container's own environment (read back with container_env when a run needs
+        # it), never the state file: a stopped container is started again with it, a new one gets a new one.
+        if not running and engine('start', container, check=False).returncode != 0:
+            password = secrets.token_urlsafe(24)
             engine('rm', '-f', container, check=False)
             if kind == 'postgres':
                 engine('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::5432',
                        '-e', 'POSTGRES_USER=app', '-e', 'POSTGRES_DB=app', '-e', 'POSTGRES_PASSWORD',
                        block_image(kind, svc), env={'POSTGRES_PASSWORD': password})
-            else:   # the password is read from the container's own environment, not argv
+            else:   # read by sh from the container's own environment, not argv
                 engine('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::6379',
                        '-e', 'VALKEY_PASSWORD', block_image(kind, svc),
                        'sh', '-c', 'exec valkey-server --requirepass "$VALKEY_PASSWORD" --maxmemory 200mb '
                        '--maxmemory-policy allkeys-lru --appendonly yes', env={'VALKEY_PASSWORD': password})
-            state[block] = {'password': password}
         inner = '5432' if kind == 'postgres' else '6379'
         port = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
-        state[block]['port'] = port
+        state[block] = {'port': port, 'container': container}
         print(f'{block} ({kind}): 127.0.0.1:{port}')
     if not contained and action in ('up', 'status'):
         print(f"{app['name']} has no postgres/redis/bucket blocks: nothing runs locally "
@@ -2076,11 +2075,13 @@ def local_bucket(app, block, svc, state, container, network, running):
 def local_connection(kind, block, local, app_name=None):
     """A block's Secret keys for a local run: on the host (published port), or
     with app_name, from a container on the app's Docker network."""
+    if kind == 'secret':
+        # Made for this run and kept nowhere (a secret never touches disk): a session key, say, is new
+        # each run. Set the variable in your shell to keep one.
+        return {'value': secrets.token_urlsafe(36)[:48]}
     if block not in local:
         die(f'block {block} ({kind}) has no local container: run `magehand dev up`')
     conn = local[block]
-    if kind == 'secret':
-        return {'value': conn['value']}
     if kind == 'bucket':
         endpoint = f'http://magehand-{app_name}-{block}:3900' if app_name else f'http://127.0.0.1:{conn["port"]}'
         # The key's secret is not in the state file: ask the running Garage (its admin token is the
@@ -2102,7 +2103,11 @@ def local_connection(kind, block, local, app_name=None):
         if data['access'] == 'public':   # the platform's URL is the data Worker's; here it is the S3 path
             data['url'] = f'{endpoint}/{conn["bucket"]}/'
         return data
-    pw = conn['password']
+    var = 'POSTGRES_PASSWORD' if kind == 'postgres' else 'VALKEY_PASSWORD'
+    pw = container_env(conn.get('container') or f'magehand-{app_name}-{block}').get(var) if (conn.get('container') or app_name) else None
+    if not pw:
+        die(f'block {block} ({kind}): cannot read its password from the local container (an older `dev up`, '
+            'or it is gone): `magehand dev down`, then `magehand dev up`')
     inner = '5432' if kind == 'postgres' else '6379'
     host, port = (f'magehand-{app_name}-{block}', inner) if app_name else ('127.0.0.1', conn['port'])
     if kind == 'postgres':

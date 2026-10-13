@@ -36,8 +36,15 @@ APP = {
         {'name': 'OTHER', 'valueFrom': {'secretKeyRef': {'name': 'handmade', 'key': 'x'}}},
     ]},
 }
-LOCAL = {'db': {'password': 'pw', 'port': '5555'}, 'cache': {'password': 'rpw', 'port': '6666'},
-         'session': {'value': 'v' * 48}}
+# The state file holds no secret: a database's password is the container's own environment.
+LOCAL = {'db': {'port': '5555', 'container': 'magehand-demo-db'},
+         'cache': {'port': '6666', 'container': 'magehand-demo-cache'}}
+CONTAINER_ENV = {'magehand-demo-db': {'POSTGRES_PASSWORD': 'pw'}, 'magehand-demo-cache': {'VALKEY_PASSWORD': 'rpw'}}
+
+
+def container_env_fake(name):
+    return CONTAINER_ENV.get(name, {})
+
 
 
 def free_port():
@@ -61,11 +68,26 @@ class Plan(unittest.TestCase):
         self.assertEqual(magehand.app_port(no_port_env), 9000)
 
     def test_local_connection(self):
-        pg = magehand.local_connection('postgres', 'db', LOCAL)
-        self.assertEqual(pg['uri'], 'postgresql://app:pw@127.0.0.1:5555/app')
-        self.assertEqual(magehand.local_connection('redis', 'cache', LOCAL)['uri'], 'redis://:rpw@127.0.0.1:6666/0')
+        with mock.patch.object(magehand, 'container_env', container_env_fake):
+            pg = magehand.local_connection('postgres', 'db', LOCAL)
+            self.assertEqual(pg['uri'], 'postgresql://app:pw@127.0.0.1:5555/app')
+            self.assertEqual(magehand.local_connection('redis', 'cache', LOCAL)['uri'],
+                             'redis://:rpw@127.0.0.1:6666/0')
         with self.assertRaises(SystemExit):
             magehand.local_connection('postgres', 'db', {})
+
+    def test_no_password_is_in_the_state_the_connection_comes_from_the_container(self):
+        self.assertNotIn('pw', json.dumps(LOCAL))
+        with mock.patch.object(magehand, 'container_env', lambda _c: {}):    # the container is gone
+            with self.assertRaises(SystemExit) as caught:
+                magehand.local_connection('postgres', 'db', LOCAL)
+        self.assertIn('magehand dev down', str(caught.exception.code))
+
+    def test_a_secret_block_is_made_for_the_run_and_kept_nowhere(self):
+        one = magehand.local_connection('secret', 'session', {})['value']
+        two = magehand.local_connection('secret', 'session', {})['value']
+        self.assertEqual((len(one), len(two)), (48, 48))
+        self.assertNotEqual(one, two)                              # nothing persists it
 
 
 class FakeLocalGarage:
@@ -177,6 +199,26 @@ class LocalBucket(unittest.TestCase):
             self.assertIn(name, run)                       # named, as `-e NAME`
         for value in env.values():
             self.assertFalse([a for a in run if value in str(a)], 'a secret value is in argv')
+
+    def test_dev_up_records_no_secret_and_restarts_a_stopped_database(self):
+        saved, calls = {}, []
+
+        def engine(*args, check=True, env=None):
+            calls.append(args)
+            out = mock.Mock(returncode=0)
+            out.stdout = '0.0.0.0:5432\n' if args[0] == 'port' else ('false' if args[0] == 'inspect' else '')
+            if args[0] == 'start':
+                out.returncode = 0               # the container exists, stopped: it is started, not replaced
+            return out
+        app = {'name': 'demo', 'services': {'db': {'type': 'postgres'}, 'session': {'type': 'secret'}}}
+        with mock.patch.object(magehand, 'engine', engine), mock.patch.object(magehand, 'runtime', lambda: 'docker'), \
+                mock.patch.object(magehand, 'app_here', lambda _a: app), \
+                mock.patch.object(magehand, 'local_state', lambda _n: {}), \
+                mock.patch.object(magehand, 'save_local_state', lambda name, data: saved.update(data)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            magehand.cmd_dev(mock.Mock(action='up', app_flag=None, app=None))
+        self.assertEqual(saved, {'db': {'port': '5432', 'container': 'magehand-demo-db'}})   # a port, no secret
+        self.assertFalse([c for c in calls if c[0] == 'run'])                                 # started, not recreated
 
     def test_postgres_and_redis_passwords_are_not_in_argv_either(self):
         state, calls, envs = {}, [], []
@@ -644,10 +686,11 @@ class BucketConnection(unittest.TestCase):
 
 class Resolve(unittest.TestCase):
     def setUp(self):
-        self.saved = (magehand.bao, magehand.valid_token, magehand.local_state)
+        self.saved = (magehand.bao, magehand.valid_token, magehand.local_state, magehand.container_env)
         self.paths = []
         magehand.valid_token = lambda: 'tok'
         magehand.local_state = lambda _name: LOCAL
+        magehand.container_env = container_env_fake
 
         def fake_bao(method, path, token=None, body=None):
             self.paths.append(path)
@@ -658,7 +701,7 @@ class Resolve(unittest.TestCase):
         os.chdir(self.tmp.name)
 
     def tearDown(self):
-        magehand.bao, magehand.valid_token, magehand.local_state = self.saved
+        magehand.bao, magehand.valid_token, magehand.local_state, magehand.container_env = self.saved
         os.chdir(self.cwd)
         self.tmp.cleanup()
         os.environ.pop('PORT', None)
@@ -667,7 +710,7 @@ class Resolve(unittest.TestCase):
         env = magehand.resolve_env(APP)
         self.assertEqual(env['LLM_KEY'], 'sk-test')
         self.assertEqual(env['DATABASE_URL'], 'postgresql://app:pw@127.0.0.1:5555/app')
-        self.assertEqual(env['SESSION_KEY'], 'v' * 48)
+        self.assertEqual(len(env['SESSION_KEY']), 48)              # made for this run
         self.assertNotIn('OTHER', env)
         self.assertEqual(self.paths, ['apps/data/demo-dev/llm-ai'])
 
@@ -737,15 +780,16 @@ class MissingKey(unittest.TestCase):
     """No dev key in OpenBao: say why (not registered, not deployed, being created) instead of a bare 404."""
 
     def setUp(self):
-        self.saved = magehand.APPS_DIR, magehand.bao, magehand.valid_token, magehand.local_state
+        self.saved = magehand.APPS_DIR, magehand.bao, magehand.valid_token, magehand.local_state, magehand.container_env
         self.apps = tempfile.TemporaryDirectory()
         magehand.APPS_DIR = self.apps.name
         magehand.bao = lambda *_a, **_k: (404, None)
         magehand.valid_token = lambda: 'tok'
         magehand.local_state = lambda _name: LOCAL
+        magehand.container_env = container_env_fake
 
     def tearDown(self):
-        magehand.APPS_DIR, magehand.bao, magehand.valid_token, magehand.local_state = self.saved
+        magehand.APPS_DIR, magehand.bao, magehand.valid_token, magehand.local_state, magehand.container_env = self.saved
         self.apps.cleanup()
 
     def register(self, app_yaml):
