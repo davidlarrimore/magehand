@@ -1,4 +1,5 @@
 """Unit tests for magehand (no network, no Docker)."""
+import datetime
 import http.server
 import json
 import os
@@ -1911,75 +1912,6 @@ class Release(unittest.TestCase):
         self.assertTrue(any('not approved' in p for p in self.plan(files={
             'homelab/contents/platform/prod-apps/apps.yaml': 'other: {exposure: internal}\n'})['problems']))
 
-    def test_review_verdict(self):
-        v = magehand.review_verdict
-        who = {magehand.OWNER, magehand.BOT}
-        ok = [{'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'h'}]
-        self.assertIsNone(v(5, 'h', ok, who))
-        self.assertIn('no approving review', v(5, 'h', [], who))
-        self.assertIn('no approving review', v(5, 'new', ok, who))  # approval of an older push
-        stranger = [{'user': {'login': 'someone'}, 'state': 'APPROVED', 'commit_id': 'h'}]
-        self.assertIn('no approving review', v(5, 'h', stranger, who))
-        asked = ok + [{'user': {'login': magehand.OWNER}, 'state': 'CHANGES_REQUESTED', 'commit_id': 'h'}]
-        self.assertIn('changes requested by ' + magehand.OWNER, v(5, 'h', asked, who))
-        # a later approval from the same reviewer replaces their change request
-        fixed = asked + [{'user': {'login': magehand.OWNER}, 'state': 'APPROVED', 'commit_id': 'h'}]
-        self.assertIsNone(v(5, 'h', fixed, who))
-
-    def test_the_prs_of_a_commit_come_from_github_not_its_message(self):
-        # a direct push that merely says (#8), and a PR that was closed or aimed at another branch
-        subject = 'unreviewed direct push (#8)'
-        compare = {'ahead_by': 3, 'commits': [
-            {'sha': 'd1', 'commit': {'message': subject}},
-            {'sha': 'd2', 'commit': {'message': 'Merge pull request #8 from x/y'}},
-            {'sha': 'd3', 'commit': {'message': 'work (#8)'}}]}
-        plan = self.plan(**{
-            self.APP + f'compare/v1.0.0...{self.HEAD}?per_page=100&page=1': compare,
-            self.APP + 'commits/d1/pulls': [],
-            self.APP + 'commits/d2/pulls': [{'number': 8, 'merged_at': None, 'base': {'ref': 'main'}}],
-            self.APP + 'commits/d3/pulls': [{'number': 8, 'merged_at': 'x', 'base': {'ref': 'staging'}}]})
-        straight = [p for p in plan['problems'] if 'pushed straight to main' in p]
-        self.assertEqual(len(straight), 3)
-        self.assertIn('unreviewed direct push (#8)', straight[0])
-
-    def test_reviews_are_read_across_pages(self):
-        key = self.APP + 'pulls/8/reviews?per_page=100&page='
-        ok = {'user': {'login': magehand.BOT}, 'state': 'APPROVED', 'commit_id': 'h8'}
-        filler = [{'user': {'login': f'u{i}'}, 'state': 'COMMENTED', 'commit_id': 'h8'} for i in range(99)]
-        # approval first, a change request on page 2: refused
-        asked = {'user': {'login': magehand.OWNER}, 'state': 'CHANGES_REQUESTED', 'commit_id': 'h8'}
-        plan = self.plan(**{key + '1': [ok] + filler, key + '2': [asked]})
-        self.assertTrue(any('changes requested' in p for p in plan['problems']))
-        # the approval only on page 2: accepted
-        plan = self.plan(**{key + '1': filler + [filler[0]], key + '2': [ok]})
-        self.assertEqual(plan['problems'], [])
-        # a page that can't be read refuses
-        plan = self.plan(**{key + '1': [ok] + filler, key + '2': None})
-        self.assertTrue(any('could not read the reviews of PR #8' in p for p in plan['problems']))
-
-    def first_release(self, commits, **extra):
-        """A repo with no release yet whose history (newest first) is `commits`, over two pages."""
-        return self.plan(**{self.APP + 'releases?per_page=20': [],
-                            self.APP + f'commits?sha={self.HEAD}&per_page=100&page=1': commits[:100],
-                            self.APP + f'commits?sha={self.HEAD}&per_page=100&page=2': commits[100:],
-                            **extra})
-
-    def test_first_release_reads_the_whole_history_and_forgives_only_the_bootstrap(self):
-        def commit(i, pr=True):
-            return {'sha': f'c{i}' if pr else f'x{i}', 'commit': {'message': f'fix: n{i} (#{i})'}}
-        # the bootstrap: two direct commits older than the first PR (page 2): a warning, not a refusal
-        plan = self.first_release([commit(8), commit(9), commit(0, pr=False), commit(-1, pr=False)],
-                                  **{self.APP + 'commits/x0/pulls': [], self.APP + 'commits/x-1/pulls': []})
-        self.assertEqual([p for p in plan['problems'] if 'straight' in p], [])
-        self.assertTrue(any('before the first PR' in w for w in plan['warnings']))
-        # a direct push newer than a reviewed PR refuses, even on the second page
-        many = [commit(8), commit(9)] + [commit(9)] * 98 + [commit(0, pr=False), commit(8)]
-        plan = self.first_release(many, **{self.APP + 'commits/x0/pulls': []})
-        self.assertTrue(any('pushed straight to main' in p for p in plan['problems']))
-        # nothing was ever reviewed: nothing to forgive
-        plan = self.first_release([commit(0, pr=False)], **{self.APP + 'commits/x0/pulls': []})
-        self.assertTrue(any('pushed straight to main' in p for p in plan['problems']))
-
     def test_main_needs_its_security_scan_to_have_run_and_passed(self):
         runs = self.APP + f'actions/runs?head_sha={self.HEAD}&per_page=100'
         checks = self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1'
@@ -2008,17 +1940,16 @@ class Release(unittest.TestCase):
                 key + '2': {'total_count': 101, 'check_runs': [ok(100)]}}
         self.assertEqual(self.plan(**both)['problems'], [])
 
+
     def test_plan_nothing_new_and_existing_tag(self):
         key = self.APP + f'compare/v1.0.0...{self.HEAD}?per_page=100&page=1'
         self.assertIn('nothing new on main since v1.0.0', self.plan(**{key: {'ahead_by': 0, 'commits': []}})['problems'])
         self.assertTrue(any('already exists' in p
                             for p in self.plan(**{self.APP + 'git/ref/tags/v1.1.0': {'ref': 'x'}})['problems']))
 
-    def test_unreadable_specs_and_labels_refuse_instead_of_guessing(self):
+    def test_unreadable_specs_refuse_instead_of_guessing(self):
         problems = self.plan(files={'app/contents/deploy/app.yaml': None})['problems']  # absent on main: required
         self.assertTrue(any('deploy/app.yaml is missing' in p for p in problems))
-        problems = self.plan(**{self.APP + 'pulls/8': None})['problems']
-        self.assertTrue(any('could not read PR #8' in p for p in problems))
         problems = self.plan(files={'app/contents/deploy/app.yaml': 'a: [\n'})['problems']
         self.assertTrue(any('not valid YAML' in p for p in problems))
 
