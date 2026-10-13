@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -65,6 +66,254 @@ class Plan(unittest.TestCase):
         self.assertEqual(magehand.local_connection('redis', 'cache', LOCAL)['uri'], 'redis://:rpw@127.0.0.1:6666/0')
         with self.assertRaises(SystemExit):
             magehand.local_connection('postgres', 'db', {})
+
+
+class FakeLocalGarage:
+    """The local Garage's admin API, as far as magehand uses it."""
+
+    def __init__(self):
+        self.calls, self.buckets, self.role, self.keys = [], {}, None, {}
+        self.fail = set()      # operation names that answer 500
+        self.n = 0
+
+    def __call__(self, port, token, method, path, body=None):
+        op = path.split('?')[0].replace('/v2/', '')
+        query = dict(p.split('=', 1) for p in path.split('?')[1].split('&')) if '?' in path else {}
+        self.calls.append((op, body))
+        if op in self.fail:
+            return 500, None
+        if op == 'GetClusterStatus':
+            return 200, {'layoutVersion': 0, 'nodes': [{'id': 'n1', 'role': self.role}]}
+        if op == 'UpdateClusterLayout':
+            self.role = body['roles'][0]
+            return 200, {}
+        if op == 'ApplyClusterLayout':
+            return 200, {}
+        if op == 'GetBucketInfo':
+            alias = urllib.parse.unquote(query['globalAlias'])
+            return (200, {'id': self.buckets[alias]}) if alias in self.buckets else (404, None)
+        if op == 'CreateBucket':
+            self.buckets[body['globalAlias']] = 'b1'
+            return 200, {'id': 'b1'}
+        if op in ('UpdateBucket', 'AllowBucketKey'):
+            return 200, {}
+        if op == 'GetKeyInfo':
+            found = self.keys.get(query['id'])
+            return (200, {'accessKeyId': query['id'], 'secretAccessKey': found['secret']}) if found else (404, None)
+        if op == 'ListKeys':
+            return 200, [{'id': i, 'name': k['name']} for i, k in self.keys.items()]
+        if op == 'DeleteKey':
+            self.keys.pop(query['id'], None)
+            return 200, {}
+        if op == 'CreateKey':
+            self.n += 1
+            self.keys[f'GK{self.n}'] = {'name': body['name'], 'secret': f'secret{self.n}'}
+            return 200, {'accessKeyId': f'GK{self.n}', 'secretAccessKey': f'secret{self.n}'}
+        return 404, None
+
+
+class LocalBucket(unittest.TestCase):
+    """`magehand dev up` runs a Garage for a bucket block and sets it up through its admin API."""
+
+    def setUp(self):
+        self.engine_calls = []
+        self.engine_env = []
+        self.stopped = False       # a container that exists but is not running
+        self.garage = FakeLocalGarage()
+
+        self.containers = {}       # name -> the environment it was started with
+
+        def engine(*args, check=True, env=None):
+            self.engine_calls.append(args)
+            self.engine_env.append(env or {})
+            out = mock.Mock(returncode=0)
+            out.stdout = ''
+            if args[0] == 'port':
+                out.stdout = '127.0.0.1:{}\n'.format({'3900': '41000', '3903': '41003'}.get(args[-1], '0'))
+            elif args[0] == 'start':
+                out.returncode = 0 if self.stopped and args[1] in self.containers else 1
+            elif args[0] == 'run':
+                self.containers[args[args.index('--name') + 1]] = dict(env or {})
+            elif args[0] == 'rm':
+                self.containers.pop(args[-1], None)
+            elif args[0] == 'inspect':
+                out.stdout = json.dumps([f'{k}={v}' for k, v in self.containers.get(args[-1], {}).items()])
+            return out
+        self.patches = [mock.patch.object(magehand, 'engine', engine),
+                        mock.patch.object(magehand, 'garage_admin', self.garage),
+                        mock.patch.object(magehand, 'STATE', pathlib.Path(tempfile.mkdtemp()))]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+
+    def up(self, state=None, running=False, svc=None):
+        state = {} if state is None else state
+        with contextlib.redirect_stdout(io.StringIO()):
+            magehand.local_bucket({'name': 'demo'}, 'files', svc or {'type': 'bucket'}, state,
+                                  'magehand-demo-files', 'magehand-demo', running)
+        return state
+
+    def runs(self):
+        return [(a, e) for a, e in zip(self.engine_calls, self.engine_env) if a[0] == 'run']
+
+    def test_it_starts_the_pinned_garage_on_loopback_with_its_data_in_a_volume(self):
+        self.up()
+        (run, _), = self.runs()
+        self.assertIn(magehand.GARAGE_IMAGE, run)
+        self.assertIn('127.0.0.1::3900', run)             # published on loopback only
+        self.assertIn('127.0.0.1::3903', run)
+        self.assertIn('magehand-demo-files-data:/data', run)     # survives a restart, goes with `down`
+        self.assertRegex(magehand.GARAGE_IMAGE, r'@sha256:[0-9a-f]{64}$')
+
+    def test_secrets_never_appear_in_argv(self):
+        self.up()
+        (run, env), = self.runs()
+        self.assertEqual(set(env), {'GARAGE_RPC_SECRET', 'GARAGE_ADMIN_TOKEN'})
+        self.assertRegex(env['GARAGE_RPC_SECRET'], r'^[0-9a-f]{64}$')   # Garage wants 32 bytes of hex
+        for name in env:
+            self.assertIn(name, run)                       # named, as `-e NAME`
+        for value in env.values():
+            self.assertFalse([a for a in run if value in str(a)], 'a secret value is in argv')
+
+    def test_postgres_and_redis_passwords_are_not_in_argv_either(self):
+        state, calls, envs = {}, [], []
+
+        def engine(*args, check=True, env=None):
+            calls.append(args)
+            envs.append(env or {})
+            out = mock.Mock(returncode=0)
+            out.stdout = '0.0.0.0:5432\n' if args[0] == 'port' else ('false' if args[0] == 'inspect' else '')
+            return out
+        app = {'name': 'demo', 'services': {'db': {'type': 'postgres'}, 'cache': {'type': 'redis'}}}
+        with mock.patch.object(magehand, 'engine', engine), mock.patch.object(magehand, 'runtime', lambda: 'docker'), \
+                mock.patch.object(magehand, 'app_here', lambda _a: app), mock.patch.object(magehand, 'local_state',
+                                                                                          lambda _n: state), \
+                mock.patch.object(magehand, 'save_local_state', lambda *_a: None), \
+                mock.patch.object(magehand, 'block_image', lambda *_a: 'img'), contextlib.redirect_stdout(io.StringIO()):
+            magehand.cmd_dev(mock.Mock(action='up', app_flag=None, app=None))
+        for argv, env in zip(calls, envs):
+            if argv[0] == 'run':
+                self.assertTrue(env, 'a run with a password passes it through the environment')
+                for value in env.values():
+                    self.assertFalse([a for a in argv if value in str(a)], f'{argv[:6]} carries a secret in argv')
+
+    def test_it_makes_the_bucket_quota_and_a_key_limited_to_it(self):
+        state = self.up()
+        ops = [c[0] for c in self.garage.calls]
+        for op in ('UpdateClusterLayout', 'ApplyClusterLayout', 'CreateBucket', 'UpdateBucket', 'CreateKey',
+                   'AllowBucketKey'):
+            self.assertIn(op, ops)
+        quota = next(b for o, b in self.garage.calls if o == 'UpdateBucket')
+        self.assertEqual(quota['quotas']['maxSize'], magehand.GARAGE_QUOTA)
+        allow = next(b for o, b in self.garage.calls if o == 'AllowBucketKey')
+        self.assertEqual(allow['permissions'], {'read': True, 'write': True, 'owner': False})
+        self.assertEqual((state['files']['bucket'], state['files']['port'], state['files']['access_key_id']),
+                         ('demo-files', '41000', 'GK1'))
+
+    def test_a_stopped_container_is_started_again_not_replaced(self):
+        state = self.up()
+        self.engine_calls.clear()
+        self.engine_env.clear()
+        self.stopped = True                                # a reboot stopped it; its volume still holds the data
+        again = self.up(state=state, running=False)
+        self.assertEqual(self.runs(), [])                  # no new container
+        self.assertIn(('start', 'magehand-demo-files'), self.engine_calls)
+        self.assertNotIn(('rm', '-f', 'magehand-demo-files'), self.engine_calls)
+        self.assertEqual(again['files']['access_key_id'], 'GK1')        # the same key, reused
+
+    def test_a_removed_container_keeps_its_data_and_its_key_while_garage_still_has_it(self):
+        state = self.up()
+        self.containers.clear()                            # the container is gone, its volume is not
+        self.engine_calls.clear()
+        self.up(state=state, running=False)                # `start` fails: it is started fresh on the volume
+        self.assertEqual(len(self.runs()), 1)
+        self.assertIn('magehand-demo-files-data:/data', self.runs()[0][0])
+        self.assertEqual(state['files']['access_key_id'], 'GK1')    # GetKeyInfo found it: not replaced
+        self.assertEqual(len([c for c in self.garage.calls if c[0] == 'CreateKey']), 1)
+
+    def test_a_key_garage_no_longer_has_is_made_again_without_leaving_the_old_one(self):
+        state = self.up()
+        self.garage.keys.clear()                           # the volume was removed
+        self.garage.keys['GKstale'] = {'name': 'magehand:demo-files', 'secret': 'x'}
+        again = self.up(state=state, running=True)
+        self.assertNotEqual(again['files']['access_key_id'], 'GK1')
+        self.assertNotIn('GKstale', self.garage.keys)      # an earlier attempt's key is removed first
+
+    def test_a_running_store_with_a_key_is_not_set_up_again_from_scratch(self):
+        state = self.up()
+        self.garage.calls.clear()
+        self.engine_calls.clear()
+        again = self.up(state=state, running=True)
+        self.assertEqual(self.runs(), [])
+        self.assertNotIn('CreateKey', [c[0] for c in self.garage.calls])
+        self.assertEqual(again['files']['access_key_id'], 'GK1')
+
+    def test_a_running_store_we_cannot_read_a_token_from_is_started_again(self):
+        self.up(state={'files': {'access_key_id': 'GKx', 'port': '1'}}, running=True)   # unknown container
+        self.assertEqual(len(self.runs()), 1)              # no admin token to drive it with
+
+    def test_no_secret_is_written_to_the_state_file(self):
+        state = self.up()
+        token = self.containers['magehand-demo-files']['GARAGE_ADMIN_TOKEN']
+        persisted = json.dumps(state)
+        self.assertNotIn(token, persisted)
+        self.assertNotIn('secret1', persisted)             # the key's secret
+        self.assertNotIn('secret_access_key', state['files'])
+        self.assertNotIn('admin_token', state['files'])
+        # ... and a run still gets the key's secret, asked of the running Garage
+        self.assertEqual(magehand.local_connection('bucket', 'files', state)['secret_access_key'], 'secret1')
+
+    def test_a_stopped_store_is_a_dev_up_away_not_a_crash_with_a_stale_secret(self):
+        state = self.up()
+        self.containers.clear()                            # gone: nothing to ask
+        with self.assertRaises(SystemExit) as caught:
+            magehand.local_connection('bucket', 'files', state)
+        self.assertIn('magehand dev up', str(caught.exception.code))
+
+    def test_the_longest_app_and_block_names_still_fit_garage_bucket_names(self):
+        app, block = 'a' * 40, 'b' * 30
+        name = magehand.local_bucket_name(app, block)
+        self.assertLessEqual(len(name), 63)
+        self.assertRegex(name, r'^[a-z0-9][a-z0-9-]*[a-z0-9]$')
+        self.assertEqual(name, magehand.local_bucket_name(app, block))        # stable
+        self.assertNotEqual(name, magehand.local_bucket_name(app, 'b' * 29 + 'c'))   # collision-resistant
+        self.assertEqual(magehand.local_bucket_name('demo', 'files'), 'demo-files')   # short names are as before
+
+    def test_every_setup_step_is_checked_and_a_retry_repairs_it(self):
+        for op in ('UpdateClusterLayout', 'ApplyClusterLayout', 'CreateBucket', 'UpdateBucket', 'CreateKey',
+                   'AllowBucketKey'):
+            garage = self.garage = FakeLocalGarage()
+            magehand.garage_admin = garage                 # the patch holds the first fake: point it at this one
+            garage.fail = {op}
+            state = {}
+            with self.assertRaises(SystemExit, msg=op):
+                self.up(state=state)
+            self.assertEqual(state, {}, f'{op}: a failed setup must not record a key')
+            garage.fail = set()
+            again = self.up(state=state)                   # the retry completes
+            self.assertTrue(again['files']['access_key_id'], op)
+            self.assertEqual(len([k for k in garage.keys.values() if k['name'] == 'magehand:demo-files']), 1, op)
+
+    def test_the_connection_matches_the_platforms_keys(self):
+        state = self.up(svc={'type': 'bucket', 'access': 'public'})
+        host = magehand.local_connection('bucket', 'files', state)
+        self.assertEqual(set(host), {'endpoint', 'bucket', 'access_key_id', 'secret_access_key', 'region',
+                                     'access', 'path_style', 'url'})
+        self.assertEqual((host['endpoint'], host['region'], host['path_style']),
+                         ('http://127.0.0.1:41000', 'garage', 'true'))
+        pod = magehand.local_connection('bucket', 'files', state, app_name='demo')
+        self.assertEqual(pod['endpoint'], 'http://magehand-demo-files:3900')
+        private = magehand.local_connection('bucket', 'files', self.up(svc={'type': 'bucket'}))
+        self.assertNotIn('url', private)                  # only a public bucket has a url
+
+    def test_the_builtin_schema_knows_path_style_and_the_public_only_url(self):
+        spec = magehand.block_spec({}, 'bucket')           # no catalog: the fallback
+        self.assertIn('path_style', spec['keys'])
+        self.assertIn('url', spec['keys'])
+        self.assertEqual(spec['key_options'], {'url': 'access'})
 
 
 class Resolve(unittest.TestCase):
@@ -130,13 +379,26 @@ class Resolve(unittest.TestCase):
             os.environ.pop('S3_ENDPOINT')
         self.assertNotIn('S3_ENDPOINT', env)   # the shell's value reaches the app on its own
 
-    def test_bucket_without_a_value_warns_instead_of_asking_for_dev_up(self):
+    def test_bucket_without_a_local_store_warns_and_does_not_stop(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            env = magehand.resolve_env(self.bucket_app())   # no SystemExit
+            env = magehand.resolve_env(self.bucket_app())   # no SystemExit: a bucket is not needed to start
         self.assertNotIn('S3_ENDPOINT', env)
-        self.assertIn('no local object store yet', err.getvalue())
-        self.assertNotIn('dev up', err.getvalue())
+        self.assertIn('no local object store', err.getvalue())
+        self.assertIn('magehand dev up', err.getvalue())
+
+    def test_bucket_with_a_local_store_gets_its_keys(self):
+        local = {**LOCAL, 'files': {'port': '4444', 'admin_port': '4445', 'bucket': 'demo-files',
+                                    'access_key_id': 'GKx', 'container': 'magehand-demo-files',
+                                    'access': 'private'}}   # no secret on disk: it is asked of Garage
+        asked = lambda port, token, method, path, body=None: (200, {'secretAccessKey': 's3cret'})  # noqa: E731
+        with mock.patch.object(magehand, 'local_state', lambda _n: local), \
+                mock.patch.object(magehand, 'container_env', lambda _c: {'GARAGE_ADMIN_TOKEN': 't'}), \
+                mock.patch.object(magehand, 'garage_admin', asked):
+            env = magehand.resolve_env(self.bucket_app())
+            self.assertEqual(env['S3_ENDPOINT'], 'http://127.0.0.1:4444')
+            env = magehand.resolve_env(self.bucket_app(), container=True)   # over the app's Docker network
+            self.assertEqual(env['S3_ENDPOINT'], 'http://magehand-demo-files:3900')
 
     def test_missing_key_fails(self):
         bad = {**APP, 'container': {'env': [
@@ -440,6 +702,21 @@ class CheckManifests(unittest.TestCase):
         catalog = dict(CATALOG, blocks=dict(CATALOG['blocks'], postgres={'keys': ['url']}))
         app = check_app([ref('DB', 'db-connection', 'url')], services={'db': {'type': 'postgres'}})
         self.assertEqual(magehand.check_manifests(app, catalog), [])
+
+    def test_bucket_blocks_are_validated_against_the_catalog(self):
+        catalog = dict(CATALOG, blocks=dict(CATALOG['blocks'], bucket={
+            'access_values': ['public', 'private', 'internal'], 'writer_values': ['openclaw']}))
+
+        def errors(name='files', **svc):
+            app = check_app([], services={name: dict({'type': 'bucket'}, **svc)})
+            return ' | '.join(texts(magehand.check_manifests(app, catalog), 'error'))
+        self.assertEqual(errors(access='internal'), '')
+        self.assertEqual(errors(access='public', writers=['openclaw']), '')
+        self.assertIn("access 'secret' not offered", errors(access='secret'))
+        self.assertIn('writers must be a list', errors(writers=['mallory']))
+        self.assertIn('writers must be a list', errors(writers='openclaw'))
+        self.assertIn('not available on an internal bucket', errors(access='internal', writers=['openclaw']))
+        self.assertIn('a bucket name is lowercase', errors(name='My_Files'))
 
     def test_model_type_size_and_image(self):
         app = check_app([], services={'ai': {'type': 'llm', 'models': ['nope']}, 'db': {'type': 'postgres', 'size': '9Gi'},
