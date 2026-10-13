@@ -3333,6 +3333,7 @@ class Parser(argparse.ArgumentParser):
 
 S3_MAX_BODY = 256 * 1024 * 1024   # one request, held in memory: a bigger file is `sync`'s to split later
 BUCKET_ENVS = ('local', 'dev', 'prod')
+BUCKET_CAP_BYTES = 10**9   # the platform's per-bucket cap; it alerts at 80% and 100%
 FILES_HOST = 'files.davidlarrimore.com'
 
 
@@ -3492,10 +3493,61 @@ def bucket_env(a):
     return a.env or 'dev'
 
 
+def bucket_app(named=None):
+    """The app of the checkout you are in: `magehand bucket` works on that app's buckets and nothing else.
+    `--app` stays for scripts that name their own app; another app is refused, as `run` refuses its keys."""
+    here = app_repo_here()
+    if not here:
+        die("run `magehand bucket` inside the app's repo: it works on the buckets of the app whose code this is "
+            "(`magehand app` shows them)")
+    if named and named != here:
+        die(f"this checkout is {here}'s code: `magehand bucket` works only on {here}'s buckets, not {named}'s. "
+            f'Run it from {named}\'s own repo')
+    return app_here(here)
+
+
+def bucket_usage(app, blocks, env):
+    """Per bucket block: objects, bytes and the share of the 1 GB cap. An internal bucket is only
+    reachable locally; asked for by name it is an error, found by sweeping it is reported as unreachable."""
+    rows = []
+    for block, explicit in blocks:
+        row = {'bucket': block, 'env': env, 'access': (bucket_blocks(app)[block] or {}).get('access') or 'private',
+               'cap_bytes': BUCKET_CAP_BYTES}
+        if env != 'local' and row['access'] == 'internal' and not explicit:
+            row['error'] = 'internal: reachable only with --env local'
+        else:
+            objects, _ = bucket_list(bucket_connection(app, block, env), '', delimiter='')
+            row['objects'] = len(objects)
+            row['bytes'] = sum(size for _, size, _, _ in objects)
+            row['percent'] = round(100 * row['bytes'] / BUCKET_CAP_BYTES, 1)
+        rows.append(row)
+    return rows
+
+
 def cmd_bucket(a):
-    app = app_here(a.app_flag)
+    app = bucket_app(a.app_flag)
     env = bucket_env(a)
     action = a.bucket_action
+    if action == 'usage':
+        names = sorted(bucket_blocks(app))
+        if a.target:
+            block, _ = bucket_target(app, a.target)
+            blocks = [(block, True)]
+        elif names:
+            blocks = [(n, False) for n in names]
+        else:
+            die(f'{app["name"]} has no bucket blocks: request one with `type: bucket` in app.yaml')
+        rows = bucket_usage(app, blocks, env)
+        if a.json:
+            print(json.dumps({'app': app['name'], 'env': env, 'buckets': rows}, indent=1))
+            return
+        for row in rows:
+            if 'error' in row:
+                print(f'{row["bucket"]}: {row["error"]}')
+                continue
+            print(f'{row["bucket"]} ({env}, {row["access"]}): {row["objects"]} objects, {row["bytes"]} bytes '
+                  f'({row["percent"]}% of the {BUCKET_CAP_BYTES // 10**6} MB cap)')
+        return
     if action == 'ls':
         block, prefix = bucket_target(app, a.target)
         conn = bucket_connection(app, block, env)
@@ -3785,7 +3837,9 @@ def build_parser():
     app_option(p)
     runtime_option(p)
     p = command('bucket', cmd_bucket, "list, copy, sync and link an app's object storage", "read and write the app's `bucket` blocks with the keys the platform hands the app",
-                'BUCKET is a bucket block of the app (a service of type bucket in app.yaml). --env picks where:\n'
+                'Works only on the app whose repo you are in (--app may name it, never another). BUCKET is one of its\n'
+                'bucket blocks\n'
+                '(a service of type bucket in app.yaml). --env picks where:\n'
                 'dev (default) and prod read the keys from OpenBao (`magehand login`); local uses the Garage\n'
                 '`magehand dev up` started. An internal bucket exists only in the cluster, so use --env local.\n'
                 'Prod writes are yours to decide: --env prod uploads to real data.\n\n'
@@ -3796,9 +3850,11 @@ def build_parser():
                 '  magehand bucket cp files/data/latest.json ./latest.json\n'
                 '  magehand bucket sync ./site files/site   upload what changed (no deletes)\n'
                 '  magehand bucket url files/data/latest.json   the public URL (access: public)\n'
+                '  magehand bucket usage                    objects and bytes of each bucket against the cap\n'
                 '  magehand bucket cp ./files/x files/x     a local path that starts with a bucket name: ./\n'
                 '  magehand bucket --env local ls files     against the local store')
-    p.add_argument('-a', '--app', dest='app_flag', metavar='APP', help='the app (default: the app repo you are in)')
+    p.add_argument('-a', '--app', dest='app_flag', metavar='APP',
+                   help="the app of this checkout (kept for scripts; another app is refused)")
     p.add_argument('--env', choices=BUCKET_ENVS, help='local, dev (default) or prod')
     bsub = p.add_subparsers(dest='bucket_action', metavar='ACTION', required=True, parser_class=Parser)
     q = bsub.add_parser('ls', help='list objects')
@@ -3817,6 +3873,9 @@ def build_parser():
     q.add_argument('--dry-run', action='store_true', help='say what would be uploaded')
     q.add_argument('--cache-control', help='Cache-Control to store with each object')
     q.add_argument('--json', action='store_true', help='print a JSON object (progress goes to stderr)')
+    q = bsub.add_parser('usage', help='objects and bytes against the 1 GB cap')
+    q.add_argument('target', nargs='?', metavar='BUCKET', help='one bucket block (default: all of the app\'s)')
+    q.add_argument('--json', action='store_true', help='print JSON')
     q = bsub.add_parser('url', help='the public URL of an object')
     q.add_argument('target', metavar='BUCKET/KEY')
     q.add_argument('--json', action='store_true', help='print a JSON object')
