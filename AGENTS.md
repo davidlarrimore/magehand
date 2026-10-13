@@ -15,7 +15,7 @@
   are `magehand new` (an app's repo on GitHub) and `magehand release` (a tag
   and release on an app's repo), both as the owner through `gh`, and
   `magehand bucket cp` / `sync`, which put objects into that app's own
-  bucket only (the app of the checkout you are in; there is no `--app`), on an explicit command, with the keys of the environment
+  bucket only (the app of the checkout you are in; `--app` may only name it), on an explicit command, with the keys of the environment
   asked for (`--env prod` writes production data), and never delete.
 - Secrets never touch argv (`-e NAME` for docker; the token goes to the
   Keychain on stdin, `security -i`) and never touch disk, except the token's

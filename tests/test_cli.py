@@ -569,10 +569,9 @@ class BucketCommands(unittest.TestCase):
     def test_only_the_app_of_this_checkout(self):
         with mock.patch.object(magehand, 'app_repo_here', lambda: None):
             self.assertIn("inside the app's repo", self.die('ls', 'files'))
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            magehand.build_parser().parse_args(['bucket', '--app', 'other', 'ls', 'files'])
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            magehand.build_parser().parse_args(['bucket', '-a', 'other', 'ls', 'files'])
+        for flag in ('--app', '-a'):
+            self.assertIn("works only on demo's buckets, not other's", self.die(flag, 'other', 'ls', 'files'))
+            self.assertIn('files', self.run_cmd(flag, 'demo', 'usage'))   # its own app: still accepted
 
     def test_context_is_the_checkouts_app(self):
         seen = []

@@ -3493,13 +3493,16 @@ def bucket_env(a):
     return a.env or 'dev'
 
 
-def bucket_app():
-    """The app of the checkout you are in: `magehand bucket` works on that app's buckets and nothing else
-    (no --app, as `run` refuses another app's keys)."""
+def bucket_app(named=None):
+    """The app of the checkout you are in: `magehand bucket` works on that app's buckets and nothing else.
+    `--app` stays for scripts that name their own app; another app is refused, as `run` refuses its keys."""
     here = app_repo_here()
     if not here:
         die("run `magehand bucket` inside the app's repo: it works on the buckets of the app whose code this is "
             "(`magehand app` shows them)")
+    if named and named != here:
+        die(f"this checkout is {here}'s code: `magehand bucket` works only on {here}'s buckets, not {named}'s. "
+            f'Run it from {named}\'s own repo')
     return app_here(here)
 
 
@@ -3522,7 +3525,7 @@ def bucket_usage(app, blocks, env):
 
 
 def cmd_bucket(a):
-    app = bucket_app()
+    app = bucket_app(a.app_flag)
     env = bucket_env(a)
     action = a.bucket_action
     if action == 'usage':
@@ -3834,7 +3837,8 @@ def build_parser():
     app_option(p)
     runtime_option(p)
     p = command('bucket', cmd_bucket, "list, copy, sync and link an app's object storage", "read and write the app's `bucket` blocks with the keys the platform hands the app",
-                'Works only on the app whose repo you are in; there is no --app. BUCKET is one of its bucket blocks\n'
+                'Works only on the app whose repo you are in (--app may name it, never another). BUCKET is one of its\n'
+                'bucket blocks\n'
                 '(a service of type bucket in app.yaml). --env picks where:\n'
                 'dev (default) and prod read the keys from OpenBao (`magehand login`); local uses the Garage\n'
                 '`magehand dev up` started. An internal bucket exists only in the cluster, so use --env local.\n'
@@ -3849,6 +3853,8 @@ def build_parser():
                 '  magehand bucket usage                    objects and bytes of each bucket against the cap\n'
                 '  magehand bucket cp ./files/x files/x     a local path that starts with a bucket name: ./\n'
                 '  magehand bucket --env local ls files     against the local store')
+    p.add_argument('-a', '--app', dest='app_flag', metavar='APP',
+                   help="the app of this checkout (kept for scripts; another app is refused)")
     p.add_argument('--env', choices=BUCKET_ENVS, help='local, dev (default) or prod')
     bsub = p.add_subparsers(dest='bucket_action', metavar='ACTION', required=True, parser_class=Parser)
     q = bsub.add_parser('ls', help='list objects')
