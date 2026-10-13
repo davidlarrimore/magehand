@@ -1806,13 +1806,16 @@ def no_runtime(what):
             'whose blocks are llm and secret only.')
 
 
-def engine(*args, check=True):
+def engine(*args, check=True, env=None):
+    """Run the container CLI. Secret values go in `env` and are named in args as `-e NAME`: docker
+    reads them from its own environment, so they never appear in argv."""
     cli = runtime()
     if not cli:
         die(no_runtime('this'))
     if not shutil.which(cli):
         die(f'container runtime {cli} is configured but not installed: `magehand runtime auto` or install it')
-    return subprocess.run([cli, *args], capture_output=True, text=True, check=check)  # nosec B603  # docker/podman
+    return subprocess.run([cli, *args], capture_output=True, text=True, check=check,  # nosec B603  # docker/podman
+                          env={**os.environ, **env} if env else None)
 
 
 def save_config(**changes):
@@ -1891,8 +1894,10 @@ def garage_admin(port, token, method, path, body=None):
         return error.code, None
 
 
-def garage_setup(port, token, bucket, wait=30):
-    """Layout, bucket, quota and key on a fresh local Garage; (access key id, secret)."""
+def garage_setup(port, token, bucket, key_id=None, wait=30):
+    """Layout, bucket, quota and a key limited to it on the local Garage; (access key id, secret).
+    Every step is checked and the whole is idempotent, so a half-finished setup is repaired by
+    running `dev up` again. A key that already works (key_id) is reused."""
     deadline = time.time() + wait
     while True:
         try:
@@ -1904,24 +1909,45 @@ def garage_setup(port, token, bucket, wait=30):
         if time.time() > deadline:
             die('the local object store did not start (check `docker logs`)')
         time.sleep(0.5)
+
+    def need(result, what):
+        if result[0] not in (200, 204):
+            die(f'local object store: {what} failed (HTTP {result[0]}); run `magehand dev up` again, '
+                'or `magehand dev down` to start clean')
+        return result[1]
     node = cluster['nodes'][0]
     if not node.get('role'):
-        garage_admin(port, token, 'POST', '/v2/UpdateClusterLayout',
-                     {'roles': [{'id': node['id'], 'zone': 'local', 'capacity': 10 * 1024 ** 3, 'tags': []}]})
-        garage_admin(port, token, 'POST', '/v2/ApplyClusterLayout', {'version': (cluster.get('layoutVersion') or 0) + 1})
-    status, info = garage_admin(port, token, 'POST', '/v2/CreateBucket', {'globalAlias': bucket})
-    if status != 200:
-        status, info = garage_admin(port, token, 'GET', f'/v2/GetBucketInfo?globalAlias={urllib.parse.quote(bucket)}')
-    if status != 200 or not info:
-        die(f'could not make the local bucket {bucket} (HTTP {status})')
-    garage_admin(port, token, 'POST', f'/v2/UpdateBucket?id={info["id"]}',
-                 {'quotas': {'maxSize': GARAGE_QUOTA, 'maxObjects': None}})
-    status, key = garage_admin(port, token, 'POST', '/v2/CreateKey', {'name': f'magehand:{bucket}'})
-    if status != 200 or not key or not key.get('secretAccessKey'):
-        die(f'could not make a local key (HTTP {status})')
-    garage_admin(port, token, 'POST', '/v2/AllowBucketKey', {
+        need(garage_admin(port, token, 'POST', '/v2/UpdateClusterLayout',
+                          {'roles': [{'id': node['id'], 'zone': 'local', 'capacity': 10 * 1024 ** 3, 'tags': []}]}),
+             'staging the layout')
+        need(garage_admin(port, token, 'POST', '/v2/ApplyClusterLayout',
+                          {'version': (cluster.get('layoutVersion') or 0) + 1}), 'applying the layout')
+    status, info = garage_admin(port, token, 'GET', f'/v2/GetBucketInfo?globalAlias={urllib.parse.quote(bucket)}')
+    if status == 404:
+        info = need(garage_admin(port, token, 'POST', '/v2/CreateBucket', {'globalAlias': bucket}), 'making the bucket')
+    elif status != 200:
+        die(f'local object store: reading the bucket failed (HTTP {status})')
+    need(garage_admin(port, token, 'POST', f'/v2/UpdateBucket?id={info["id"]}',
+                      {'quotas': {'maxSize': GARAGE_QUOTA, 'maxObjects': None}}), 'setting the quota')
+    name = f'magehand:{bucket}'
+    key = None
+    if key_id:   # the recorded key, if this Garage still has it (its volume may have been removed)
+        status, found = garage_admin(port, token, 'GET',
+                                     f'/v2/GetKeyInfo?id={urllib.parse.quote(key_id)}&showSecretKey=true')
+        if status == 200 and found and found.get('secretAccessKey'):
+            key = found
+    if key is None:
+        listed = need(garage_admin(port, token, 'GET', '/v2/ListKeys'), 'listing keys') or []
+        for old in listed:   # a key from an earlier, half-finished attempt
+            if old.get('name') == name:
+                need(garage_admin(port, token, 'POST', f'/v2/DeleteKey?id={urllib.parse.quote(old["id"])}'),
+                     'removing an old key')
+        key = need(garage_admin(port, token, 'POST', '/v2/CreateKey', {'name': name}), 'making a key')
+        if not key or not key.get('secretAccessKey'):
+            die('local object store: it returned no key secret')
+    need(garage_admin(port, token, 'POST', '/v2/AllowBucketKey', {
         'bucketId': info['id'], 'accessKeyId': key['accessKeyId'],
-        'permissions': {'read': True, 'write': True, 'owner': False}})
+        'permissions': {'read': True, 'write': True, 'owner': False}}), 'allowing the key on the bucket')
     return key['accessKeyId'], key['secretAccessKey']
 
 
@@ -1948,6 +1974,8 @@ def cmd_dev(a):
             continue
         if action == 'down':
             engine('rm', '-f', '-v', container, check=False)
+            if kind == 'bucket':
+                engine('volume', 'rm', '-f', f'{container}-data', check=False)
             state.pop(block, None)
             print(f'{block}: removed')
             continue
@@ -1963,13 +1991,13 @@ def cmd_dev(a):
             engine('rm', '-f', container, check=False)
             if kind == 'postgres':
                 engine('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::5432',
-                       '-e', 'POSTGRES_USER=app',
-                       '-e', 'POSTGRES_DB=app', '-e', f'POSTGRES_PASSWORD={password}', block_image(kind, svc))
-            else:
+                       '-e', 'POSTGRES_USER=app', '-e', 'POSTGRES_DB=app', '-e', 'POSTGRES_PASSWORD',
+                       block_image(kind, svc), env={'POSTGRES_PASSWORD': password})
+            else:   # the password is read from the container's own environment, not argv
                 engine('run', '-d', '--name', container, '--network', network, '-p', '127.0.0.1::6379',
-                       block_image(kind, svc),
-                       'valkey-server', '--requirepass', password, '--maxmemory', '200mb',
-                       '--maxmemory-policy', 'allkeys-lru', '--appendonly', 'yes')
+                       '-e', 'VALKEY_PASSWORD', block_image(kind, svc),
+                       'sh', '-c', 'exec valkey-server --requirepass "$VALKEY_PASSWORD" --maxmemory 200mb '
+                       '--maxmemory-policy allkeys-lru --appendonly yes', env={'VALKEY_PASSWORD': password})
             state[block] = {'password': password}
         inner = '5432' if kind == 'postgres' else '6379'
         port = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
@@ -1987,31 +2015,33 @@ def cmd_dev(a):
 
 
 def local_bucket(app, block, svc, state, container, network, running):
-    """Start (or keep) the app's local Garage for one bucket block and record how to reach it."""
-    token = state.get(block, {}).get('admin_token') or secrets.token_urlsafe(24)
-    bucket = f'{app["name"]}-{block}'
+    """Start (or keep) the app's local Garage for one bucket block and record how to reach it.
+    Its data is a named volume that only `dev down` removes, so a stopped container (a reboot) is
+    started again with its objects, and the recorded key is reused while Garage still has it."""
     mine = state.get(block, {})
-    if running and not mine.get('admin_token'):
+    token = mine.get('admin_token')
+    bucket = f'{app["name"]}-{block}'
+    if running and not token:
         running = False   # state was lost: its admin token is unknown, so start it again
     if not running:
-        engine('rm', '-f', container, check=False)
-        STATE.mkdir(parents=True, exist_ok=True)
-        config = STATE / f'{app["name"]}-{block}-garage.toml'
-        config.write_text(GARAGE_CONFIG)
-        engine('run', '-d', '--name', container, '--network', network,
-               '-p', '127.0.0.1::3900', '-p', '127.0.0.1::3903',
-               '-v', f'{config}:/etc/garage.toml:ro',
-               '-e', f'GARAGE_RPC_SECRET={secrets.token_hex(32)}', '-e', f'GARAGE_ADMIN_TOKEN={token}',
-               GARAGE_IMAGE, '/garage', 'server')
-        mine = {}   # a new container is empty: its key is new too
+        started = bool(token) and engine('start', container, check=False).returncode == 0
+        if not started:
+            token = secrets.token_urlsafe(24)
+            engine('rm', '-f', container, check=False)
+            STATE.mkdir(parents=True, exist_ok=True)
+            config = STATE / f'{app["name"]}-{block}-garage.toml'
+            config.write_text(GARAGE_CONFIG)
+            engine('run', '-d', '--name', container, '--network', network,
+                   '-p', '127.0.0.1::3900', '-p', '127.0.0.1::3903',
+                   '-v', f'{config}:/etc/garage.toml:ro', '-v', f'{container}-data:/data',
+                   '-e', 'GARAGE_RPC_SECRET', '-e', 'GARAGE_ADMIN_TOKEN', GARAGE_IMAGE, '/garage', 'server',
+                   env={'GARAGE_RPC_SECRET': secrets.token_hex(32), 'GARAGE_ADMIN_TOKEN': token})
     published = {}
     for inner, label in (('3900', 'port'), ('3903', 'admin_port')):
         published[label] = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
-    if not mine.get('access_key_id'):
-        key_id, secret = garage_setup(published['admin_port'], token, bucket)
-        mine = {'access_key_id': key_id, 'secret_access_key': secret}
-    state[block] = {**mine, **published, 'admin_token': token, 'bucket': bucket,
-                    'access': (svc or {}).get('access') or 'private'}
+    key_id, secret = garage_setup(published['admin_port'], token, bucket, key_id=mine.get('access_key_id'))
+    state[block] = {'access_key_id': key_id, 'secret_access_key': secret, **published, 'admin_token': token,
+                    'bucket': bucket, 'access': (svc or {}).get('access') or 'private'}
     print(f'{block} (bucket): http://127.0.0.1:{published["port"]}/{bucket}  (local Garage)')
 
 
@@ -2328,7 +2358,9 @@ BLOCK_KEYS = {
     'redis': {'keys': ['host', 'port', 'password', 'uri']},
     'secret': {'keys': ['value']},
     'llm': {'keys': ['api_key', 'base_url', 'models', 'search_url'], 'key_options': {'search_url': 'search'}},
-    'bucket': {'keys': ['endpoint', 'bucket', 'access_key_id', 'secret_access_key', 'region', 'access']},
+    'bucket': {'keys': ['endpoint', 'bucket', 'access_key_id', 'secret_access_key', 'region', 'access',
+                        'path_style', 'url'],
+               'key_options': {'url': 'access'}},   # url exists only for access: public (ENUM_OPTION_VALUES)
 }
 # key_options naming an enumerated option: the value that makes the key exist (a boolean option needs true).
 ENUM_OPTION_VALUES = {'access': 'public'}
@@ -3369,9 +3401,12 @@ def build_parser():
     p.add_argument('--min', type=int, default=SIGNIN_WARN // 60, metavar='N',
                    help='with --check: minutes that must remain (default: %(default)s)')
     json_option(p)
-    p = command('dev', cmd_dev, 'local postgres/redis blocks: up, down, status', "start, stop or show local containers for the app's postgres/redis blocks",
+    p = command('dev', cmd_dev, 'local postgres/redis/bucket blocks: up, down, status', "start, stop or show local containers for the app's postgres/redis/bucket blocks",
                 'Also makes local values for secret blocks. llm keys need nothing here: they come from\n'
                 'OpenBao when the app runs.\n\n'
+                'A bucket block runs the platform\'s own Garage (one container, its data in a volume that\n'
+                'survives a restart and goes only with `down`), with one bucket capped at 1 GB and a key limited\n'
+                'to it. A public bucket\'s local `url` is the S3 path: it needs the key (no anonymous reads).\n\n'
                 'examples:\n  magehand dev up\n  magehand dev            (status)\n'
                 '  magehand dev down       (deletes the local data)')
     p.add_argument('action', nargs='?', default='status', choices=('up', 'down', 'status'),
