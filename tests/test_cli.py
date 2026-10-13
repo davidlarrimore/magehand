@@ -1,6 +1,8 @@
 """Unit tests for magehand (no network, no Docker)."""
+import contextlib
 import datetime
 import http.server
+import io
 import json
 import os
 import pathlib
@@ -109,6 +111,32 @@ class Resolve(unittest.TestCase):
         self.assertEqual(env['PORT'], '8000')
         self.assertEqual(env['DATABASE_URL'], 'postgresql://app:pw@magehand-demo-db:5432/app')
         self.assertEqual(env['REDIS_URL'], 'redis://:rpw@magehand-demo-cache:6379/0')
+
+    def bucket_app(self):
+        return {**APP, 'services': {**APP['services'], 'files': {'type': 'bucket'}},
+                'container': {'env': [{'name': 'S3_ENDPOINT',
+                                       'valueFrom': {'secretKeyRef': {'name': 'files-connection', 'key': 'endpoint'}}}]}}
+
+    def test_bucket_value_from_magehand_env_is_kept(self):
+        pathlib.Path('.magehand.env').write_text('S3_ENDPOINT=http://127.0.0.1:9000\n')
+        env = magehand.resolve_env(self.bucket_app())
+        self.assertEqual(env['S3_ENDPOINT'], 'http://127.0.0.1:9000')
+
+    def test_bucket_value_from_the_shell_is_not_blocked(self):
+        os.environ['S3_ENDPOINT'] = 'http://127.0.0.1:9000'
+        try:
+            env = magehand.resolve_env(self.bucket_app())   # no SystemExit
+        finally:
+            os.environ.pop('S3_ENDPOINT')
+        self.assertNotIn('S3_ENDPOINT', env)   # the shell's value reaches the app on its own
+
+    def test_bucket_without_a_value_warns_instead_of_asking_for_dev_up(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            env = magehand.resolve_env(self.bucket_app())   # no SystemExit
+        self.assertNotIn('S3_ENDPOINT', env)
+        self.assertIn('no local object store yet', err.getvalue())
+        self.assertNotIn('dev up', err.getvalue())
 
     def test_missing_key_fails(self):
         bad = {**APP, 'container': {'env': [

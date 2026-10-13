@@ -1962,6 +1962,13 @@ def resolve_env(app, container=False):
         if entry[1] in ('value', 'unknown'):
             continue
         var, block, kind, key = entry
+        if kind == 'bucket':
+            # No local object store yet (magehand#32): keep a value supplied in .magehand.env or the
+            # shell, say so when there is none, and never ask for a `dev up` that cannot create one.
+            if var not in env and var not in os.environ:
+                print(f'magehand: {var}: bucket block {block} has no local object store yet; set {var} in '
+                      '.magehand.env (or your shell) to a local or mock S3 value', file=sys.stderr)
+            continue
         if block not in fetched:
             if kind == 'llm':
                 token = token or valid_token()
