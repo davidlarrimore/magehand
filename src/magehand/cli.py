@@ -54,7 +54,8 @@ PROXY_PORT = int(os.environ.get('MAGEHAND_PROXY_PORT', '8080'))
 # Block type -> the Secret its chart hands over (platform/building-blocks/*).
 NOT_SET_UP = "this machine isn't set up for the homelab: run `magehand setup`"
 RESOLVER = pathlib.Path('/etc/resolver') / LAB
-SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}'}
+SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}',
+               'bucket': '{}-connection'}
 # A homelab-apps checkout to read instead of GitHub (CI has one; `magehand check --apps-dir`).
 APPS_DIR = os.environ.get('MAGEHAND_APPS_DIR')
 
@@ -2213,7 +2214,10 @@ BLOCK_KEYS = {
     'redis': {'keys': ['host', 'port', 'password', 'uri']},
     'secret': {'keys': ['value']},
     'llm': {'keys': ['api_key', 'base_url', 'models', 'search_url'], 'key_options': {'search_url': 'search'}},
+    'bucket': {'keys': ['endpoint', 'bucket', 'access_key_id', 'secret_access_key', 'region', 'access']},
 }
+# key_options naming an enumerated option: the value that makes the key exist (a boolean option needs true).
+ENUM_OPTION_VALUES = {'access': 'public'}
 CODE_SUFFIXES = ('.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.go', '.rb', '.php', '.java', '.kt', '.rs')
 SKIP_DIRS = {'.git', 'node_modules', '.venv', 'venv', '__pycache__', 'dist', 'build', '.next', 'vendor', 'target',
              'tests', 'test', '__tests__', 'spec', 'e2e', 'ui-fixtures', 'fixtures'}
@@ -2376,9 +2380,11 @@ def check_manifests(app, catalog):
             found.append(finding('error', deployment_file, f'env {var}: block {block} ({kind}) has no '
                                  f'key {key!r}; keys: {", ".join(spec["keys"])}', 'blocks'))
         option = spec['key_options'].get(key)
-        if option and (app['services'].get(block) or {}).get(option) is not True:
+        wanted = ENUM_OPTION_VALUES.get(option, True)
+        if option and (app['services'].get(block) or {}).get(option) != wanted:
+            shown = f'{option}: {"true" if wanted is True else wanted}'
             found.append(finding('error', deployment_file, f'env {var}: key {key} exists only with '
-                                 f'`{option}: true` on block {block}; without it the pod waits forever',
+                                 f'`{shown}` on block {block}; without it the pod waits forever',
                                  'blocks "Web search"' if option == 'search' else 'blocks'))
     for source in container.get('envFrom') or []:
         found.append(finding('warning', deployment_file, f'envFrom {source}: map each variable with '

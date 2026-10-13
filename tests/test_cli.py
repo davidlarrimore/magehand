@@ -327,7 +327,7 @@ def check_app(env, services=None, image='ghcr.io/davidlarrimore/homelab-apps/dem
             'container': {'image': image, 'env': env}}
 
 
-CATALOG = {'blocks': {'postgres': {'sizes': ['1Gi', '2Gi']}, 'redis': {}, 'secret': {}, 'llm': {}},
+CATALOG = {'blocks': {'postgres': {'sizes': ['1Gi', '2Gi']}, 'redis': {}, 'secret': {}, 'llm': {}, 'bucket': {}},
            'models': [{'id': 'm1'}]}
 
 
@@ -349,6 +349,33 @@ class CheckManifests(unittest.TestCase):
         self.assertIn('search: true', texts(magehand.check_manifests(app, CATALOG), 'error')[0])
         app['services']['ai']['search'] = True
         self.assertEqual(magehand.check_manifests(app, CATALOG), [])
+
+    def bucket_app(self, env, **service):
+        return check_app(env, services={'files': dict({'type': 'bucket'}, **service)})
+
+    def test_bucket_keys_map_to_the_connection_secret(self):
+        env = [ref(var, 'files-connection', key) for var, key in
+               [('S3_ENDPOINT', 'endpoint'), ('S3_BUCKET', 'bucket'), ('S3_KEY', 'access_key_id'),
+                ('S3_SECRET', 'secret_access_key'), ('S3_REGION', 'region')]]
+        self.assertEqual(magehand.check_manifests(self.bucket_app(env, access='private'), CATALOG), [])
+
+    def test_bucket_unknown_key(self):
+        found = magehand.check_manifests(self.bucket_app([ref('X', 'files-connection', 'password')]), CATALOG)
+        self.assertIn("has no key 'password'", texts(found, 'error')[0])
+
+    def test_bucket_url_needs_access_public(self):
+        catalog = {'blocks': {'bucket': {'keys': ['endpoint', 'url'], 'key_options': {'url': 'access'}}}}
+        env = [ref('PUBLIC_URL', 'files-connection', 'url')]
+        for service in ({}, {'access': 'private'}):
+            found = magehand.check_manifests(self.bucket_app(env, **service), catalog)
+            self.assertIn('`access: public`', texts(found, 'error')[0])
+        self.assertEqual(magehand.check_manifests(self.bucket_app(env, access='public'), catalog), [])
+
+    def test_boolean_key_option_still_needs_true(self):
+        # an enumerated option's rule must not loosen the boolean ones
+        app = check_app([ref('SEARCH', 'ai-connection', 'search_url')])
+        app['services']['ai']['search'] = False
+        self.assertIn('search: true', texts(magehand.check_manifests(app, CATALOG), 'error')[0])
 
     def test_optional_block_key(self):
         app = check_app([ref('LLM_KEY', 'ai-connection', 'api_key', optional=True)])
