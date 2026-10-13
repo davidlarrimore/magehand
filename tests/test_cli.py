@@ -542,6 +542,7 @@ class BucketCommands(unittest.TestCase):
         self.patches = [mock.patch.object(magehand, 'app_here', lambda name=None: {
                             'name': 'demo', 'services': {'files': {'type': 'bucket', 'access': self.access},
                                                          'db': {'type': 'postgres'}}}),
+                        mock.patch.object(magehand, 'app_repo_here', lambda: 'demo'),
                         mock.patch.object(magehand, 'bucket_connection', lambda app, block, env: self.conn)]
         for p in self.patches:
             p.start()
@@ -564,6 +565,40 @@ class BucketCommands(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self.run_cmd(*argv)
         return str(caught.exception.code)
+
+    def test_only_the_app_of_this_checkout(self):
+        with mock.patch.object(magehand, 'app_repo_here', lambda: None):
+            self.assertIn("inside the app's repo", self.die('ls', 'files'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            magehand.build_parser().parse_args(['bucket', '--app', 'other', 'ls', 'files'])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            magehand.build_parser().parse_args(['bucket', '-a', 'other', 'ls', 'files'])
+
+    def test_context_is_the_checkouts_app(self):
+        seen = []
+        with mock.patch.object(magehand, 'app_repo_here', lambda: 'mine'), \
+                mock.patch.object(magehand, 'app_here', lambda name=None: seen.append(name) or
+                                  {'name': 'mine', 'services': {'files': {'type': 'bucket'}}}):
+            self.run_cmd('usage', '--json')
+        self.assertEqual(seen, ['mine'])
+
+    def test_usage(self):
+        FakeS3.store['a/one.txt'] = (b'x' * 300, 'text/plain')
+        FakeS3.store['b.txt'] = (b'y' * 200, 'text/plain')
+        data = json.loads(self.run_cmd('usage', '--json'))
+        row = data['buckets'][0]
+        self.assertEqual((data['app'], row['bucket'], row['objects'], row['bytes'], row['percent']),
+                         ('demo', 'files', 2, 500, 0.0))
+        self.assertEqual(row['cap_bytes'], 10**9)
+        self.assertIn('2 objects, 500 bytes', self.run_cmd('usage', 'files'))
+
+    def test_usage_unknown_bucket_and_none(self):
+        self.assertIn('not a bucket block', self.die('usage', 'db'))
+        self.access = 'internal'
+        out = self.run_cmd('--env', 'dev', 'usage')
+        self.assertIn('internal: reachable only with --env local', out)
+        # asked for by name, the connection error is the answer (the mocked connection allows it here)
+        self.assertIn('files', self.run_cmd('--env', 'local', 'usage'))
 
     def test_the_signer_reproduces_awss_published_s3_example(self):
         import datetime, hashlib
