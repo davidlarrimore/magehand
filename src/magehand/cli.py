@@ -1893,6 +1893,10 @@ def local_state(app_name):
                 dirty = True
         if not entry:   # a generated secret block held nothing else
             del state[block]
+        elif 'port' in entry and 'container' not in entry:
+            # an older state named no container, and the password now lives in it: its name is fixed
+            entry['container'] = f'magehand-{app_name}-{block}'
+            dirty = True
     if dirty:
         save_local_state(app_name, state)
     return state
@@ -2096,9 +2100,11 @@ def local_bucket(app, block, svc, state, container, network, running):
     print(f'{block} (bucket): http://127.0.0.1:{published["port"]}/{bucket}  (local Garage)')
 
 
-def local_connection(kind, block, local, app_name=None):
+def local_connection(kind, block, local, app_name=None, app=None):
     """A block's Secret keys for a local run: on the host (published port), or
-    with app_name, from a container on the app's Docker network."""
+    with app_name, from a container on the app's Docker network. `app` is the app's name when it is
+    needed to find the container (it is fixed: magehand-APP-BLOCK) and the run is on the host."""
+    app = app or app_name
     if kind == 'secret':
         # Made for this run and kept nowhere (a secret never touches disk): a session key, say, is new
         # each run. Set the variable in your shell to keep one.
@@ -2110,7 +2116,7 @@ def local_connection(kind, block, local, app_name=None):
         endpoint = f'http://magehand-{app_name}-{block}:3900' if app_name else f'http://127.0.0.1:{conn["port"]}'
         # The key's secret is not in the state file: ask the running Garage (its admin token is the
         # container's environment). A stopped or removed store is a `dev up` away.
-        token = container_env(conn.get('container') or f'magehand-{app_name}-{block}').get('GARAGE_ADMIN_TOKEN')
+        token = container_env(conn.get('container') or f'magehand-{app}-{block}').get('GARAGE_ADMIN_TOKEN')
         found = None
         if token:
             try:
@@ -2128,10 +2134,13 @@ def local_connection(kind, block, local, app_name=None):
             data['url'] = f'{endpoint}/{conn["bucket"]}/'
         return data
     var = 'POSTGRES_PASSWORD' if kind == 'postgres' else 'VALKEY_PASSWORD'
-    pw = container_env(conn.get('container') or f'magehand-{app_name}-{block}').get(var) if (conn.get('container') or app_name) else None
+    container = conn.get('container') or (f'magehand-{app}-{block}' if app else None)
+    pw = container_env(container).get(var) if container else None
     if not pw:
-        die(f'block {block} ({kind}): cannot read its password from the local container (an older `dev up`, '
-            'or it is gone): `magehand dev down`, then `magehand dev up`')
+        die(f'block {block} ({kind}): cannot read its password from the local container {container or "(unknown)"}: '
+            'run `magehand dev up` (it starts a stopped one and refreshes this state). If it still cannot be '
+            'read (a container from a much older magehand, or it is gone), `magehand dev down` then `dev up` '
+            'makes a new one and deletes the local data')
     inner = '5432' if kind == 'postgres' else '6379'
     host, port = (f'magehand-{app_name}-{block}', inner) if app_name else ('127.0.0.1', conn['port'])
     if kind == 'postgres':
@@ -2189,7 +2198,8 @@ def resolve_env(app, container=False):
                     die(f'cannot read {path} (HTTP {status}); `magehand login` and try again')
                 fetched[block] = body['data']['data']
             else:
-                fetched[block] = local_connection(kind, block, local, app['name'] if container else None)
+                fetched[block] = local_connection(kind, block, local, app['name'] if container else None,
+                                                  app=app['name'])
         if key not in fetched[block]:
             die(f'{var}: block {block} has no key {key!r} (keys: {", ".join(sorted(fetched[block]))})')
         env[var] = str(fetched[block][key])
@@ -3412,7 +3422,7 @@ def bucket_connection(app, block, env):
         local = local_state(app['name'])
         if block not in local:
             die(f'block {block} has no local object store: run `magehand dev up` (or use --env dev)')
-        return local_connection('bucket', block, local)
+        return local_connection('bucket', block, local, app=app['name'])
     namespace = f'{app["name"]}-dev' if env == 'dev' else app['name']
     if access == 'internal':
         die(f'{block} is an internal bucket: it exists only inside the cluster, so it cannot be reached from '

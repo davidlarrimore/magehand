@@ -92,11 +92,50 @@ class Plan(unittest.TestCase):
                 'removed': {'password': 'forgotten'},                                # a block no longer in app.yaml
                 'files': {'access_key_id': 'GK1', 'secret_access_key': 's', 'admin_token': 't', 'port': '1'}}))
             state = magehand.local_state('demo')
-            self.assertEqual(state, {'db': {'port': '5555'}, 'files': {'access_key_id': 'GK1', 'port': '1'}})
+            self.assertEqual(state, {'db': {'port': '5555', 'container': 'magehand-demo-db'},
+                                     'files': {'access_key_id': 'GK1', 'port': '1',
+                                               'container': 'magehand-demo-files'}})
             on_disk = path.read_text()                                               # and it is cleaned on disk too
             for leaked in ('oldpw', 'forgotten', 'v' * 48, '"s"', '"t"'):
                 self.assertNotIn(leaked, on_disk)
             self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600')
+
+    def test_a_host_run_right_after_upgrading_uses_the_existing_containers_password(self):
+        # the legacy state named no container; the password is already in the healthy container's
+        # environment, so nothing needs to be reset (and `dev down` would delete the data)
+        asked = []
+
+        def env(name):
+            asked.append(name)
+            return CONTAINER_ENV.get(name, {})
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(magehand, 'STATE', pathlib.Path(tmp)), \
+                mock.patch.object(magehand, 'container_env', env):
+            (pathlib.Path(tmp) / 'demo.json').write_text(json.dumps({
+                'db': {'password': 'legacy-pw', 'port': '5555'}, 'cache': {'password': 'legacy-rpw', 'port': '6666'}}))
+            app = {**APP, 'container': {**APP['container'], 'env': [
+                {'name': 'DATABASE_URL', 'valueFrom': {'secretKeyRef': {'name': 'db-connection', 'key': 'uri'}}},
+                {'name': 'REDIS_URL', 'valueFrom': {'secretKeyRef': {'name': 'cache-connection', 'key': 'uri'}}}]}}
+            resolved = magehand.resolve_env(app)
+            self.assertEqual(resolved['DATABASE_URL'], 'postgresql://app:pw@127.0.0.1:5555/app')
+            self.assertEqual(resolved['REDIS_URL'], 'redis://:rpw@127.0.0.1:6666/0')
+            self.assertEqual(sorted(set(asked)), ['magehand-demo-cache', 'magehand-demo-db'])
+            self.assertNotIn('legacy', (pathlib.Path(tmp) / 'demo.json').read_text())
+            self.assertIn('magehand-demo-db', (pathlib.Path(tmp) / 'demo.json').read_text())   # migrated name
+
+    def test_the_container_is_found_from_the_app_name_when_the_state_names_none(self):
+        # independent of the migration: a host run knows the app, and the container name is fixed
+        with mock.patch.object(magehand, 'container_env', container_env_fake):
+            conn = magehand.local_connection('postgres', 'db', {'db': {'port': '5555'}}, app='demo')
+        self.assertEqual((conn['password'], conn['host'], conn['port']), ('pw', '127.0.0.1', '5555'))
+
+    def test_an_unreadable_password_recommends_dev_up_before_a_reset(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(magehand, 'STATE', pathlib.Path(tmp)), \
+                mock.patch.object(magehand, 'container_env', lambda _c: {}):
+            with self.assertRaises(SystemExit) as caught:
+                magehand.local_connection('postgres', 'db', {'db': {'port': '5555'}}, app='demo')
+        message = str(caught.exception.code)
+        self.assertLess(message.index('magehand dev up'), message.index('magehand dev down'))
+        self.assertIn('deletes the local data', message)
 
     def test_a_secret_set_in_the_shell_is_kept_and_unset_one_is_made_per_run(self):
         app = {**APP, 'container': {**APP['container'], 'env': [
