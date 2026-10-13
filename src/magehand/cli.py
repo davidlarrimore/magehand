@@ -18,6 +18,7 @@ import argparse
 import base64
 import datetime
 import difflib
+import hashlib
 import http.client
 import http.server
 import json
@@ -2014,34 +2015,54 @@ def cmd_dev(a):
             engine('network', 'rm', network, check=False)
 
 
+def local_bucket_name(app_name, block):
+    """The bucket's name on the local Garage: <app>-<block>, bounded to Garage's 63 characters
+    (an app name is up to 40 and a block up to 30) with a stable hash when it must be cut."""
+    name = f'{app_name}-{block}'
+    if len(name) <= 63:
+        return name
+    return f'{name[:52].rstrip("-")}-{hashlib.sha256(name.encode()).hexdigest()[:10]}'
+
+
+def container_env(container):
+    """The environment a container was started with ({} if it does not exist). The admin token
+    lives only there: it is read back when needed, never written to the state file."""
+    out = engine('inspect', '-f', '{{json .Config.Env}}', container, check=False)
+    try:
+        return dict(item.split('=', 1) for item in json.loads(out.stdout or '[]') if '=' in item)
+    except ValueError:
+        return {}
+
+
 def local_bucket(app, block, svc, state, container, network, running):
     """Start (or keep) the app's local Garage for one bucket block and record how to reach it.
     Its data is a named volume that only `dev down` removes, so a stopped container (a reboot) is
-    started again with its objects, and the recorded key is reused while Garage still has it."""
+    started again with its objects, and the key is reused while Garage still has it. No secret is
+    kept in the state file: the admin token is the container's own environment and the key's
+    secret is asked of Garage when a run needs it (see local_connection)."""
     mine = state.get(block, {})
-    token = mine.get('admin_token')
-    bucket = f'{app["name"]}-{block}'
-    if running and not token:
-        running = False   # state was lost: its admin token is unknown, so start it again
-    if not running:
-        started = bool(token) and engine('start', container, check=False).returncode == 0
-        if not started:
-            token = secrets.token_urlsafe(24)
-            engine('rm', '-f', container, check=False)
-            STATE.mkdir(parents=True, exist_ok=True)
-            config = STATE / f'{app["name"]}-{block}-garage.toml'
-            config.write_text(GARAGE_CONFIG)
-            engine('run', '-d', '--name', container, '--network', network,
-                   '-p', '127.0.0.1::3900', '-p', '127.0.0.1::3903',
-                   '-v', f'{config}:/etc/garage.toml:ro', '-v', f'{container}-data:/data',
-                   '-e', 'GARAGE_RPC_SECRET', '-e', 'GARAGE_ADMIN_TOKEN', GARAGE_IMAGE, '/garage', 'server',
-                   env={'GARAGE_RPC_SECRET': secrets.token_hex(32), 'GARAGE_ADMIN_TOKEN': token})
+    bucket = local_bucket_name(app['name'], block)
+    if running and not container_env(container).get('GARAGE_ADMIN_TOKEN'):
+        running = False   # not ours (or gone): start it again
+    if not running and engine('start', container, check=False).returncode != 0:
+        engine('rm', '-f', container, check=False)
+        STATE.mkdir(parents=True, exist_ok=True)
+        config = STATE / f'{app["name"]}-{block}-garage.toml'
+        config.write_text(GARAGE_CONFIG)
+        engine('run', '-d', '--name', container, '--network', network,
+               '-p', '127.0.0.1::3900', '-p', '127.0.0.1::3903',
+               '-v', f'{config}:/etc/garage.toml:ro', '-v', f'{container}-data:/data',
+               '-e', 'GARAGE_RPC_SECRET', '-e', 'GARAGE_ADMIN_TOKEN', GARAGE_IMAGE, '/garage', 'server',
+               env={'GARAGE_RPC_SECRET': secrets.token_hex(32), 'GARAGE_ADMIN_TOKEN': secrets.token_urlsafe(24)})
+    token = container_env(container).get('GARAGE_ADMIN_TOKEN')
+    if not token:
+        die(f'cannot read the local object store\'s admin token from {container}: `magehand dev down` and up again')
     published = {}
     for inner, label in (('3900', 'port'), ('3903', 'admin_port')):
         published[label] = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
-    key_id, secret = garage_setup(published['admin_port'], token, bucket, key_id=mine.get('access_key_id'))
-    state[block] = {'access_key_id': key_id, 'secret_access_key': secret, **published, 'admin_token': token,
-                    'bucket': bucket, 'access': (svc or {}).get('access') or 'private'}
+    key_id, _secret = garage_setup(published['admin_port'], token, bucket, key_id=mine.get('access_key_id'))
+    state[block] = {'access_key_id': key_id, **published, 'bucket': bucket, 'container': container,
+                    'access': (svc or {}).get('access') or 'private'}
     print(f'{block} (bucket): http://127.0.0.1:{published["port"]}/{bucket}  (local Garage)')
 
 
@@ -2055,8 +2076,21 @@ def local_connection(kind, block, local, app_name=None):
         return {'value': conn['value']}
     if kind == 'bucket':
         endpoint = f'http://magehand-{app_name}-{block}:3900' if app_name else f'http://127.0.0.1:{conn["port"]}'
+        # The key's secret is not in the state file: ask the running Garage (its admin token is the
+        # container's environment). A stopped or removed store is a `dev up` away.
+        token = container_env(conn.get('container') or f'magehand-{app_name}-{block}').get('GARAGE_ADMIN_TOKEN')
+        found = None
+        if token:
+            try:
+                status, found = garage_admin(conn['admin_port'], token, 'GET',
+                                             f'/v2/GetKeyInfo?id={urllib.parse.quote(conn["access_key_id"])}'
+                                             '&showSecretKey=true')
+            except OSError:
+                status, found = 0, None
+        if not found or not found.get('secretAccessKey'):
+            die(f'block {block} (bucket): the local object store is not running: `magehand dev up`')
         data = {'endpoint': endpoint, 'bucket': conn['bucket'], 'access_key_id': conn['access_key_id'],
-                'secret_access_key': conn['secret_access_key'], 'region': 'garage',
+                'secret_access_key': found['secretAccessKey'], 'region': 'garage',
                 'access': conn.get('access', 'private'), 'path_style': 'true'}
         if data['access'] == 'public':   # the platform's URL is the data Worker's; here it is the S3 path
             data['url'] = f'{endpoint}/{conn["bucket"]}/'

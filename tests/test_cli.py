@@ -121,14 +121,23 @@ class LocalBucket(unittest.TestCase):
         self.stopped = False       # a container that exists but is not running
         self.garage = FakeLocalGarage()
 
+        self.containers = {}       # name -> the environment it was started with
+
         def engine(*args, check=True, env=None):
             self.engine_calls.append(args)
             self.engine_env.append(env or {})
             out = mock.Mock(returncode=0)
-            out.stdout = '127.0.0.1:{}\n'.format({'3900': '41000', '3903': '41003'}.get(args[-1], '0')) \
-                if args and args[0] == 'port' else ''
-            if args and args[0] == 'start':
-                out.returncode = 0 if self.stopped else 1
+            out.stdout = ''
+            if args[0] == 'port':
+                out.stdout = '127.0.0.1:{}\n'.format({'3900': '41000', '3903': '41003'}.get(args[-1], '0'))
+            elif args[0] == 'start':
+                out.returncode = 0 if self.stopped and args[1] in self.containers else 1
+            elif args[0] == 'run':
+                self.containers[args[args.index('--name') + 1]] = dict(env or {})
+            elif args[0] == 'rm':
+                self.containers.pop(args[-1], None)
+            elif args[0] == 'inspect':
+                out.stdout = json.dumps([f'{k}={v}' for k, v in self.containers.get(args[-1], {}).items()])
             return out
         self.patches = [mock.patch.object(magehand, 'engine', engine),
                         mock.patch.object(magehand, 'garage_admin', self.garage),
@@ -214,12 +223,12 @@ class LocalBucket(unittest.TestCase):
         self.assertIn(('start', 'magehand-demo-files'), self.engine_calls)
         self.assertNotIn(('rm', '-f', 'magehand-demo-files'), self.engine_calls)
         self.assertEqual(again['files']['access_key_id'], 'GK1')        # the same key, reused
-        self.assertEqual(again['files']['admin_token'], state['files']['admin_token'])
 
     def test_a_removed_container_keeps_its_data_and_its_key_while_garage_still_has_it(self):
         state = self.up()
+        self.containers.clear()                            # the container is gone, its volume is not
         self.engine_calls.clear()
-        self.up(state=state, running=False)                # `start` fails: the container is gone, the volume is not
+        self.up(state=state, running=False)                # `start` fails: it is started fresh on the volume
         self.assertEqual(len(self.runs()), 1)
         self.assertIn('magehand-demo-files-data:/data', self.runs()[0][0])
         self.assertEqual(state['files']['access_key_id'], 'GK1')    # GetKeyInfo found it: not replaced
@@ -242,9 +251,36 @@ class LocalBucket(unittest.TestCase):
         self.assertNotIn('CreateKey', [c[0] for c in self.garage.calls])
         self.assertEqual(again['files']['access_key_id'], 'GK1')
 
-    def test_a_running_store_whose_state_was_lost_is_started_again(self):
-        self.up(state={'files': {'access_key_id': 'GKx', 'secret_access_key': 's', 'port': '1'}}, running=True)
-        self.assertEqual(len(self.runs()), 1)              # no admin token: it cannot be driven
+    def test_a_running_store_we_cannot_read_a_token_from_is_started_again(self):
+        self.up(state={'files': {'access_key_id': 'GKx', 'port': '1'}}, running=True)   # unknown container
+        self.assertEqual(len(self.runs()), 1)              # no admin token to drive it with
+
+    def test_no_secret_is_written_to_the_state_file(self):
+        state = self.up()
+        token = self.containers['magehand-demo-files']['GARAGE_ADMIN_TOKEN']
+        persisted = json.dumps(state)
+        self.assertNotIn(token, persisted)
+        self.assertNotIn('secret1', persisted)             # the key's secret
+        self.assertNotIn('secret_access_key', state['files'])
+        self.assertNotIn('admin_token', state['files'])
+        # ... and a run still gets the key's secret, asked of the running Garage
+        self.assertEqual(magehand.local_connection('bucket', 'files', state)['secret_access_key'], 'secret1')
+
+    def test_a_stopped_store_is_a_dev_up_away_not_a_crash_with_a_stale_secret(self):
+        state = self.up()
+        self.containers.clear()                            # gone: nothing to ask
+        with self.assertRaises(SystemExit) as caught:
+            magehand.local_connection('bucket', 'files', state)
+        self.assertIn('magehand dev up', str(caught.exception.code))
+
+    def test_the_longest_app_and_block_names_still_fit_garage_bucket_names(self):
+        app, block = 'a' * 40, 'b' * 30
+        name = magehand.local_bucket_name(app, block)
+        self.assertLessEqual(len(name), 63)
+        self.assertRegex(name, r'^[a-z0-9][a-z0-9-]*[a-z0-9]$')
+        self.assertEqual(name, magehand.local_bucket_name(app, block))        # stable
+        self.assertNotEqual(name, magehand.local_bucket_name(app, 'b' * 29 + 'c'))   # collision-resistant
+        self.assertEqual(magehand.local_bucket_name('demo', 'files'), 'demo-files')   # short names are as before
 
     def test_every_setup_step_is_checked_and_a_retry_repairs_it(self):
         for op in ('UpdateClusterLayout', 'ApplyClusterLayout', 'CreateBucket', 'UpdateBucket', 'CreateKey',
@@ -258,7 +294,7 @@ class LocalBucket(unittest.TestCase):
             self.assertEqual(state, {}, f'{op}: a failed setup must not record a key')
             garage.fail = set()
             again = self.up(state=state)                   # the retry completes
-            self.assertTrue(again['files']['secret_access_key'], op)
+            self.assertTrue(again['files']['access_key_id'], op)
             self.assertEqual(len([k for k in garage.keys.values() if k['name'] == 'magehand:demo-files']), 1, op)
 
     def test_the_connection_matches_the_platforms_keys(self):
@@ -352,9 +388,13 @@ class Resolve(unittest.TestCase):
         self.assertIn('magehand dev up', err.getvalue())
 
     def test_bucket_with_a_local_store_gets_its_keys(self):
-        local = {**LOCAL, 'files': {'port': '4444', 'bucket': 'demo-files', 'access_key_id': 'GKx',
-                                    'secret_access_key': 's3cret', 'access': 'private'}}
-        with mock.patch.object(magehand, 'local_state', lambda _n: local):
+        local = {**LOCAL, 'files': {'port': '4444', 'admin_port': '4445', 'bucket': 'demo-files',
+                                    'access_key_id': 'GKx', 'container': 'magehand-demo-files',
+                                    'access': 'private'}}   # no secret on disk: it is asked of Garage
+        asked = lambda port, token, method, path, body=None: (200, {'secretAccessKey': 's3cret'})  # noqa: E731
+        with mock.patch.object(magehand, 'local_state', lambda _n: local), \
+                mock.patch.object(magehand, 'container_env', lambda _c: {'GARAGE_ADMIN_TOKEN': 't'}), \
+                mock.patch.object(magehand, 'garage_admin', asked):
             env = magehand.resolve_env(self.bucket_app())
             self.assertEqual(env['S3_ENDPOINT'], 'http://127.0.0.1:4444')
             env = magehand.resolve_env(self.bucket_app(), container=True)   # over the app's Docker network
