@@ -56,6 +56,26 @@ NOT_SET_UP = "this machine isn't set up for the homelab: run `magehand setup`"
 RESOLVER = pathlib.Path('/etc/resolver') / LAB
 SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}',
                'bucket': '{}-connection'}
+# Local object storage for `bucket` blocks: the same Garage the platform runs for `internal`
+# buckets (one node, in a container, one bucket and key per block), so code written against it
+# works in the cluster. Pinned by digest; Garage's admin API sets it up (the image has no shell).
+GARAGE_IMAGE = ('dxflrs/garage:v2.4.1@sha256:'
+                '9c96caa2612d3411acc5b0e6701fb238dbfba33e533a6d7d3d811a4b12d0d020')
+GARAGE_CONFIG = '''metadata_dir = "/data/meta"
+data_dir = "/data/data"
+db_engine = "sqlite"
+replication_factor = 1
+rpc_bind_addr = "127.0.0.1:3901"
+rpc_public_addr = "127.0.0.1:3901"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+
+[admin]
+api_bind_addr = "[::]:3903"
+'''
+GARAGE_QUOTA = 1_000_000_000   # the platform's per-bucket cap, so a local run hits it too
 # A homelab-apps checkout to read instead of GitHub (CI has one; `magehand check --apps-dir`).
 APPS_DIR = os.environ.get('MAGEHAND_APPS_DIR')
 
@@ -1858,12 +1878,59 @@ def block_image(kind, svc):
     return values['image']
 
 
+def garage_admin(port, token, method, path, body=None):
+    """(status, JSON or None) from the local Garage's admin API on 127.0.0.1:port."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=data, method=method,
+                                 headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310  # 127.0.0.1, a container we started
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw.strip() else {})
+    except urllib.error.HTTPError as error:
+        return error.code, None
+
+
+def garage_setup(port, token, bucket, wait=30):
+    """Layout, bucket, quota and key on a fresh local Garage; (access key id, secret)."""
+    deadline = time.time() + wait
+    while True:
+        try:
+            status, cluster = garage_admin(port, token, 'GET', '/v2/GetClusterStatus')
+        except OSError:
+            status, cluster = 0, None
+        if status == 200 and cluster and cluster.get('nodes'):
+            break
+        if time.time() > deadline:
+            die('the local object store did not start (check `docker logs`)')
+        time.sleep(0.5)
+    node = cluster['nodes'][0]
+    if not node.get('role'):
+        garage_admin(port, token, 'POST', '/v2/UpdateClusterLayout',
+                     {'roles': [{'id': node['id'], 'zone': 'local', 'capacity': 10 * 1024 ** 3, 'tags': []}]})
+        garage_admin(port, token, 'POST', '/v2/ApplyClusterLayout', {'version': (cluster.get('layoutVersion') or 0) + 1})
+    status, info = garage_admin(port, token, 'POST', '/v2/CreateBucket', {'globalAlias': bucket})
+    if status != 200:
+        status, info = garage_admin(port, token, 'GET', f'/v2/GetBucketInfo?globalAlias={urllib.parse.quote(bucket)}')
+    if status != 200 or not info:
+        die(f'could not make the local bucket {bucket} (HTTP {status})')
+    garage_admin(port, token, 'POST', f'/v2/UpdateBucket?id={info["id"]}',
+                 {'quotas': {'maxSize': GARAGE_QUOTA, 'maxObjects': None}})
+    status, key = garage_admin(port, token, 'POST', '/v2/CreateKey', {'name': f'magehand:{bucket}'})
+    if status != 200 or not key or not key.get('secretAccessKey'):
+        die(f'could not make a local key (HTTP {status})')
+    garage_admin(port, token, 'POST', '/v2/AllowBucketKey', {
+        'bucketId': info['id'], 'accessKeyId': key['accessKeyId'],
+        'permissions': {'read': True, 'write': True, 'owner': False}})
+    return key['accessKeyId'], key['secretAccessKey']
+
+
 def cmd_dev(a):
     action = a.action
     app = app_here(a.app_flag or a.app)
     state = local_state(app['name'])
     network = f'magehand-{app["name"]}'
-    contained = [b for b, svc in app['services'].items() if (svc or {}).get('type') in ('postgres', 'redis')]
+    contained = [b for b, svc in app['services'].items() if (svc or {}).get('type') in ('postgres', 'redis', 'bucket')]
     cli = runtime() if contained else None
     if action == 'up' and contained and not cli:
         die(no_runtime(f'the local {", ".join(contained)} block' + ('s' if len(contained) > 1 else '')))
@@ -1874,7 +1941,7 @@ def cmd_dev(a):
         container = f'magehand-{app["name"]}-{block}'
         if kind == 'secret' and action == 'up':
             state.setdefault(block, {'value': secrets.token_urlsafe(36)[:48]})
-        if kind not in ('postgres', 'redis'):
+        if kind not in ('postgres', 'redis', 'bucket'):
             continue
         if not cli:
             print(f'{block} ({kind}): no container runtime')
@@ -1887,6 +1954,9 @@ def cmd_dev(a):
         running = engine('inspect', '-f', '{{.State.Running}}', container, check=False).stdout.strip() == 'true'
         if action == 'status':
             print(f'{block} ({kind}): {"running" if running else "not running"}')
+            continue
+        if kind == 'bucket':
+            local_bucket(app, block, svc, state, container, network, running)
             continue
         if not running:
             password = state.get(block, {}).get('password') or secrets.token_urlsafe(24)
@@ -1906,7 +1976,7 @@ def cmd_dev(a):
         state[block]['port'] = port
         print(f'{block} ({kind}): 127.0.0.1:{port}')
     if not contained and action in ('up', 'status'):
-        print(f"{app['name']} has no postgres/redis blocks: nothing runs locally "
+        print(f"{app['name']} has no postgres/redis/bucket blocks: nothing runs locally "
               '(llm keys come from OpenBao when the app runs)')
     if action == 'up':
         save_local_state(app['name'], state)
@@ -1914,6 +1984,35 @@ def cmd_dev(a):
         (STATE / f'{app["name"]}.json').unlink(missing_ok=True)
         if cli:
             engine('network', 'rm', network, check=False)
+
+
+def local_bucket(app, block, svc, state, container, network, running):
+    """Start (or keep) the app's local Garage for one bucket block and record how to reach it."""
+    token = state.get(block, {}).get('admin_token') or secrets.token_urlsafe(24)
+    bucket = f'{app["name"]}-{block}'
+    mine = state.get(block, {})
+    if running and not mine.get('admin_token'):
+        running = False   # state was lost: its admin token is unknown, so start it again
+    if not running:
+        engine('rm', '-f', container, check=False)
+        STATE.mkdir(parents=True, exist_ok=True)
+        config = STATE / f'{app["name"]}-{block}-garage.toml'
+        config.write_text(GARAGE_CONFIG)
+        engine('run', '-d', '--name', container, '--network', network,
+               '-p', '127.0.0.1::3900', '-p', '127.0.0.1::3903',
+               '-v', f'{config}:/etc/garage.toml:ro',
+               '-e', f'GARAGE_RPC_SECRET={secrets.token_hex(32)}', '-e', f'GARAGE_ADMIN_TOKEN={token}',
+               GARAGE_IMAGE, '/garage', 'server')
+        mine = {}   # a new container is empty: its key is new too
+    published = {}
+    for inner, label in (('3900', 'port'), ('3903', 'admin_port')):
+        published[label] = engine('port', container, inner).stdout.strip().splitlines()[0].rsplit(':', 1)[-1]
+    if not mine.get('access_key_id'):
+        key_id, secret = garage_setup(published['admin_port'], token, bucket)
+        mine = {'access_key_id': key_id, 'secret_access_key': secret}
+    state[block] = {**mine, **published, 'admin_token': token, 'bucket': bucket,
+                    'access': (svc or {}).get('access') or 'private'}
+    print(f'{block} (bucket): http://127.0.0.1:{published["port"]}/{bucket}  (local Garage)')
 
 
 def local_connection(kind, block, local, app_name=None):
@@ -1924,6 +2023,14 @@ def local_connection(kind, block, local, app_name=None):
     conn = local[block]
     if kind == 'secret':
         return {'value': conn['value']}
+    if kind == 'bucket':
+        endpoint = f'http://magehand-{app_name}-{block}:3900' if app_name else f'http://127.0.0.1:{conn["port"]}'
+        data = {'endpoint': endpoint, 'bucket': conn['bucket'], 'access_key_id': conn['access_key_id'],
+                'secret_access_key': conn['secret_access_key'], 'region': 'garage',
+                'access': conn.get('access', 'private'), 'path_style': 'true'}
+        if data['access'] == 'public':   # the platform's URL is the data Worker's; here it is the S3 path
+            data['url'] = f'{endpoint}/{conn["bucket"]}/'
+        return data
     pw = conn['password']
     inner = '5432' if kind == 'postgres' else '6379'
     host, port = (f'magehand-{app_name}-{block}', inner) if app_name else ('127.0.0.1', conn['port'])
@@ -1962,12 +2069,12 @@ def resolve_env(app, container=False):
         if entry[1] in ('value', 'unknown'):
             continue
         var, block, kind, key = entry
-        if kind == 'bucket':
-            # No local object store yet (magehand#32): keep a value supplied in .magehand.env or the
-            # shell, say so when there is none, and never ask for a `dev up` that cannot create one.
+        if kind == 'bucket' and block not in local:
+            # No local object store running: keep a value supplied in .magehand.env or the shell,
+            # and say how to get one when there is none (it is optional: a bucket is not needed to start).
             if var not in env and var not in os.environ:
-                print(f'magehand: {var}: bucket block {block} has no local object store yet; set {var} in '
-                      '.magehand.env (or your shell) to a local or mock S3 value', file=sys.stderr)
+                print(f'magehand: {var}: bucket block {block} has no local object store; run `magehand dev up` '
+                      '(or set the value in .magehand.env or your shell)', file=sys.stderr)
             continue
         if block not in fetched:
             if kind == 'llm':
@@ -2346,6 +2453,24 @@ def check_manifests(app, catalog):
             if 'search' in svc and not isinstance(svc['search'], bool):
                 found.append(finding('error', f'{where}/app.yaml', f'block {name}: search must be true or false',
                                      'blocks "Web search"'))
+        if kind == 'bucket':
+            if not re.fullmatch(r'[a-z]([a-z0-9-]{0,28}[a-z0-9])?', str(name)):
+                found.append(finding('error', f'{where}/app.yaml', f'block {name}: a bucket name is lowercase '
+                                     'letters, digits and dashes, starting with a letter (at most 30)',
+                                     'blocks "Object storage"'))
+            offered = options.get('access_values') or []
+            if 'access' in svc and offered and svc['access'] not in offered:
+                found.append(finding('error', f'{where}/app.yaml', f'block {name}: access {svc["access"]!r} not '
+                                     f'offered ({", ".join(offered)})', 'blocks "Object storage"'))
+            if 'writers' in svc:
+                allowed = options.get('writer_values') or []
+                writers = svc['writers']
+                if not isinstance(writers, list) or (allowed and not set(map(str, writers)) <= set(allowed)):
+                    found.append(finding('error', f'{where}/app.yaml', f'block {name}: writers must be a list '
+                                         f'within [{", ".join(allowed)}]', 'blocks "Object storage"'))
+                elif writers and svc.get('access') == 'internal':
+                    found.append(finding('error', f'{where}/app.yaml', f'block {name}: writers are not available '
+                                         'on an internal bucket (it is in-cluster only)', 'blocks "Object storage"'))
     container = app['container']
     image = container.get('image') or ''
     own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name'])
