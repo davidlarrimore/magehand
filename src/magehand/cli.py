@@ -19,6 +19,8 @@ import base64
 import datetime
 import difflib
 import hashlib
+import mimetypes
+import hmac
 import http.client
 import http.server
 import json
@@ -32,12 +34,14 @@ import signal
 import socket
 import subprocess  # nosec B404  # runs docker, git, gh and the user's own command
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import xml.etree.ElementTree as ET  # nosec B405  # parses only S3 responses from the bucket's own endpoint
 from importlib.metadata import PackageNotFoundError, version as package_version
 
 import yaml
@@ -676,6 +680,9 @@ def cmd_app(a):
         opts = ', '.join(f'{k}={v}' for k, v in (svc or {}).items() if k != 'type')
         state = {'undeployed': '  not deployed yet: no key until merged', 'unregistered': '  no key: app not registered'}
         print(f'  {block}: {(svc or {}).get("type")}{"  (" + opts + ")" if opts else ""}{state.get(keys.get(block), "")}')
+        if (svc or {}).get('type') == 'bucket':
+            for line in bucket_summary(name, block, svc):
+                print('      ' + line)
     print(f'Env (the pod spec; locally: magehand run, app port {app_port(app)}):')
     for entry in env_plan(app):
         if entry[1] == 'value':
@@ -3278,12 +3285,301 @@ class Parser(argparse.ArgumentParser):
         self.exit(2, f'{self.prog}: error: {message}\n')
 
 
+# --- bucket: ls, cp, sync, url ---------------------------------------------------------
+# Read and write the app's buckets with the keys the platform hands the app (the same
+# <service>-connection values): the local Garage after `dev up`, or OpenBao's copy for dev and prod.
+# One small SigV4 client (stdlib), path-style, so R2 and Garage are the same to it.
+
+S3_MAX_BODY = 256 * 1024 * 1024   # one request, held in memory: a bigger file is `sync`'s to split later
+BUCKET_ENVS = ('local', 'dev', 'prod')
+FILES_HOST = 'files.davidlarrimore.com'
+
+
+def s3_sign(method, host, path, query, payload_hash, key_id, secret, region, extra=None, when=None):
+    """SigV4 request headers for S3 (`path` and `query` already encoded; `extra` are more headers
+    to sign, lowercase names). Values are trimmed and runs of spaces collapse, as SigV4 requires."""
+    when = when or datetime.datetime.now(datetime.timezone.utc)
+    stamp = when.strftime('%Y%m%dT%H%M%SZ')
+    headers = {'host': host, 'x-amz-date': stamp, 'x-amz-content-sha256': payload_hash, **(extra or {})}
+    names = sorted(headers)
+    canonical = '\n'.join([method, path, query,
+                           ''.join(f"{n}:{' '.join(str(headers[n]).split())}\n" for n in names),
+                           ';'.join(names), payload_hash])
+    day = stamp[:8]
+    scope = f'{day}/{region}/s3/aws4_request'
+    to_sign = '\n'.join(['AWS4-HMAC-SHA256', stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    key = f'AWS4{secret}'.encode()
+    for part in (day, region, 's3', 'aws4_request'):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    headers['authorization'] = (f'AWS4-HMAC-SHA256 Credential={key_id}/{scope}, '
+                                f'SignedHeaders={";".join(names)}, '
+                                f'Signature={hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()}')
+    return headers
+
+
+def s3_call(conn, method, key='', params=None, body=b'', headers=None):
+    """(status, response headers, body bytes). `key` is the object key ('' for the bucket)."""
+    endpoint = conn['endpoint'].rstrip('/')
+    host = urllib.parse.urlsplit(endpoint).netloc
+    path = '/' + urllib.parse.quote(f'{conn["bucket"]}/{key}' if key else conn['bucket'], safe='/~')
+    query = '&'.join(f'{urllib.parse.quote(k, safe="~")}={urllib.parse.quote(str(v), safe="~")}'
+                     for k, v in sorted((params or {}).items()))
+    signed = s3_sign(method, host, path, query, hashlib.sha256(body).hexdigest(), conn['access_key_id'],
+                     conn['secret_access_key'], conn.get('region') or 'auto', {k.lower(): v for k, v in (headers or {}).items()})
+    req = urllib.request.Request(f'{endpoint}{path}' + (f'?{query}' if query else ''), data=body or None, method=method,
+                                 headers={k.title() if k != 'authorization' else 'Authorization': v
+                                          for k, v in signed.items() if k != 'host'})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:  # nosec B310  # the bucket's own S3 endpoint
+            return resp.status, dict(resp.getheaders()), resp.read()
+    except urllib.error.HTTPError as error:
+        return error.code, dict(error.headers.items()), error.read()
+    except OSError as error:
+        die(f'cannot reach {endpoint}: {error}')
+
+
+def s3_error(status, body):
+    """A short reason for a failed S3 call (its <Code> and <Message>)."""
+    try:
+        root = ET.fromstring(body)  # nosec B314  # the bucket endpoint's own error document
+        found = {child.tag.split('}')[-1]: (child.text or '') for child in root}
+        return f'HTTP {status} {found.get("Code", "")}: {found.get("Message", "")}'.strip()
+    except ET.ParseError:
+        return f'HTTP {status}'
+
+
+def bucket_summary(app_name, block, svc):
+    """Lines for `magehand app`: where a bucket lives and how it is reached."""
+    access = (svc or {}).get('access') or 'private'
+    backend = {'public': 'Cloudflare R2, served read-only over HTTP', 'private': 'Cloudflare R2, S3 API only',
+               'internal': 'Garage in the cluster, never on the internet, 1 GB quota'}.get(access, access)
+    lines = [f'backend: {backend}']
+    if access == 'public':
+        lines.append(f'url: dev https://{FILES_HOST}/{app_name}-dev/{block}/   prod https://{FILES_HOST}/{app_name}/{block}/')
+    lines.append(f'use: magehand bucket ls {block}   (local: magehand dev up, then --env local)')
+    return lines
+
+
+def bucket_blocks(app):
+    return {block: svc for block, svc in app['services'].items() if (svc or {}).get('type') == 'bucket'}
+
+
+def bucket_target(app, text):
+    """(block, key) from 'BLOCK' or 'BLOCK/KEY'; dies unless BLOCK is one of the app's bucket blocks."""
+    block, _, key = text.partition('/')
+    blocks = bucket_blocks(app)
+    if block not in blocks:
+        have = ', '.join(sorted(blocks)) or 'none: request one with `type: bucket` in app.yaml'
+        die(f'{block!r} is not a bucket block of {app["name"]} (buckets: {have})')
+    return block, key
+
+
+def bucket_connection(app, block, env):
+    """The keys for one bucket block in one environment, as the app's pod would get them."""
+    access = (bucket_blocks(app)[block] or {}).get('access') or 'private'
+    if env == 'local':
+        local = local_state(app['name'])
+        if block not in local:
+            die(f'block {block} has no local object store: run `magehand dev up` (or use --env dev)')
+        return local_connection('bucket', block, local)
+    namespace = f'{app["name"]}-dev' if env == 'dev' else app['name']
+    if access == 'internal':
+        die(f'{block} is an internal bucket: it exists only inside the cluster, so it cannot be reached from '
+            f'here in {env}. Use --env local (magehand dev up), or code running in the app')
+    status, body = bao('GET', f'apps/data/{namespace}/bucket-{block}', valid_token())
+    if status == 404:
+        die(f'{block} is not provisioned in {env} yet (the platform makes it within about 2 minutes of the '
+            f'merge; production needs a release)')
+    if status != 200:
+        die(f'cannot read the {env} keys for {block} (HTTP {status}); `magehand login` and try again')
+    return body['data']['data']
+
+
+def bucket_url(app, block, env, conn, key):
+    """The public URL for an object, or None (only a public bucket has one)."""
+    if conn.get('url'):
+        return conn['url'].rstrip('/') + '/' + urllib.parse.quote(key, safe='/~') if key else conn['url']
+    if (bucket_blocks(app)[block] or {}).get('access') == 'public' and env != 'local':
+        ns = f'{app["name"]}-dev' if env == 'dev' else app['name']
+        return f'https://{FILES_HOST}/{ns}/{block}/' + urllib.parse.quote(key, safe='/~')
+    return None
+
+
+def bucket_list(conn, prefix='', delimiter='/'):
+    """([(key, size, etag, modified)], [common prefixes]) for everything under `prefix`."""
+    objects, prefixes, token = [], [], None
+    while True:
+        params = {'list-type': 2, 'prefix': prefix}
+        if delimiter:
+            params['delimiter'] = delimiter
+        if token:
+            params['continuation-token'] = token
+        status, _, body = s3_call(conn, 'GET', '', params)
+        if status != 200:
+            die(f'listing failed: {s3_error(status, body)}')
+        root = ET.fromstring(body)  # nosec B314  # the bucket endpoint's own listing
+        token = None
+        for node in root:
+            tag = node.tag.split('}')[-1]
+            fields = {c.tag.split('}')[-1]: (c.text or '') for c in node}
+            if tag == 'Contents':
+                objects.append((fields.get('Key', ''), int(fields.get('Size') or 0),
+                                fields.get('ETag', '').strip('"'), fields.get('LastModified', '')))
+            elif tag == 'CommonPrefixes':
+                prefixes.append(fields.get('Prefix', ''))
+            elif tag == 'NextContinuationToken':
+                token = node.text
+        if not token:
+            return objects, prefixes
+
+
+def put_object(conn, key, path, content_type=None, cache_control=None):
+    size = path.stat().st_size
+    if size > S3_MAX_BODY:
+        die(f'{path}: {size // (1024 * 1024)} MiB is over the {S3_MAX_BODY // (1024 * 1024)} MiB a single upload takes')
+    ctype = content_type or mimetypes.guess_type(key)[0] or mimetypes.guess_type(str(path))[0] or 'application/octet-stream'
+    extra = {'content-type': ctype}
+    if cache_control:
+        extra['cache-control'] = cache_control
+    status, _, body = s3_call(conn, 'PUT', key, body=path.read_bytes(), headers=extra)
+    if status not in (200, 204):
+        die(f'upload of {key} failed: {s3_error(status, body)}')
+    return size, ctype
+
+
+def bucket_env(a):
+    return a.env or 'dev'
+
+
+def cmd_bucket(a):
+    app = app_here(a.app_flag)
+    env = bucket_env(a)
+    action = a.bucket_action
+    if action == 'ls':
+        block, prefix = bucket_target(app, a.target)
+        conn = bucket_connection(app, block, env)
+        objects, prefixes = bucket_list(conn, prefix, delimiter='' if a.recursive else '/')
+        if a.json:
+            print(json.dumps({'bucket': block, 'env': env, 'prefix': prefix,
+                              'prefixes': prefixes, 'objects': [{'key': k, 'size': n, 'etag': e, 'modified': m}
+                                                                for k, n, e, m in objects]}, indent=1))
+            return
+        for name in prefixes:
+            print(f'{"PRE":>10}  {name}')
+        for key, size, _etag, modified in objects:
+            print(f'{size:>10}  {modified[:19].replace("T", " ")}  {key}')
+        if not objects and not prefixes:
+            print(f'(nothing under {block}/{prefix})')
+        return
+    if action == 'url':
+        block, key = bucket_target(app, a.target)
+        conn = bucket_connection(app, block, env)
+        url = bucket_url(app, block, env, conn, key)
+        if url:
+            print(json.dumps({'action': 'url', 'bucket': block, 'key': key, 'env': env, 'url': url})
+                  if a.json else url)
+            return
+        access = (bucket_blocks(app)[block] or {}).get('access') or 'private'
+        die(f'{block} is {access}: it has no public URL (only access: public does). Read it through the S3 API '
+            f'with its keys, or serve it from the app')
+    if action == 'cp':
+        src, dst = a.source, a.dest
+        names = set(bucket_blocks(app))
+
+        def remote(text):
+            # Deterministic, whatever is on disk: BUCKET/KEY is remote when BUCKET is one of the app's
+            # bucket blocks. A local file or directory that has that name is written ./BUCKET/... or
+            # with an absolute path.
+            if text.startswith(('./', '../', '/', '~')):
+                return False
+            return text.split('/', 1)[0] in names
+        if remote(src) == remote(dst):
+            die('one side is a file and the other BUCKET/KEY (a bucket block of the app; write a local path '
+                f'that starts with a bucket name as ./PATH): buckets: {", ".join(sorted(names)) or "none"}')
+        if remote(dst):   # upload
+            block, key = bucket_target(app, dst)
+            path = pathlib.Path(src)
+            if not path.is_file():
+                die(f'{src}: not a file')
+            if not key or key.endswith('/'):
+                key = key + path.name
+            conn = bucket_connection(app, block, env)
+            size, ctype = put_object(conn, key, path, a.content_type, a.cache_control)
+            url = bucket_url(app, block, env, conn, key)
+            if a.json:
+                print(json.dumps({'action': 'cp', 'direction': 'upload', 'bucket': block, 'key': key, 'env': env,
+                                  'file': str(path), 'bytes': size, 'content_type': ctype, 'url': url}))
+                return
+            print(f'uploaded {size} bytes to {block}/{key} ({ctype}, {env})')
+            if url:
+                print(f'public: {url}')
+            return
+        block, key = bucket_target(app, src)   # download
+        if not key:
+            die(f'give the object key: {block}/KEY')
+        conn = bucket_connection(app, block, env)
+        status, _, body = s3_call(conn, 'GET', key)
+        if status != 200:
+            die(f'download of {key} failed: {s3_error(status, body)}')
+        out = pathlib.Path(dst).expanduser()
+        if out.is_dir():
+            out = out / pathlib.PurePosixPath(key).name
+        # A unique file made exclusively in the destination's directory, written through its
+        # descriptor and then renamed over the destination: never an existing `NAME.part`, a symlink's
+        # target, or another download's temporary file.
+        fd, tmp_name = tempfile.mkstemp(dir=str(out.parent), prefix=f'.{out.name}.', suffix='.part')
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(body)
+            os.replace(tmp_name, out)
+        except BaseException:
+            pathlib.Path(tmp_name).unlink(missing_ok=True)
+            raise
+        if a.json:
+            print(json.dumps({'action': 'cp', 'direction': 'download', 'bucket': block, 'key': key, 'env': env,
+                              'file': str(out), 'bytes': len(body)}))
+        else:
+            print(f'downloaded {len(body)} bytes to {out}')
+        return
+    if action == 'sync':
+        block, prefix = bucket_target(app, a.dest)
+        root = pathlib.Path(a.source)
+        if not root.is_dir():
+            die(f'{a.source}: not a directory')
+        if prefix and not prefix.endswith('/'):
+            prefix += '/'
+        conn = bucket_connection(app, block, env)
+        have = {k: e for k, _n, e, _m in bucket_list(conn, prefix, delimiter='')[0]}
+        files = [f for f in sorted(root.rglob('*')) if f.is_file() and '.git' not in f.relative_to(root).parts]
+        sent, skipped, keys = 0, 0, []
+        progress = sys.stderr if a.json else sys.stdout    # a JSON object is all that goes to stdout
+        for path in files:
+            key = prefix + path.relative_to(root).as_posix()
+            if have.get(key) == hashlib.md5(path.read_bytes()).hexdigest():  # nosec B324  # S3's ETag is an MD5, not a secret
+                skipped += 1
+                continue
+            if a.dry_run:
+                print(f'would upload {key}', file=progress)
+            else:
+                put_object(conn, key, path, None, a.cache_control)
+                print(f'uploaded {key}', file=progress)
+            keys.append(key)
+            sent += 1
+        if a.json:
+            print(json.dumps({'action': 'sync', 'bucket': block, 'prefix': prefix, 'env': env,
+                              'dry_run': bool(a.dry_run), 'uploaded': keys, 'unchanged': skipped}))
+            return
+        verb = 'would upload' if a.dry_run else 'uploaded'
+        print(f'{verb} {sent} file(s), {skipped} unchanged, in {block}/{prefix} ({env})')
+        return
+
+
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new',)),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'update-agents')),
           ('ship an app', ('release',)),
-          ('run an app locally', ('run', 'dev', 'runtime', 'login')),
+          ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
 
@@ -3447,6 +3743,42 @@ def build_parser():
                    help='up, down or status (default)')
     app_option(p)
     runtime_option(p)
+    p = command('bucket', cmd_bucket, "list, copy, sync and link an app's object storage", "read and write the app's `bucket` blocks with the keys the platform hands the app",
+                'BUCKET is a bucket block of the app (a service of type bucket in app.yaml). --env picks where:\n'
+                'dev (default) and prod read the keys from OpenBao (`magehand login`); local uses the Garage\n'
+                '`magehand dev up` started. An internal bucket exists only in the cluster, so use --env local.\n'
+                'Prod writes are yours to decide: --env prod uploads to real data.\n\n'
+                'examples:\n'
+                '  magehand bucket ls files                 top level of the bucket\n'
+                '  magehand bucket ls files/reports/        under a prefix (-r for everything)\n'
+                '  magehand bucket cp latest.json files/data/latest.json\n'
+                '  magehand bucket cp files/data/latest.json ./latest.json\n'
+                '  magehand bucket sync ./site files/site   upload what changed (no deletes)\n'
+                '  magehand bucket url files/data/latest.json   the public URL (access: public)\n'
+                '  magehand bucket cp ./files/x files/x     a local path that starts with a bucket name: ./\n'
+                '  magehand bucket --env local ls files     against the local store')
+    p.add_argument('-a', '--app', dest='app_flag', metavar='APP', help='the app (default: the app repo you are in)')
+    p.add_argument('--env', choices=BUCKET_ENVS, help='local, dev (default) or prod')
+    bsub = p.add_subparsers(dest='bucket_action', metavar='ACTION', required=True, parser_class=Parser)
+    q = bsub.add_parser('ls', help='list objects')
+    q.add_argument('target', metavar='BUCKET[/PREFIX]')
+    q.add_argument('-r', '--recursive', action='store_true', help='everything under the prefix, not one level')
+    q.add_argument('--json', action='store_true', help='print JSON')
+    q = bsub.add_parser('cp', help='copy one file up or down')
+    q.add_argument('source', metavar='SOURCE', help='a file, or BUCKET/KEY to download')
+    q.add_argument('dest', metavar='DEST', help='BUCKET/KEY to upload to (a trailing / keeps the file name), or a file')
+    q.add_argument('--content-type', help='Content-Type (default: guessed from the name)')
+    q.add_argument('--cache-control', help='Cache-Control to store with the object')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
+    q = bsub.add_parser('sync', help='upload the files that changed (never deletes)')
+    q.add_argument('source', metavar='DIR')
+    q.add_argument('dest', metavar='BUCKET[/PREFIX]')
+    q.add_argument('--dry-run', action='store_true', help='say what would be uploaded')
+    q.add_argument('--cache-control', help='Cache-Control to store with each object')
+    q.add_argument('--json', action='store_true', help='print a JSON object (progress goes to stderr)')
+    q = bsub.add_parser('url', help='the public URL of an object')
+    q.add_argument('target', metavar='BUCKET/KEY')
+    q.add_argument('--json', action='store_true', help='print a JSON object')
     p = command('run', cmd_run, "run a command or the app's image with its pod's env", "run a command, or the app's image, with the env the app's pod gets",
                 'Secrets come from OpenBao and local containers, never from disk. A proxy on 127.0.0.1:8080\n'
                 'adds the X-authentik-* headers Traefik would, as you.\n\n'

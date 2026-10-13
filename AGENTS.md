@@ -5,13 +5,18 @@
   192.0.2.0/24 and example.com).
 - One module, `src/magehand/cli.py`: stdlib plus PyYAML, Python 3.9+ (no
   `match`, no `X | Y` types).
-- It reads and runs locally; it never deploys or writes to the homelab. Keep
-  every network call to GitHub and `*.lab`; never add a public homelab
-  endpoint. The one cluster call is read-only `kubectl get` (`status`: dev's
-  pods and Argo application), skipped without kubectl and by `--no-cluster`.
-  Its writes are `magehand new` (an app's repo on GitHub) and `magehand
-  release` (a tag and release on an app's repo), both as the owner through
-  `gh`, never to the homelab itself.
+- It reads and runs locally; it never deploys or changes the homelab's
+  configuration. Keep every network call to GitHub and `*.lab`, with one
+  scoped exception: `magehand bucket` talks to the S3 endpoint the platform
+  hands the app for *its own* bucket (R2 for dev and prod, the local
+  Garage for `--env local`), because that is where the app's data is. The
+  one cluster call is read-only `kubectl get` (`status`: dev's pods and Argo
+  application), skipped without kubectl and by `--no-cluster`. Its writes
+  are `magehand new` (an app's repo on GitHub) and `magehand release` (a tag
+  and release on an app's repo), both as the owner through `gh`, and
+  `magehand bucket cp` / `sync`, which put objects into that app's own
+  bucket only, on an explicit command, with the keys of the environment
+  asked for (`--env prod` writes production data), and never delete.
 - Secrets never touch argv (`-e NAME` for docker; the token goes to the
   Keychain on stdin, `security -i`) and never touch disk, except the token's
   0600 file off macOS, where the standard library has no credential store.

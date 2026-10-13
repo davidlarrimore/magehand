@@ -316,6 +316,332 @@ class LocalBucket(unittest.TestCase):
         self.assertEqual(spec['key_options'], {'url': 'access'})
 
 
+class FakeS3(http.server.BaseHTTPRequestHandler):
+    """An S3 (path-style) with one bucket that checks each request's SigV4 signature itself."""
+
+    store = {}          # key -> (body, headers)
+    ACCESS, SECRET, REGION, BUCKET = 'GKtest', 'topsecret', 'garage', 'demo-files'
+    PAGE = 2            # list this many per page, to exercise continuation tokens
+    seen = []
+
+    def log_message(self, *args):
+        pass
+
+    def verified(self, body):
+        import hashlib as h, hmac as m
+        auth = self.headers.get('Authorization', '')
+        try:
+            cred = auth.split('Credential=')[1].split(',')[0]
+            names = auth.split('SignedHeaders=')[1].split(',')[0].split(';')
+            given = auth.split('Signature=')[1]
+        except IndexError:
+            return False
+        key_id, day, region, service, term = cred.split('/')
+        if key_id != self.ACCESS or region != self.REGION:
+            return False
+        path, _, query = self.path.partition('?')
+        canon_query = '&'.join(sorted(query.split('&'))) if query else ''
+        hdrs = {n: ' '.join(self.headers.get(n if n != 'host' else 'Host', '').split()) for n in names}
+        canon = '\n'.join([self.command, path, canon_query, ''.join(f'{n}:{hdrs[n]}\n' for n in names),
+                           ';'.join(names), self.headers.get('x-amz-content-sha256')])
+        if self.headers.get('x-amz-content-sha256') != h.sha256(body).hexdigest():
+            return False
+        stamp = self.headers.get('x-amz-date')
+        sts = '\n'.join(['AWS4-HMAC-SHA256', stamp, f'{day}/{region}/s3/aws4_request',
+                         h.sha256(canon.encode()).hexdigest()])
+        k = f'AWS4{self.SECRET}'.encode()
+        for part in (day, region, 's3', 'aws4_request'):
+            k = m.new(k, part.encode(), h.sha256).digest()
+        return m.new(k, sts.encode(), h.sha256).hexdigest() == given
+
+    def reply(self, status, body=b'', headers=None):
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_any(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+        if not self.verified(body):
+            return self.reply(403, b'<Error><Code>SignatureDoesNotMatch</Code><Message>bad signature</Message></Error>')
+        path, _, query = self.path.partition('?')
+        import urllib.parse as up
+        parts = up.unquote(path).lstrip('/').split('/', 1)
+        key = parts[1] if len(parts) > 1 else ''
+        self.seen.append((self.command, key))
+        if self.command == 'PUT':
+            self.store[key] = (body, {k.lower(): v for k, v in self.headers.items()})
+            return self.reply(200)
+        if self.command == 'GET' and key:
+            if key not in self.store:
+                return self.reply(404, b'<Error><Code>NoSuchKey</Code><Message>no such key</Message></Error>')
+            return self.reply(200, self.store[key][0])
+        if self.command == 'GET':
+            q = dict(up.parse_qsl(query))
+            prefix, delim = q.get('prefix', ''), q.get('delimiter', '')
+            keys = sorted(k for k in self.store if k.startswith(prefix))
+            commons, items = [], []
+            for k in keys:
+                rest = k[len(prefix):]
+                if delim and delim in rest:
+                    c = prefix + rest.split(delim)[0] + delim
+                    if c not in commons:
+                        commons.append(c)
+                else:
+                    items.append(k)
+            start = int(q.get('continuation-token', '0') or 0)
+            page = items[start:start + self.PAGE]
+            more = start + self.PAGE < len(items)
+            xml = '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            for k in page:
+                import hashlib as h
+                xml += (f'<Contents><Key>{k}</Key><Size>{len(self.store[k][0])}</Size>'
+                        f'<ETag>"{h.md5(self.store[k][0]).hexdigest()}"</ETag>'
+                        '<LastModified>2026-10-13T12:00:00.000Z</LastModified></Contents>')
+            for c in commons:
+                xml += f'<CommonPrefixes><Prefix>{c}</Prefix></CommonPrefixes>'
+            if more:
+                xml += f'<NextContinuationToken>{start + self.PAGE}</NextContinuationToken>'
+            xml += '</ListBucketResult>'
+            return self.reply(200, xml.encode())
+        return self.reply(405)
+
+    do_GET = do_PUT = do_DELETE = handle_any
+
+
+class BucketCommands(unittest.TestCase):
+    """`magehand bucket ls/cp/sync/url` against a fake S3 that verifies SigV4."""
+
+    def setUp(self):
+        FakeS3.store, FakeS3.seen = {}, []
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), FakeS3)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_address[1]
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.access = 'public'
+        self.conn = {'endpoint': f'http://127.0.0.1:{self.port}', 'bucket': FakeS3.BUCKET,
+                     'access_key_id': FakeS3.ACCESS, 'secret_access_key': FakeS3.SECRET, 'region': FakeS3.REGION,
+                     'access': 'public', 'path_style': 'true', 'url': 'https://files.example/demo-dev/files/'}
+        self.patches = [mock.patch.object(magehand, 'app_here', lambda name=None: {
+                            'name': 'demo', 'services': {'files': {'type': 'bucket', 'access': self.access},
+                                                         'db': {'type': 'postgres'}}}),
+                        mock.patch.object(magehand, 'bucket_connection', lambda app, block, env: self.conn)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        os.chdir(self.cwd)
+        self.server.shutdown()
+        self.server.server_close()
+
+    def run_cmd(self, *argv):
+        args = magehand.build_parser().parse_args(['bucket', *argv])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            args.func(args)
+        return out.getvalue()
+
+    def die(self, *argv):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_cmd(*argv)
+        return str(caught.exception.code)
+
+    def test_the_signer_reproduces_awss_published_s3_example(self):
+        import datetime, hashlib
+        h = magehand.s3_sign('GET', 'examplebucket.s3.amazonaws.com', '/test.txt', '', hashlib.sha256(b'').hexdigest(),
+                             'AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'us-east-1',
+                             {'range': 'bytes=0-9'}, when=datetime.datetime(2013, 5, 24, tzinfo=datetime.timezone.utc))
+        self.assertTrue(h['authorization'].endswith(
+            'Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41'))
+
+    def test_cp_uploads_with_type_cache_control_and_prints_the_public_url(self):
+        pathlib.Path('latest.json').write_text('{"ok": true}')
+        out = self.run_cmd('cp', 'latest.json', 'files/data/latest.json', '--cache-control', 'max-age=60')
+        body, headers = FakeS3.store['data/latest.json']
+        self.assertEqual(body, b'{"ok": true}')
+        self.assertEqual(headers['content-type'], 'application/json')    # guessed from the key
+        self.assertEqual(headers['cache-control'], 'max-age=60')
+        self.assertIn('uploaded 12 bytes to files/data/latest.json', out)
+        self.assertIn('public: https://files.example/demo-dev/files/data/latest.json', out)
+
+    def test_cp_with_a_trailing_slash_keeps_the_file_name_and_spaces_sign_correctly(self):
+        pathlib.Path('my report.txt').write_text('hi')
+        self.run_cmd('cp', 'my report.txt', 'files/reports/', '--content-type', 'text/plain;  charset=utf-8')
+        self.assertIn('reports/my report.txt', FakeS3.store)             # signed and decoded correctly
+
+    def test_cp_downloads_atomically(self):
+        pathlib.Path('up.bin').write_bytes(b'\x00\x01binary')
+        self.run_cmd('cp', 'up.bin', 'files/b/up.bin')
+        out = self.run_cmd('cp', 'files/b/up.bin', 'down.bin')
+        self.assertEqual(pathlib.Path('down.bin').read_bytes(), b'\x00\x01binary')
+        self.assertFalse(pathlib.Path('down.bin.part').exists())
+        self.assertIn('downloaded 8 bytes', out)
+
+    def test_a_download_never_touches_a_neighbouring_part_file_or_a_symlinks_target(self):
+        pathlib.Path('up.bin').write_bytes(b'new bytes')
+        self.run_cmd('cp', 'up.bin', 'files/b/up.bin')
+        # an unrelated file that used to be the temporary path
+        pathlib.Path('target.bin.part').write_bytes(b'someone else')
+        # a symlink at the destination whose target must not be overwritten
+        pathlib.Path('real.txt').write_bytes(b'precious')
+        os.symlink('real.txt', 'target.bin')
+        self.run_cmd('cp', 'files/b/up.bin', 'target.bin')
+        self.assertEqual(pathlib.Path('target.bin.part').read_bytes(), b'someone else')
+        self.assertEqual(pathlib.Path('real.txt').read_bytes(), b'precious')
+        self.assertEqual(pathlib.Path('target.bin').read_bytes(), b'new bytes')
+        self.assertEqual(sorted(p.name for p in pathlib.Path('.').glob('.target.bin.*')), [])   # no temp left
+
+    def test_a_failed_download_leaves_no_temporary_file(self):
+        pathlib.Path('up.bin').write_bytes(b'x')
+        self.run_cmd('cp', 'up.bin', 'files/b/up.bin')
+        with mock.patch.object(magehand.os, 'replace', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.run_cmd('cp', 'files/b/up.bin', 'out.bin')
+        self.assertEqual([p.name for p in pathlib.Path('.').iterdir() if p.name.startswith('.out.bin')], [])
+        self.assertFalse(pathlib.Path('out.bin').exists())
+
+    def test_bucket_key_is_remote_even_when_a_local_directory_has_the_same_name(self):
+        pathlib.Path('files').mkdir()
+        pathlib.Path('files/key').write_text('a local file that must not win')
+        pathlib.Path('up.txt').write_text('payload')
+        self.run_cmd('cp', 'up.txt', 'files/')                       # the documented trailing-slash upload
+        self.assertEqual(FakeS3.store['up.txt'][0], b'payload')
+        self.run_cmd('cp', 'up.txt', 'files/key')                    # a key that exists locally is still remote
+        self.assertEqual(FakeS3.store['key'][0], b'payload')
+        self.assertEqual(pathlib.Path('files/key').read_text(), 'a local file that must not win')
+
+    def test_a_local_path_that_starts_with_a_bucket_name_is_written_with_dot_slash(self):
+        pathlib.Path('files').mkdir()
+        pathlib.Path('files/page.html').write_text('<p>x</p>')
+        out = self.run_cmd('cp', './files/page.html', 'files/site/page.html')
+        self.assertIn('uploaded 8 bytes to files/site/page.html', out)
+        self.run_cmd('cp', 'files/site/page.html', './files/copy.html')
+        self.assertEqual(pathlib.Path('files/copy.html').read_text(), '<p>x</p>')
+        self.assertIn('starts with a bucket name', self.die('cp', 'files/a', 'files/b'))
+
+    def test_every_action_can_print_one_json_object(self):
+        pathlib.Path('up.json').write_text('{}')
+        pathlib.Path('d').mkdir()
+        pathlib.Path('d/x.txt').write_text('x')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            up = json.loads(self.run_cmd('cp', 'up.json', 'files/up.json', '--json'))
+            down = json.loads(self.run_cmd('cp', 'files/up.json', 'got.json', '--json'))
+            sync = json.loads(self.run_cmd('sync', 'd', 'files/d', '--json'))
+            url = json.loads(self.run_cmd('url', 'files/up.json', '--json'))
+        self.assertEqual((up['action'], up['direction'], up['bucket'], up['key'], up['bytes'], up['content_type']),
+                         ('cp', 'upload', 'files', 'up.json', 2, 'application/json'))
+        self.assertEqual(up['url'], 'https://files.example/demo-dev/files/up.json')
+        self.assertEqual((down['direction'], down['bytes'], down['file']), ('download', 2, 'got.json'))
+        self.assertEqual((sync['action'], sync['uploaded'], sync['unchanged'], sync['dry_run']),
+                         ('sync', ['d/x.txt'], 0, False))
+        self.assertEqual((url['action'], url['url']), ('url', 'https://files.example/demo-dev/files/up.json'))
+        self.assertIn('uploaded d/x.txt', err.getvalue())               # progress went to stderr, not stdout
+
+    def test_a_missing_object_says_why(self):
+        self.assertIn('NoSuchKey', self.die('cp', 'files/nope', 'x'))
+
+    def test_ls_lists_one_level_with_prefixes_and_pages(self):
+        for key in ('a.txt', 'b.txt', 'c.txt', 'docs/x.md', 'docs/y.md'):
+            FakeS3.store[key] = (key.encode(), {})
+        out = self.run_cmd('ls', 'files')
+        self.assertIn('PRE  docs/', out)
+        for name in ('a.txt', 'b.txt', 'c.txt'):                    # three files across two pages
+            self.assertIn(name, out)
+        self.assertNotIn('docs/x.md', out)
+        deep = self.run_cmd('ls', 'files/docs/')
+        self.assertIn('docs/x.md', deep)
+        everything = json.loads(self.run_cmd('ls', 'files', '-r', '--json'))
+        self.assertEqual([o['key'] for o in everything['objects']], ['a.txt', 'b.txt', 'c.txt', 'docs/x.md', 'docs/y.md'])
+
+    def test_sync_uploads_what_changed_and_never_deletes(self):
+        site = pathlib.Path('site')
+        (site / 'css').mkdir(parents=True)
+        (site / 'index.html').write_text('<h1>hi</h1>')
+        (site / 'css' / 'a.css').write_text('body{}')
+        FakeS3.store['site/old.txt'] = (b'stays', {})
+        self.assertIn('2 file(s), 0 unchanged', self.run_cmd('sync', 'site', 'files/site'))
+        self.assertIn('site/css/a.css', FakeS3.store)
+        FakeS3.seen.clear()
+        (site / 'index.html').write_text('<h1>changed</h1>')
+        out = self.run_cmd('sync', 'site', 'files/site')
+        self.assertIn('1 file(s), 1 unchanged', out)
+        self.assertEqual([k for m, k in FakeS3.seen if m == 'PUT'], ['site/index.html'])
+        self.assertIn('site/old.txt', FakeS3.store)                  # nothing is deleted
+        self.assertEqual(FakeS3.store['site/index.html'][1]['content-type'], 'text/html')
+
+    def test_sync_dry_run_uploads_nothing(self):
+        pathlib.Path('d').mkdir()
+        pathlib.Path('d/x.txt').write_text('x')
+        out = self.run_cmd('sync', 'd', 'files/p', '--dry-run')
+        self.assertIn('would upload p/x.txt', out)
+        self.assertEqual(FakeS3.store, {})
+
+    def test_url_is_the_public_url_and_private_has_none(self):
+        self.assertEqual(self.run_cmd('url', 'files/a b.json').strip(), 'https://files.example/demo-dev/files/a%20b.json')
+        self.access = 'private'
+        self.conn.pop('url')
+        self.conn['access'] = 'private'
+        self.assertIn('no public URL', self.die('url', 'files/a.json'))
+
+    def test_a_service_that_is_not_a_bucket_lists_the_ones_that_are(self):
+        message = self.die('ls', 'db')
+        self.assertIn("'db' is not a bucket block", message)
+        self.assertIn('files', message)
+
+    def test_a_signature_the_server_refuses_is_reported_not_swallowed(self):
+        self.conn['secret_access_key'] = 'wrong'
+        self.assertIn('SignatureDoesNotMatch', self.die('ls', 'files'))
+
+
+class BucketConnection(unittest.TestCase):
+    """Where the keys come from: the local store, OpenBao for dev and prod, never for an internal one remotely."""
+
+    APP = {'name': 'demo', 'services': {'files': {'type': 'bucket', 'access': 'private'},
+                                        'scratch': {'type': 'bucket', 'access': 'internal'}}}
+
+    def test_dev_and_prod_read_their_own_openbao_path(self):
+        seen = []
+
+        def bao(method, path, token=None, body=None, soft=False):
+            seen.append(path)
+            return 200, {'data': {'data': {'endpoint': 'https://r2', 'bucket': 'b'}}}
+        with mock.patch.object(magehand, 'bao', bao), mock.patch.object(magehand, 'valid_token', lambda: 't'):
+            magehand.bucket_connection(self.APP, 'files', 'dev')
+            magehand.bucket_connection(self.APP, 'files', 'prod')
+        self.assertEqual(seen, ['apps/data/demo-dev/bucket-files', 'apps/data/demo/bucket-files'])
+
+    def test_an_internal_bucket_is_not_reachable_from_a_laptop(self):
+        with self.assertRaises(SystemExit) as caught:
+            magehand.bucket_connection(self.APP, 'scratch', 'dev')
+        self.assertIn('only inside the cluster', str(caught.exception.code))
+        self.assertIn('--env local', str(caught.exception.code))
+
+    def test_not_provisioned_yet_says_so(self):
+        with mock.patch.object(magehand, 'bao', lambda *a, **k: (404, None)), \
+                mock.patch.object(magehand, 'valid_token', lambda: 't'):
+            with self.assertRaises(SystemExit) as caught:
+                magehand.bucket_connection(self.APP, 'files', 'dev')
+        self.assertIn('not provisioned in dev yet', str(caught.exception.code))
+
+    def test_local_needs_dev_up(self):
+        with mock.patch.object(magehand, 'local_state', lambda _n: {}):
+            with self.assertRaises(SystemExit) as caught:
+                magehand.bucket_connection(self.APP, 'files', 'local')
+        self.assertIn('magehand dev up', str(caught.exception.code))
+
+    def test_app_summary_says_where_a_bucket_lives(self):
+        lines = ' '.join(magehand.bucket_summary('demo', 'files', {'type': 'bucket', 'access': 'public'}))
+        self.assertIn('https://files.davidlarrimore.com/demo-dev/files/', lines)
+        self.assertIn('Garage', ' '.join(magehand.bucket_summary('demo', 's', {'type': 'bucket', 'access': 'internal'})))
+
+
 class Resolve(unittest.TestCase):
     def setUp(self):
         self.saved = (magehand.bao, magehand.valid_token, magehand.local_state)
