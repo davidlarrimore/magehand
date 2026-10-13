@@ -34,6 +34,7 @@ import signal
 import socket
 import subprocess  # nosec B404  # runs docker, git, gh and the user's own command
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -3475,7 +3476,8 @@ def cmd_bucket(a):
         conn = bucket_connection(app, block, env)
         url = bucket_url(app, block, env, conn, key)
         if url:
-            print(url)
+            print(json.dumps({'action': 'url', 'bucket': block, 'key': key, 'env': env, 'url': url})
+                  if a.json else url)
             return
         access = (bucket_blocks(app)[block] or {}).get('access') or 'private'
         die(f'{block} is {access}: it has no public URL (only access: public does). Read it through the S3 API '
@@ -3485,11 +3487,15 @@ def cmd_bucket(a):
         names = set(bucket_blocks(app))
 
         def remote(text):
-            head = text.split('/', 1)[0]
-            return head in names and not pathlib.Path(text).exists()
+            # Deterministic, whatever is on disk: BUCKET/KEY is remote when BUCKET is one of the app's
+            # bucket blocks. A local file or directory that has that name is written ./BUCKET/... or
+            # with an absolute path.
+            if text.startswith(('./', '../', '/', '~')):
+                return False
+            return text.split('/', 1)[0] in names
         if remote(src) == remote(dst):
-            die('one side is a file and the other BUCKET/KEY (a bucket block of the app): '
-                f'buckets: {", ".join(sorted(names)) or "none"}')
+            die('one side is a file and the other BUCKET/KEY (a bucket block of the app; write a local path '
+                f'that starts with a bucket name as ./PATH): buckets: {", ".join(sorted(names)) or "none"}')
         if remote(dst):   # upload
             block, key = bucket_target(app, dst)
             path = pathlib.Path(src)
@@ -3499,8 +3505,12 @@ def cmd_bucket(a):
                 key = key + path.name
             conn = bucket_connection(app, block, env)
             size, ctype = put_object(conn, key, path, a.content_type, a.cache_control)
-            print(f'uploaded {size} bytes to {block}/{key} ({ctype}, {env})')
             url = bucket_url(app, block, env, conn, key)
+            if a.json:
+                print(json.dumps({'action': 'cp', 'direction': 'upload', 'bucket': block, 'key': key, 'env': env,
+                                  'file': str(path), 'bytes': size, 'content_type': ctype, 'url': url}))
+                return
+            print(f'uploaded {size} bytes to {block}/{key} ({ctype}, {env})')
             if url:
                 print(f'public: {url}')
             return
@@ -3511,13 +3521,25 @@ def cmd_bucket(a):
         status, _, body = s3_call(conn, 'GET', key)
         if status != 200:
             die(f'download of {key} failed: {s3_error(status, body)}')
-        out = pathlib.Path(dst)
+        out = pathlib.Path(dst).expanduser()
         if out.is_dir():
             out = out / pathlib.PurePosixPath(key).name
-        tmp = out.with_name(out.name + '.part')
-        tmp.write_bytes(body)
-        tmp.replace(out)
-        print(f'downloaded {len(body)} bytes to {out}')
+        # A unique file made exclusively in the destination's directory, written through its
+        # descriptor and then renamed over the destination: never an existing `NAME.part`, a symlink's
+        # target, or another download's temporary file.
+        fd, tmp_name = tempfile.mkstemp(dir=str(out.parent), prefix=f'.{out.name}.', suffix='.part')
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(body)
+            os.replace(tmp_name, out)
+        except BaseException:
+            pathlib.Path(tmp_name).unlink(missing_ok=True)
+            raise
+        if a.json:
+            print(json.dumps({'action': 'cp', 'direction': 'download', 'bucket': block, 'key': key, 'env': env,
+                              'file': str(out), 'bytes': len(body)}))
+        else:
+            print(f'downloaded {len(body)} bytes to {out}')
         return
     if action == 'sync':
         block, prefix = bucket_target(app, a.dest)
@@ -3529,18 +3551,24 @@ def cmd_bucket(a):
         conn = bucket_connection(app, block, env)
         have = {k: e for k, _n, e, _m in bucket_list(conn, prefix, delimiter='')[0]}
         files = [f for f in sorted(root.rglob('*')) if f.is_file() and '.git' not in f.relative_to(root).parts]
-        sent = skipped = 0
+        sent, skipped, keys = 0, 0, []
+        progress = sys.stderr if a.json else sys.stdout    # a JSON object is all that goes to stdout
         for path in files:
             key = prefix + path.relative_to(root).as_posix()
             if have.get(key) == hashlib.md5(path.read_bytes()).hexdigest():  # nosec B324  # S3's ETag is an MD5, not a secret
                 skipped += 1
                 continue
             if a.dry_run:
-                print(f'would upload {key}')
+                print(f'would upload {key}', file=progress)
             else:
                 put_object(conn, key, path, None, a.cache_control)
-                print(f'uploaded {key}')
+                print(f'uploaded {key}', file=progress)
+            keys.append(key)
             sent += 1
+        if a.json:
+            print(json.dumps({'action': 'sync', 'bucket': block, 'prefix': prefix, 'env': env,
+                              'dry_run': bool(a.dry_run), 'uploaded': keys, 'unchanged': skipped}))
+            return
         verb = 'would upload' if a.dry_run else 'uploaded'
         print(f'{verb} {sent} file(s), {skipped} unchanged, in {block}/{prefix} ({env})')
         return
@@ -3727,6 +3755,7 @@ def build_parser():
                 '  magehand bucket cp files/data/latest.json ./latest.json\n'
                 '  magehand bucket sync ./site files/site   upload what changed (no deletes)\n'
                 '  magehand bucket url files/data/latest.json   the public URL (access: public)\n'
+                '  magehand bucket cp ./files/x files/x     a local path that starts with a bucket name: ./\n'
                 '  magehand bucket --env local ls files     against the local store')
     p.add_argument('-a', '--app', dest='app_flag', metavar='APP', help='the app (default: the app repo you are in)')
     p.add_argument('--env', choices=BUCKET_ENVS, help='local, dev (default) or prod')
@@ -3740,13 +3769,16 @@ def build_parser():
     q.add_argument('dest', metavar='DEST', help='BUCKET/KEY to upload to (a trailing / keeps the file name), or a file')
     q.add_argument('--content-type', help='Content-Type (default: guessed from the name)')
     q.add_argument('--cache-control', help='Cache-Control to store with the object')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     q = bsub.add_parser('sync', help='upload the files that changed (never deletes)')
     q.add_argument('source', metavar='DIR')
     q.add_argument('dest', metavar='BUCKET[/PREFIX]')
     q.add_argument('--dry-run', action='store_true', help='say what would be uploaded')
     q.add_argument('--cache-control', help='Cache-Control to store with each object')
+    q.add_argument('--json', action='store_true', help='print a JSON object (progress goes to stderr)')
     q = bsub.add_parser('url', help='the public URL of an object')
     q.add_argument('target', metavar='BUCKET/KEY')
+    q.add_argument('--json', action='store_true', help='print a JSON object')
     p = command('run', cmd_run, "run a command or the app's image with its pod's env", "run a command, or the app's image, with the env the app's pod gets",
                 'Secrets come from OpenBao and local containers, never from disk. A proxy on 127.0.0.1:8080\n'
                 'adds the X-authentik-* headers Traefik would, as you.\n\n'

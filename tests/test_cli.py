@@ -483,6 +483,67 @@ class BucketCommands(unittest.TestCase):
         self.assertFalse(pathlib.Path('down.bin.part').exists())
         self.assertIn('downloaded 8 bytes', out)
 
+    def test_a_download_never_touches_a_neighbouring_part_file_or_a_symlinks_target(self):
+        pathlib.Path('up.bin').write_bytes(b'new bytes')
+        self.run_cmd('cp', 'up.bin', 'files/b/up.bin')
+        # an unrelated file that used to be the temporary path
+        pathlib.Path('target.bin.part').write_bytes(b'someone else')
+        # a symlink at the destination whose target must not be overwritten
+        pathlib.Path('real.txt').write_bytes(b'precious')
+        os.symlink('real.txt', 'target.bin')
+        self.run_cmd('cp', 'files/b/up.bin', 'target.bin')
+        self.assertEqual(pathlib.Path('target.bin.part').read_bytes(), b'someone else')
+        self.assertEqual(pathlib.Path('real.txt').read_bytes(), b'precious')
+        self.assertEqual(pathlib.Path('target.bin').read_bytes(), b'new bytes')
+        self.assertEqual(sorted(p.name for p in pathlib.Path('.').glob('.target.bin.*')), [])   # no temp left
+
+    def test_a_failed_download_leaves_no_temporary_file(self):
+        pathlib.Path('up.bin').write_bytes(b'x')
+        self.run_cmd('cp', 'up.bin', 'files/b/up.bin')
+        with mock.patch.object(magehand.os, 'replace', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.run_cmd('cp', 'files/b/up.bin', 'out.bin')
+        self.assertEqual([p.name for p in pathlib.Path('.').iterdir() if p.name.startswith('.out.bin')], [])
+        self.assertFalse(pathlib.Path('out.bin').exists())
+
+    def test_bucket_key_is_remote_even_when_a_local_directory_has_the_same_name(self):
+        pathlib.Path('files').mkdir()
+        pathlib.Path('files/key').write_text('a local file that must not win')
+        pathlib.Path('up.txt').write_text('payload')
+        self.run_cmd('cp', 'up.txt', 'files/')                       # the documented trailing-slash upload
+        self.assertEqual(FakeS3.store['up.txt'][0], b'payload')
+        self.run_cmd('cp', 'up.txt', 'files/key')                    # a key that exists locally is still remote
+        self.assertEqual(FakeS3.store['key'][0], b'payload')
+        self.assertEqual(pathlib.Path('files/key').read_text(), 'a local file that must not win')
+
+    def test_a_local_path_that_starts_with_a_bucket_name_is_written_with_dot_slash(self):
+        pathlib.Path('files').mkdir()
+        pathlib.Path('files/page.html').write_text('<p>x</p>')
+        out = self.run_cmd('cp', './files/page.html', 'files/site/page.html')
+        self.assertIn('uploaded 8 bytes to files/site/page.html', out)
+        self.run_cmd('cp', 'files/site/page.html', './files/copy.html')
+        self.assertEqual(pathlib.Path('files/copy.html').read_text(), '<p>x</p>')
+        self.assertIn('starts with a bucket name', self.die('cp', 'files/a', 'files/b'))
+
+    def test_every_action_can_print_one_json_object(self):
+        pathlib.Path('up.json').write_text('{}')
+        pathlib.Path('d').mkdir()
+        pathlib.Path('d/x.txt').write_text('x')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            up = json.loads(self.run_cmd('cp', 'up.json', 'files/up.json', '--json'))
+            down = json.loads(self.run_cmd('cp', 'files/up.json', 'got.json', '--json'))
+            sync = json.loads(self.run_cmd('sync', 'd', 'files/d', '--json'))
+            url = json.loads(self.run_cmd('url', 'files/up.json', '--json'))
+        self.assertEqual((up['action'], up['direction'], up['bucket'], up['key'], up['bytes'], up['content_type']),
+                         ('cp', 'upload', 'files', 'up.json', 2, 'application/json'))
+        self.assertEqual(up['url'], 'https://files.example/demo-dev/files/up.json')
+        self.assertEqual((down['direction'], down['bytes'], down['file']), ('download', 2, 'got.json'))
+        self.assertEqual((sync['action'], sync['uploaded'], sync['unchanged'], sync['dry_run']),
+                         ('sync', ['d/x.txt'], 0, False))
+        self.assertEqual((url['action'], url['url']), ('url', 'https://files.example/demo-dev/files/up.json'))
+        self.assertIn('uploaded d/x.txt', err.getvalue())               # progress went to stderr, not stdout
+
     def test_a_missing_object_says_why(self):
         self.assertIn('NoSuchKey', self.die('cp', 'files/nope', 'x'))
 
