@@ -1,6 +1,8 @@
 """Unit tests for magehand (no network, no Docker)."""
+import contextlib
 import datetime
 import http.server
+import io
 import json
 import os
 import pathlib
@@ -109,6 +111,32 @@ class Resolve(unittest.TestCase):
         self.assertEqual(env['PORT'], '8000')
         self.assertEqual(env['DATABASE_URL'], 'postgresql://app:pw@magehand-demo-db:5432/app')
         self.assertEqual(env['REDIS_URL'], 'redis://:rpw@magehand-demo-cache:6379/0')
+
+    def bucket_app(self):
+        return {**APP, 'services': {**APP['services'], 'files': {'type': 'bucket'}},
+                'container': {'env': [{'name': 'S3_ENDPOINT',
+                                       'valueFrom': {'secretKeyRef': {'name': 'files-connection', 'key': 'endpoint'}}}]}}
+
+    def test_bucket_value_from_magehand_env_is_kept(self):
+        pathlib.Path('.magehand.env').write_text('S3_ENDPOINT=http://127.0.0.1:9000\n')
+        env = magehand.resolve_env(self.bucket_app())
+        self.assertEqual(env['S3_ENDPOINT'], 'http://127.0.0.1:9000')
+
+    def test_bucket_value_from_the_shell_is_not_blocked(self):
+        os.environ['S3_ENDPOINT'] = 'http://127.0.0.1:9000'
+        try:
+            env = magehand.resolve_env(self.bucket_app())   # no SystemExit
+        finally:
+            os.environ.pop('S3_ENDPOINT')
+        self.assertNotIn('S3_ENDPOINT', env)   # the shell's value reaches the app on its own
+
+    def test_bucket_without_a_value_warns_instead_of_asking_for_dev_up(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            env = magehand.resolve_env(self.bucket_app())   # no SystemExit
+        self.assertNotIn('S3_ENDPOINT', env)
+        self.assertIn('no local object store yet', err.getvalue())
+        self.assertNotIn('dev up', err.getvalue())
 
     def test_missing_key_fails(self):
         bad = {**APP, 'container': {'env': [
@@ -327,7 +355,7 @@ def check_app(env, services=None, image='ghcr.io/davidlarrimore/homelab-apps/dem
             'container': {'image': image, 'env': env}}
 
 
-CATALOG = {'blocks': {'postgres': {'sizes': ['1Gi', '2Gi']}, 'redis': {}, 'secret': {}, 'llm': {}},
+CATALOG = {'blocks': {'postgres': {'sizes': ['1Gi', '2Gi']}, 'redis': {}, 'secret': {}, 'llm': {}, 'bucket': {}},
            'models': [{'id': 'm1'}]}
 
 
@@ -349,6 +377,33 @@ class CheckManifests(unittest.TestCase):
         self.assertIn('search: true', texts(magehand.check_manifests(app, CATALOG), 'error')[0])
         app['services']['ai']['search'] = True
         self.assertEqual(magehand.check_manifests(app, CATALOG), [])
+
+    def bucket_app(self, env, **service):
+        return check_app(env, services={'files': dict({'type': 'bucket'}, **service)})
+
+    def test_bucket_keys_map_to_the_connection_secret(self):
+        env = [ref(var, 'files-connection', key) for var, key in
+               [('S3_ENDPOINT', 'endpoint'), ('S3_BUCKET', 'bucket'), ('S3_KEY', 'access_key_id'),
+                ('S3_SECRET', 'secret_access_key'), ('S3_REGION', 'region')]]
+        self.assertEqual(magehand.check_manifests(self.bucket_app(env, access='private'), CATALOG), [])
+
+    def test_bucket_unknown_key(self):
+        found = magehand.check_manifests(self.bucket_app([ref('X', 'files-connection', 'password')]), CATALOG)
+        self.assertIn("has no key 'password'", texts(found, 'error')[0])
+
+    def test_bucket_url_needs_access_public(self):
+        catalog = {'blocks': {'bucket': {'keys': ['endpoint', 'url'], 'key_options': {'url': 'access'}}}}
+        env = [ref('PUBLIC_URL', 'files-connection', 'url')]
+        for service in ({}, {'access': 'private'}):
+            found = magehand.check_manifests(self.bucket_app(env, **service), catalog)
+            self.assertIn('`access: public`', texts(found, 'error')[0])
+        self.assertEqual(magehand.check_manifests(self.bucket_app(env, access='public'), catalog), [])
+
+    def test_boolean_key_option_still_needs_true(self):
+        # an enumerated option's rule must not loosen the boolean ones
+        app = check_app([ref('SEARCH', 'ai-connection', 'search_url')])
+        app['services']['ai']['search'] = False
+        self.assertIn('search: true', texts(magehand.check_manifests(app, CATALOG), 'error')[0])
 
     def test_optional_block_key(self):
         app = check_app([ref('LLM_KEY', 'ai-connection', 'api_key', optional=True)])
