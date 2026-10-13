@@ -1577,6 +1577,71 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+class ArgoAccess(unittest.TestCase):
+    """status says when Argo cannot read the app's repo."""
+
+    APP = {'spec': {'sources': [{'repoURL': 'https://github.com/davidlarrimore/elvis.git'},
+                                {'repoURL': 'git@github.com:davidlarrimore/homelab.git'}]}}
+
+    def app(self, kind, message):
+        return {**self.APP, 'status': {'conditions': [{'type': kind, 'message': message}]}}
+
+    def test_status_fails_with_the_fix_when_argo_cannot_read_the_repo(self):
+        repo = 'https://github.com/davidlarrimore/elvis.git'
+        for message in (f'rpc error: code = Unknown desc = authentication required for {repo}',
+                        f'Failed to load target state: repository not found: {repo}',
+                        f"failed to list refs: could not read Username for '{repo}'"):
+            with self.subTest(message):
+                stage = magehand.argo_problem(self.app('ComparisonError', message))
+                self.assertEqual(stage['state'], 'failed')
+                self.assertIn('cannot read elvis', stage['text'])
+                self.assertIn('GitHub App installation', stage['text'])
+
+    def test_other_comparison_errors_are_pending_and_shown_and_healthy_is_none(self):
+        stage = magehand.argo_problem(self.app('ComparisonError', 'kustomize build failed: no such file'))
+        self.assertEqual(stage['state'], 'pending')
+        self.assertIn('no such file', stage['text'])
+        self.assertIsNone(magehand.argo_problem({**self.APP, 'status': {'conditions': []}}))
+        self.assertIsNone(magehand.argo_problem(self.app('OrphanedResourceWarning', 'x')))
+        self.assertIsNone(magehand.argo_problem(None))
+
+    def test_only_a_git_read_of_the_app_repo_is_an_access_problem(self):
+        for label, message in {
+                'local kustomize permission error': 'kustomize build failed: open base/x.yaml: permission denied',
+                'ssh platform source': 'rpc error: ssh: handshake failed: Permission denied (publickey) '
+                                       'for git@github.com:davidlarrimore/homelab.git',
+                'another source authentication failure': 'failed to fetch davidlarrimore/homelab.git: authentication failed',
+                'kustomize remote base': 'kustomize build failed: authentication required',
+                'numbered other source': 'Failed to load target state: failed to generate manifest for source 2 of 2: '
+                                         'rpc error: code = Unknown desc = failed to list refs: authentication required',
+                'several sources, none named': 'failed to list refs: authentication required'}.items():
+            with self.subTest(label):
+                self.assertEqual(magehand.argo_problem(self.app('ComparisonError', message))['state'], 'pending')
+        named = 'failed to list refs https://github.com/davidlarrimore/elvis.git: authentication required'
+        self.assertEqual(magehand.argo_problem(self.app('ComparisonError', named))['state'], 'failed')
+        numbered = 'failed to generate manifest for source 1 of 2: failed to list refs: authentication required'
+        self.assertEqual(magehand.argo_problem(self.app('ComparisonError', numbered))['state'], 'failed')
+
+    def test_a_failing_pod_wins_over_a_pending_render_error(self):
+        app = self.app('ComparisonError', 'kustomize build failed: no such file')
+        image = 'x@sha256:' + 'a' * 64
+        pod = {'metadata': {'name': 'elvis-1'}, 'status': {'phase': 'Running', 'containerStatuses': [
+            {'name': 'app', 'ready': False, 'imageID': image, 'state': {'waiting': {'reason': 'CrashLoopBackOff'}}}]}}
+        calls = {'pods': ({'items': [pod]}, None), 'application.argoproj.io': (app, None)}
+        with mock.patch.object(magehand, 'kubectl_json', lambda kind, *a: calls[kind]):
+            stage = magehand.dev_stage('elvis', {'digest': 'sha256:abc', 'image': image})
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('CrashLoopBackOff', stage['text'])
+
+    def test_dev_stage_reports_it_before_the_pods(self):
+        app = self.app('ComparisonError', 'repository not found: https://github.com/davidlarrimore/elvis.git')
+        calls = {'pods': ({'items': []}, None), 'application.argoproj.io': (app, None)}
+        with mock.patch.object(magehand, 'kubectl_json', lambda kind, *a: calls[kind]):
+            stage = magehand.dev_stage('elvis', {'digest': 'sha256:abc', 'image': 'x@sha256:' + 'a' * 64})
+        self.assertEqual(stage['state'], 'failed')
+        self.assertEqual(stage['stage'], 'dev')
+
+
 class PinnedLayout(unittest.TestCase):
     """homelab-apps holds only a pin for an app whose manifests are in its own repo."""
     PIN = {'repo': 'elvis', 'ref': 'a' * 40, 'image': 'ghcr.io/davidlarrimore/homelab-apps/elvis@sha256:' + 'b' * 64}

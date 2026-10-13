@@ -871,6 +871,52 @@ def pod_stage(pods, application, image, argo_error=None):
                     + (f', Argo {sync}/{health}' if application else '')}
 
 
+ARGO_REPO_ACCESS = re.compile(r'repository not found|authentication (required|failed)|could not read username'
+                              r'|remote: not found|invalid username or password', re.IGNORECASE)
+
+
+def repo_names(url):
+    """The spellings Argo's errors use for a repo URL: owner/name and name, without .git."""
+    path = re.sub(r'^(https://[^/]+/|git@[^:]+:|ssh://[^/]+/)', '', str(url or '')).removesuffix('.git')
+    return {n for n in (path, path.rsplit('/', 1)[-1]) if n}
+
+
+def argo_problem(application):
+    """What Argo CD says stops it rendering or syncing the app (a stage dict without the name), or None. A
+    refused Git read of the app's repo (not in the GitHub App installation) is a failure with the fix; it has
+    to be a Git transport error that is not Kustomize's and not about another source (the platform repo is
+    read over SSH). Any other comparison error may clear by itself, so it is only pending (and shown)."""
+    for condition in ((application or {}).get('status') or {}).get('conditions') or []:
+        if condition.get('type') not in ('ComparisonError', 'InvalidSpecError'):
+            continue
+        message = ' '.join(str(condition.get('message') or '').split())
+        spec = application.get('spec') or {}
+        sources = spec.get('sources') or [spec.get('source') or {}]
+        repo = next((str(s.get('repoURL')) for s in sources if 'github.com/' in str(s.get('repoURL')) and
+                     str(s.get('repoURL')).startswith('https://')), '')
+        shown = repo.rsplit('/', 1)[-1].removesuffix('.git') if repo else 'the app repo'
+        lower = message.lower()
+        # Which source failed: Argo's "source N of M" when it says, else the app repo must be named in the
+        # message when there are several sources (the platform repo is another, read over SSH). Ambiguous
+        # errors stay pending.
+        numbered = re.search(r'source (\d+) of (\d+)', lower)
+        if numbered:
+            index = int(numbered.group(1)) - 1
+            ours = 0 <= index < len(sources) and str(sources[index].get('repoURL')) == repo
+        elif len(sources) > 1:
+            ours = any(n.lower() in lower for n in repo_names(repo) if '/' in n)
+        else:
+            ours = bool(repo)
+        about_other = not ours
+        if ARGO_REPO_ACCESS.search(message) and 'kustomize' not in lower and not about_other:
+            return {'state': 'failed',
+                    'text': f'Argo CD cannot read {shown}: add it to the GitHub App installation it reads app repos '
+                            f'through (GitHub > Settings > Applications > Configure > Repository access). '
+                            f'Argo says: {message[:160]}'}
+        return {'state': 'pending', 'text': f'Argo CD cannot render the app yet: {message[:200]}'}
+    return None
+
+
 def dev_stage(name, deploy, cluster=True):
     """The running pods for a merged dev deploy, or an unknown stage saying why they weren't read."""
     unknown = lambda why: {'stage': 'dev', 'state': 'unknown',  # noqa: E731
@@ -881,7 +927,11 @@ def dev_stage(name, deploy, cluster=True):
     if err:
         return unknown(err)
     application, argo_error = kubectl_json('application.argoproj.io', f'{name}-dev', '-n', 'argocd')
-    return pod_stage(pods, application, deploy['image'], argo_error)
+    problem = argo_problem(application)
+    stage = pod_stage(pods, application, deploy['image'], argo_error)
+    if problem and not (stage['state'] == 'failed' and problem['state'] != 'failed'):
+        return {'stage': 'dev', **problem}  # a pod that cannot start is more specific than a render still pending
+    return stage
 
 
 def build_runs(repo, head):
