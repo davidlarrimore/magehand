@@ -241,7 +241,7 @@ def load_app(name, root=None):
     pod = deployment['spec']['template']['spec']
     return {'name': name, 'spec': spec, 'services': spec.get('services') or {}, 'container': pod['containers'][0],
             'pod': pod, 'where': where, 'deployment_file': path, 'root': local.parent if local else None,
-            'pin': pinned}
+            'pin': pinned, 'selector': ((deployment['spec'].get('selector') or {}).get('matchLabels') or {})}
 
 
 def app_here(name=None):
@@ -861,9 +861,11 @@ def pod_stage(pods, application, image, argo_error=None):
     a pod can't start, otherwise a rollout in progress. Without the
     application (`argo_error`: why) pods that are ready are 'unknown', never a verified rollout."""
     digest = image.rsplit('@', 1)[-1]
+    # A CronJob's run (a pod owned by a Job) is not the app's rollout: it may run the previous image until it ends.
     live = [p for p in (pods or {}).get('items') or []
             if not (p.get('metadata') or {}).get('deletionTimestamp')
-            and (p.get('status') or {}).get('phase') not in ('Succeeded', 'Failed')]
+            and (p.get('status') or {}).get('phase') not in ('Succeeded', 'Failed')
+            and not any(o.get('kind') == 'Job' for o in (p.get('metadata') or {}).get('ownerReferences') or [])]
     if not any(BLOCK_LABEL not in ((p.get('metadata') or {}).get('labels') or {}) for p in live):
         return {'stage': 'dev', 'state': 'pending', 'text': f'no pods yet for {digest[:19]}'}
     ready = stuck = 0
@@ -2466,6 +2468,10 @@ OWN_AUTH = re.compile(r'''^\s*(?:import|from)\s+(passlib|bcrypt|argon2|flask_log
                       r'''|from\s+["'](bcrypt|bcryptjs|passport[\w-]*|next-auth|@auth/[\w-]+|jsonwebtoken|express-session)["']''',
                       re.MULTILINE)
 LOCAL_DB = re.compile(r'''sqlite3\.connect\(\s*(?!["']:memory:)|better-sqlite3|new\s+sqlite3\.Database\(|gorm\.Open\(\s*sqlite''')
+# A scheduler inside the app's process: it runs once per replica and stops with the pod.
+IN_PROCESS_SCHEDULER = re.compile(r'''^\s*(?:import|from)\s+(apscheduler|schedule|crontab|rq_scheduler)\b'''
+                                  r'''|require\(\s*["'](node-cron|node-schedule|cron|croner)["']\s*\)'''
+                                  r'''|from\s+["'](node-cron|node-schedule|cron|croner)["']''', re.MULTILINE)
 SECRET_NAME_RE = re.compile(r'(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)$')
 SECRET_VALUE_RE = re.compile(r'^(sk-|ghp_|github_pat_|xox[bp]-|hvs\.)[A-Za-z0-9_-]{8,}')
 LAB_URL = re.compile(r'https?://[a-z0-9.-]+\.lab\.davidlarrimore\.com')
@@ -2603,6 +2609,13 @@ def check_manifests(app, catalog):
         found.append(finding('error', deployment_file, f'image {image or "(none)"}: an app runs only '
                              f'its own image, pinned by digest (ghcr.io/davidlarrimore/homelab-apps/{app["name"]}@sha256:...)',
                              'README "How an app is put together"'))
+    return found + env_findings(app, container, deployment_file, catalog)
+
+
+def env_findings(app, container, deployment_file, catalog):
+    """Rules for a container's env (the Deployment's, or a CronJob's): each Secret it maps is a block's or the
+    app's own, a block key exists with the block's options, and nothing is optional or bulk-mapped."""
+    found = []
     for item in container.get('env') or []:
         ref = ((item.get('valueFrom') or {}).get('secretKeyRef')) or {}
         if not ref:
@@ -2782,6 +2795,11 @@ def check_code(root, app, catalog=None):
                                  'root filesystem is read-only and replaced on every deploy; keep data in a postgres '
                                  'block, or on a mounted volume (PVC) if it must be a file',
                                  'homelab-apps AGENTS.md "Storage and resources"'))
+        for match in IN_PROCESS_SCHEDULER.finditer(text):
+            lib = next(g for g in match.groups() if g)
+            found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'{lib}: a scheduler in the '
+                                 "app's process runs once per replica and stops when the pod restarts; run scheduled "
+                                 'work as a CronJob (`magehand job add`)', JOB_SEE))
     return found
 
 
@@ -2952,7 +2970,7 @@ def cmd_check(a):
         else:
             print(f'magehand check {name}: {note}')
         sys.exit(0)
-    found = (check_manifests(app, catalog) if app else seeded_name_findings(name, root)) \
+    found = (check_manifests(app, catalog) + check_jobs(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
     if not manifests_only:
         found += check_code(root, app, catalog) + check_agents_drift(root) + check_merged_branch(root)
@@ -3062,7 +3080,8 @@ llm block's base_url and search_url); no own login or passwords (authentik
 adds X-authentik-* headers); the root filesystem is read-only (state goes in
 a block); a block key is never `optional: true`; merging code deploys dev by
 itself, `deploy/` included (never pin images by hand); the code calls only
-models its llm block requests.
+models its llm block requests; scheduled work is a CronJob that
+`magehand job add` writes (never a scheduler inside the app's process).
 """
 
 
@@ -3667,11 +3686,508 @@ def cmd_bucket(a):
         return
 
 
+# --- job: scheduled work, a CronJob in the app's own deploy/base ---------------------------
+# The hosted-platform model (homelab docs/app-jobs-plan.md): a job is the app's image run with another command
+# on a schedule, with the app's env. `job add` writes the CronJob; merging deploys it like the rest of deploy/.
+
+JOB_NAME = re.compile(r'^[a-z]([a-z0-9-]{0,50}[a-z0-9])?$')  # a CronJob name: its Jobs add 11 characters (63 at most)
+# The schedule grammar of Kubernetes' CronJob controller (robfig/cron v3 ParseStandard): five fields, each a
+# list of `*`, `?`, a value or a low-high range, optionally /step (a whole number above 0); months and days of
+# the week also by name; days of the week 0-6 (Sunday is 0). Or a descriptor, spelled exactly (a schedule is
+# one only when it starts with @). `@every DURATION` is refused: its duration is Go's, which we can't check.
+CRON_MACROS = ('@yearly', '@annually', '@monthly', '@weekly', '@daily', '@midnight', '@hourly')
+CRON_MONTHS = {m: i + 1 for i, m in enumerate(('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct',
+                                               'nov', 'dec'))}
+CRON_DAYS = {d: i for i, d in enumerate(('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'))}
+CRON_FIELDS = (('minute', 0, 59, {}), ('hour', 0, 23, {}), ('day of month', 1, 31, {}), ('month', 1, 12, CRON_MONTHS),
+               ('day of week', 0, 6, CRON_DAYS))
+JOB_LABEL = 'homelab.davidlarrimore.com/job'  # on a job's pods; never app.kubernetes.io/name, the app's selector
+JOB_TIMEOUT, JOB_MEMORY, JOB_TIMEZONE = '10m', '256Mi', 'Etc/UTC'
+JOB_MAX_MEMORY_MI = 1024   # a container's memory limit at most (homelab platform/agent-apps-baseline limit-range)
+JOB_START_DEADLINE = 3600  # a run that can't start within an hour is skipped, and the controller never gives up
+JOB_HISTORY = 3            # finished runs kept per CronJob, for `job ls`
+JOB_MIN_INTERVAL = 5       # minutes: more often than this is a warning
+JOB_SEE = 'recipes "Run background or scheduled work"'
+
+
+def cron_problem(schedule):
+    """Why `schedule` is not a CronJob schedule, or None. Five fields or a macro; the time zone goes in
+    timeZone, not the schedule."""
+    text = str(schedule or '')
+    if text.startswith('@'):
+        if text in CRON_MACROS:
+            return None
+        if text.startswith('@every'):
+            return '@every is not supported: write five cron fields (*/30 * * * * for every 30 minutes)'
+        return f'{text!r} is not a descriptor: {", ".join(CRON_MACROS)}, spelled exactly'
+    if text.startswith(('TZ=', 'CRON_TZ=')):
+        return 'set the time zone with timeZone (--timezone), not in the schedule'
+    fields = text.split()
+    if len(fields) != 5:
+        return (f'{text!r} is not a cron schedule: five fields (minute hour day-of-month month day-of-week), '
+                f'or one of {", ".join(CRON_MACROS)}')
+    for field, (what, low, high, names) in zip(fields, CRON_FIELDS):
+        problem = cron_field_problem(field, low, high, names)
+        if problem:
+            return f'{what} {field!r}: {problem}'
+    return None
+
+
+def cron_field_problem(field, low, high, names):
+    """Why one cron field is not valid for the controller's parser, or None."""
+    def value(text):
+        number = int(text) if text.isdigit() else names.get(text.lower())
+        return number if number is not None and low <= number <= high else None
+    named = f' or {", ".join(n.upper() for n in names)}' if names else ''
+    for part in field.split(','):
+        span, slash, step = part.partition('/')
+        if slash and not (step.isdigit() and int(step) > 0):
+            return 'a step (after /) is a whole number above 0'
+        if span in ('*', '?'):
+            continue
+        start, dash, end = span.partition('-')
+        first, last = value(start), (value(end) if dash else value(start))
+        if first is None or last is None:
+            return f'values are {low} to {high}{named}; parts are *, a value or a range (1-5), with an optional /step'
+        if first > last:
+            return f'the range {span} goes from high to low'
+    return None
+
+
+def cron_too_frequent(schedule):
+    """True when the schedule's minute field runs more often than every JOB_MIN_INTERVAL minutes."""
+    fields = str(schedule or '').split()
+    if len(fields) != 5:
+        return False
+    minutes = set()
+    for part in fields[0].split(','):
+        base, slash, step = part.partition('/')
+        step = int(step) if step.isdigit() and int(step) > 0 else 1
+        if base == '*':
+            low, high = 0, 59
+        elif '-' in base and all(n.isdigit() for n in base.split('-', 1)):
+            low, high = (int(n) for n in base.split('-', 1))
+        elif base.isdigit():
+            low, high = int(base), (59 if slash else int(base))  # "5/10": from minute 5, every 10
+        else:
+            return False
+        minutes.update(range(low, high + 1, step))
+    ordered = sorted(minutes)
+    if len(ordered) < 2:
+        return False
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])] + [60 - ordered[-1] + ordered[0]]
+    return min(gaps) < JOB_MIN_INTERVAL
+
+
+def duration_seconds(text):
+    """Seconds in '90s', '10m' or '2h', or None."""
+    match = re.fullmatch(r'(\d+)([smh])', str(text or ''))
+    if not match or int(match.group(1)) == 0:
+        return None
+    return int(match.group(1)) * {'s': 1, 'm': 60, 'h': 3600}[match.group(2)]
+
+
+def memory_mi(text):
+    """MiB in '256Mi' or '1Gi', or None."""
+    match = re.fullmatch(r'(\d+)(Mi|Gi)', str(text or ''))
+    if not match or int(match.group(1)) == 0:
+        return None
+    return int(match.group(1)) * (1024 if match.group(2) == 'Gi' else 1)
+
+
+def job_manifest(app, name, schedule, command, timeout, memory, timezone):
+    """The CronJob for job `name`: the Deployment's image, env and security settings with `command`, and the
+    settings the platform needs (no overlapping runs, deadlines, one retry, kept history). Its pods have their
+    own labels, without app.kubernetes.io/name (the app's selector), so the app's Service never sends them
+    requests whatever the job is called."""
+    container, pod = app['container'], app['pod']
+    labels = {JOB_LABEL: name, 'app.kubernetes.io/part-of': app['name'], 'app.kubernetes.io/component': 'job'}
+    job = {'name': 'app', 'image': container.get('image') or f'ghcr.io/davidlarrimore/homelab-apps/{app["name"]}',
+           'command': list(command)}
+    for key in ('env', 'envFrom'):
+        if container.get(key):
+            job[key] = json.loads(json.dumps(container[key]))
+    job['resources'] = {'requests': {'cpu': '10m', 'memory': f'{min(memory_mi(memory), 64)}Mi'},
+                        'limits': {'memory': memory}}
+    job['securityContext'] = json.loads(json.dumps(container.get('securityContext') or {
+        'allowPrivilegeEscalation': False, 'readOnlyRootFilesystem': True, 'capabilities': {'drop': ['ALL']}}))
+    job['volumeMounts'] = [{'name': 'tmp', 'mountPath': '/tmp'}]  # nosec B108  # an emptyDir: the root is read-only
+    spec = {'restartPolicy': 'Never', 'automountServiceAccountToken': False,
+            'securityContext': json.loads(json.dumps(pod.get('securityContext') or {
+                'runAsNonRoot': True, 'seccompProfile': {'type': 'RuntimeDefault'}})),
+            'containers': [job], 'volumes': [{'name': 'tmp', 'emptyDir': {'sizeLimit': '256Mi'}}]}
+    return {'apiVersion': 'batch/v1', 'kind': 'CronJob', 'metadata': {'name': name, 'labels': dict(labels)},
+            'spec': {'schedule': schedule, 'timeZone': timezone, 'concurrencyPolicy': 'Forbid',
+                     'startingDeadlineSeconds': JOB_START_DEADLINE, 'successfulJobsHistoryLimit': JOB_HISTORY,
+                     'failedJobsHistoryLimit': JOB_HISTORY,
+                     'jobTemplate': {'spec': {'backoffLimit': 1, 'activeDeadlineSeconds': timeout,
+                                              'template': {'metadata': {'labels': labels}, 'spec': spec}}}}}
+
+
+def kustomization_resources(text):
+    """The resources of a kustomization.yaml's text (a list), or None when it is not a Kustomization."""
+    try:
+        spec = yaml.safe_load(text) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(spec, dict) or not isinstance(spec.get('resources') or [], list):
+        return None
+    return [str(r) for r in spec.get('resources') or []]
+
+
+# resources as a flow list, on one line or several: `resources: [a.yaml, b.yaml]`.
+FLOW_RESOURCES = re.compile(r'^resources:[ \t]*\[(?P<items>[^\]]*)\]', re.MULTILINE)
+
+
+def flow_items(match):
+    try:
+        items = yaml.safe_load('[' + match.group('items') + ']')
+    except yaml.YAMLError:
+        return None
+    return [str(r) for r in items] if isinstance(items, list) else None
+
+
+def add_resource(text, entry):
+    """kustomization.yaml's text with `entry` added to resources, keeping its comments and layout (a flow list
+    is rewritten on one line). edit_kustomization checks the result."""
+    flow = FLOW_RESOURCES.search(text)
+    if flow:
+        items = flow_items(flow)
+        if items is None:
+            return text
+        return text[:flow.start()] + 'resources: [' + ', '.join(items + [entry]) + ']' + text[flow.end():]
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if not re.match(r'^resources:\s*(#.*)?$', line.rstrip('\n')):
+            continue
+        last, indent = i, '  '
+        for j in range(i + 1, len(lines)):
+            stripped = lines[j].strip()
+            if stripped.startswith('-') and lines[j][:1] in (' ', '-'):
+                last, indent = j, lines[j][:len(lines[j]) - len(lines[j].lstrip())]
+            elif stripped and not stripped.startswith('#'):
+                break
+        if not lines[last].endswith('\n'):
+            lines[last] += '\n'
+        lines.insert(last + 1, f'{indent}- {entry}\n')
+        return ''.join(lines)
+    return text + ('\n' if text and not text.endswith('\n') else '') + f'resources:\n  - {entry}\n'
+
+
+def remove_resource(text, entry):
+    """kustomization.yaml's text without `entry` in resources. edit_kustomization checks the result."""
+    flow = FLOW_RESOURCES.search(text)
+    if flow:
+        items = flow_items(flow)
+        if items is None:
+            return text
+        return text[:flow.start()] + 'resources: [' + ', '.join(i for i in items if i != entry) + ']' + text[flow.end():]
+    return ''.join(line for line in text.splitlines(keepends=True)
+                   if not re.match(r'^\s*-\s*["\']?' + re.escape(entry) + r'["\']?\s*(#.*)?$', line.rstrip('\n')))
+
+
+def edit_kustomization(text, entry, add=True):
+    """kustomization.yaml's text with `entry` added to (or removed from) resources, or None when the edit
+    would change anything else: every other resource and key must come out the same."""
+    try:
+        before = yaml.safe_load(text) or {}
+    except yaml.YAMLError:
+        return None
+    old = kustomization_resources(text)
+    if not isinstance(before, dict) or old is None or (entry in old) == add:
+        return None
+    new = (add_resource if add else remove_resource)(text, entry)
+    try:
+        after = yaml.safe_load(new) or {}
+    except yaml.YAMLError:
+        return None
+    wanted = old + [entry] if add else [r for r in old if r != entry]
+    rest = lambda spec: {k: v for k, v in spec.items() if k != 'resources'}  # noqa: E731
+    if not isinstance(after, dict) or kustomization_resources(new) != wanted or rest(after) != rest(before):
+        return None
+    return new
+
+
+def deploy_documents(local):
+    """(file, document) for every YAML document in deploy/base, dev and prod."""
+    for part in DEPLOY_DIRS:
+        for path in sorted((local / part).glob('*.y*ml')) if (local / part).is_dir() else ():
+            try:
+                docs = list(yaml.safe_load_all(path.read_text()))
+            except (OSError, yaml.YAMLError):
+                continue  # load_app and check_deploy_files report a file that isn't YAML
+            for doc in docs:
+                if isinstance(doc, dict):
+                    yield f'{DEPLOY}/{part}/{path.name}', doc
+
+
+def cronjob_parts(doc):
+    """(CronJob spec, Job spec, pod spec, first container) of a CronJob document, each {} when missing."""
+    spec = doc.get('spec') or {}
+    job = (spec.get('jobTemplate') or {}).get('spec') or {}
+    pod = (job.get('template') or {}).get('spec') or {}
+    return spec, job, pod, ((pod.get('containers') or [{}])[0] or {})
+
+
+def check_jobs(app, catalog):
+    """Rules for the CronJobs (and bare Jobs) in a checkout's deploy/: the settings the platform needs, the
+    app's own image, Secrets that exist, pods the app's Service doesn't select, and listed in the base."""
+    if app.get('where') != DEPLOY or not app.get('root'):
+        return []
+    local = pathlib.Path(app['root']) / DEPLOY
+    found = []
+    listed = None
+    kustomization = local / 'base' / 'kustomization.yaml'
+    if kustomization.is_file():
+        listed = kustomization_resources(kustomization.read_text())
+    own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name']) + r'(@sha256:[0-9a-f]{64})?'
+    for where, doc in deploy_documents(local):
+        kind, name = doc.get('kind'), str((doc.get('metadata') or {}).get('name') or '')
+        if kind == 'Job':
+            found.append(finding('warning', where, f'Job {name}: one-off Jobs are not supported yet (it runs once, '
+                                 'when first synced, and Argo CD keeps re-creating it); scheduled work is a CronJob '
+                                 '(`magehand job add`)', JOB_SEE))
+            continue
+        if kind != 'CronJob':
+            continue
+        spec, job, pod, container = cronjob_parts(doc)
+        label = f'CronJob {name}'
+        if not JOB_NAME.match(name):
+            found.append(finding('error', where, f'{label}: a job name is lowercase letters, digits and dashes, '
+                                 'starting with a letter (at most 52)', JOB_SEE))
+        problem = cron_problem(spec.get('schedule'))
+        if problem:
+            found.append(finding('error', where, f'{label}: schedule {problem}', JOB_SEE))
+        elif cron_too_frequent(spec.get('schedule')):
+            found.append(finding('warning', where, f'{label}: runs more often than every {JOB_MIN_INTERVAL} '
+                                 'minutes; a loop in a worker suits that better than a new pod each time', JOB_SEE))
+        if spec.get('concurrencyPolicy') != 'Forbid':
+            found.append(finding('error', where, f'{label}: concurrencyPolicy: Forbid is required: without it a '
+                                 'slow run and the next one run at the same time', JOB_SEE))
+        if not spec.get('startingDeadlineSeconds'):
+            found.append(finding('error', where, f'{label}: startingDeadlineSeconds is required: without it the '
+                                 'controller stops scheduling the job for good after 100 missed runs', JOB_SEE))
+        if not job.get('activeDeadlineSeconds'):
+            found.append(finding('error', where, f'{label}: jobTemplate.spec.activeDeadlineSeconds (the timeout) is '
+                                 'required: with Forbid, a run that hangs blocks every later run', JOB_SEE))
+        if job.get('backoffLimit') is None or int(job.get('backoffLimit') or 0) > 2:
+            found.append(finding('error', where, f'{label}: jobTemplate.spec.backoffLimit 0 to 2 is required (the '
+                                 'default, 6, retries a failing run for hours)', JOB_SEE))
+        image = str(container.get('image') or '')
+        if not re.fullmatch(own, image):
+            found.append(finding('error', where, f'{label}: image {image or "(none)"}: a job runs the app\'s own image '
+                                 f'(ghcr.io/davidlarrimore/homelab-apps/{app["name"]}, without a digest)', JOB_SEE))
+        labels = ((job.get('template') or {}).get('metadata') or {}).get('labels') or {}
+        selector = app.get('selector') or {}
+        if selector and all(labels.get(k) == v for k, v in selector.items()):
+            found.append(finding('error', where, f'{label}: its pods carry the Deployment\'s labels '
+                                 f'({", ".join(f"{k}={v}" for k, v in selector.items())}), so the app\'s Service would '
+                                 'send requests to a job; give them their own (`magehand job add` does)', JOB_SEE))
+        found += env_findings(app, container, where, catalog)
+        if where.startswith(f'{DEPLOY}/base/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
+            found.append(finding('error', where, f'{label}: not in deploy/base/kustomization.yaml resources, so it '
+                                 'is never deployed', JOB_SEE))
+    return found
+
+
+def job_app(named=None):
+    """The app of this checkout, from its deploy/: `magehand job` edits and lists that app's jobs only."""
+    here = app_repo_here()
+    if not here:
+        die("run `magehand job` inside the app's repo: its jobs are files in that repo's deploy/base")
+    if named and named != here:
+        die(f"this checkout is {here}'s code: `magehand job` works only on {here}'s jobs, not {named}'s")
+    app = app_here(here)
+    if app.get('where') != DEPLOY or not app.get('root'):
+        die(f'{here} has no deploy/ with a base in this checkout: its jobs go in deploy/base next to the Deployment')
+    return app
+
+
+def local_jobs(app):
+    """The CronJobs in the checkout's deploy/ as rows: name, file, schedule, time zone, command."""
+    rows = []
+    for where, doc in deploy_documents(pathlib.Path(app['root']) / DEPLOY):
+        if doc.get('kind') == 'CronJob':
+            spec, _, _, container = cronjob_parts(doc)
+            rows.append({'name': str((doc.get('metadata') or {}).get('name') or ''), 'file': where,
+                         'schedule': spec.get('schedule'), 'timezone': spec.get('timeZone') or 'UTC',
+                         'command': container.get('command') or container.get('args') or []})
+    return rows
+
+
+def job_runs(jobs, cronjob):
+    """The finished and running Jobs of `cronjob`, newest first: name, state, start, seconds."""
+    runs = []
+    for job in jobs:
+        meta = job.get('metadata') or {}
+        if not any(o.get('kind') == 'CronJob' and o.get('name') == cronjob for o in meta.get('ownerReferences') or []):
+            continue
+        status = job.get('status') or {}
+        failed = next((c for c in status.get('conditions') or []
+                       if c.get('type') == 'Failed' and c.get('status') == 'True'), None)
+        state = 'ok' if status.get('succeeded') else 'failed' if failed else 'pending'
+        end = status.get('completionTime') or (failed or {}).get('lastTransitionTime')
+        runs.append({'job': meta.get('name'), 'state': state, 'started': status.get('startTime'),
+                     'seconds': seconds_between(status.get('startTime'), end) if end else None})
+    return sorted(runs, key=lambda r: r['started'] or '', reverse=True)
+
+
+def job_rows(local, cluster):
+    """The checkout's jobs with what dev has (cluster: kubectl's JSON of cronjobs and jobs, or None)."""
+    rows = {r['name']: dict(r, dev=None) for r in local}
+    items = (cluster or {}).get('items') or []
+    jobs = [i for i in items if i.get('kind') == 'Job']
+    for cron in (i for i in items if i.get('kind') == 'CronJob'):
+        name = (cron.get('metadata') or {}).get('name')
+        status, spec = cron.get('status') or {}, cron.get('spec') or {}
+        row = rows.setdefault(name, {'name': name, 'file': None, 'schedule': spec.get('schedule'),
+                                     'timezone': spec.get('timeZone') or 'UTC', 'command': [], 'dev': None})
+        row['dev'] = {'suspended': bool(spec.get('suspend')), 'last_schedule': status.get('lastScheduleTime'),
+                      'last_success': status.get('lastSuccessfulTime'), 'active': len(status.get('active') or []),
+                      'runs': job_runs(jobs, name)}
+    return sorted(rows.values(), key=lambda r: r['name'])
+
+
+def when(stamp):
+    """YYYY-MM-DD HH:MMZ of a Kubernetes timestamp."""
+    return f'{stamp[:10]} {clock(stamp)}' if stamp else 'never'
+
+
+def job_add(a, app, base):
+    command = list(getattr(a, 'cmd', None) or [])
+    if not command:
+        usage('job', 'give the command after --, e.g. magehand job add collect --schedule "15 6 * * *" '
+                     '-- python -m jobs.collect')
+    if not JOB_NAME.match(a.name):
+        usage('job', f'job name {a.name!r}: lowercase letters, digits and dashes, starting with a letter (at most 52)')
+    problem = cron_problem(a.schedule)
+    if problem:
+        usage('job', f'--schedule {problem}')
+    timeout = duration_seconds(a.timeout)
+    if not timeout:
+        usage('job', f'--timeout {a.timeout!r}: a number with s, m or h (90s, 10m, 2h)')
+    mi = memory_mi(a.memory)
+    if not mi or mi > JOB_MAX_MEMORY_MI:
+        usage('job', f'--memory {a.memory!r}: Mi or Gi, at most {JOB_MAX_MEMORY_MI}Mi (a container\'s limit)')
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo(a.timezone)
+    except (ImportError, ValueError, LookupError, OSError):
+        usage('job', f'--timezone {a.timezone!r}: an IANA zone such as Etc/UTC or America/New_York')
+    if any(r['name'] == a.name for r in local_jobs(app)):
+        die(f'job {a.name} exists: edit its file, or `magehand job rm {a.name}` first')
+    path = base / f'job-{a.name}.yaml'
+    if path.exists():
+        die(f'{DEPLOY}/base/{path.name} exists: pick another name or remove the file')
+    if cron_too_frequent(a.schedule):
+        print(f'warning: {a.schedule!r} runs more often than every {JOB_MIN_INTERVAL} minutes', file=sys.stderr)
+    manifest = job_manifest(app, a.name, a.schedule, command, timeout, a.memory, a.timezone)
+    pod_labels = manifest['spec']['jobTemplate']['spec']['template']['metadata']['labels']
+    selector = app.get('selector') or {}
+    if selector and all(pod_labels.get(k) == v for k, v in selector.items()):
+        die(f'the Deployment selects pods by {", ".join(f"{k}={v}" for k, v in selector.items())}, which a job\'s '
+            "pods would match, so the app's Service would send them requests: select the app's pods by "
+            'app.kubernetes.io/name')
+    # Every check before any write: the kustomization edit is made (and verified) first, written last.
+    kustomization = base / 'kustomization.yaml'
+    listed = new = None
+    if kustomization.is_file():
+        new = edit_kustomization(kustomization.read_text(), path.name)
+        if new is None:
+            die(f'could not add {path.name} to {DEPLOY}/base/kustomization.yaml without changing its other '
+                'resources (an unusual layout): nothing written. Add the job by hand, or write resources as a '
+                'block list (`resources:` then `  - deployment.yaml` lines)')
+        listed = f'{DEPLOY}/base/kustomization.yaml'
+    header = (f'# Job {a.name}: written by `magehand job add`. Edit it freely; `magehand check` checks it.\n'
+              f'# The app\'s image and env with another command; `magehand job ls` shows its runs in dev.\n')
+    path.write_text(header + yaml.safe_dump(manifest, sort_keys=False, default_flow_style=False))
+    if new is not None:
+        kustomization.write_text(new)
+    if a.json:
+        print(json.dumps({'action': 'add', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed,
+                          'schedule': a.schedule, 'timezone': a.timezone, 'command': command,
+                          'timeout_seconds': timeout, 'memory': a.memory}, indent=1))
+        return
+    print(f'wrote {DEPLOY}/base/{path.name}: {a.schedule} ({a.timezone}), {shlex.join(command)}, '
+          f'timeout {a.timeout}, memory {a.memory}')
+    print(f'added it to {listed}' if listed else
+          f'warning: no {DEPLOY}/base/kustomization.yaml: list {path.name} in the base\'s resources', file=sys.stderr)
+    print('next: `magehand check`, commit, and merge; the platform deploys it to dev with the rest of deploy/',
+          file=sys.stderr)
+
+
+def job_rm(a, app, base):
+    path = base / f'job-{a.name}.yaml'
+    if not path.is_file():
+        names = [r['name'] for r in local_jobs(app)]
+        close = difflib.get_close_matches(a.name, names, n=1)
+        die(f'no {DEPLOY}/base/{path.name}' + (f"; did you mean '{close[0]}'?" if close else '')
+            + (f' (jobs: {", ".join(names)}; a job not written by `job add` is removed by hand)' if names else ''))
+    kustomization = base / 'kustomization.yaml'
+    listed = new = None
+    if kustomization.is_file():
+        text = kustomization.read_text()
+        if path.name in (kustomization_resources(text) or []):
+            new = edit_kustomization(text, path.name, add=False)
+            if new is None:
+                die(f'could not take {path.name} out of {DEPLOY}/base/kustomization.yaml without changing its other '
+                    'resources: nothing removed. Remove the file and its entry by hand')
+            listed = f'{DEPLOY}/base/kustomization.yaml'
+    path.unlink()
+    if new is not None:
+        kustomization.write_text(new)
+    if a.json:
+        print(json.dumps({'action': 'rm', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed}))
+        return
+    print(f'removed {DEPLOY}/base/{path.name}' + (f' and its line in {listed}' if listed else ''))
+    print('merging removes the CronJob from dev (its finished runs go with it)', file=sys.stderr)
+
+
+def job_ls(a, app):
+    namespace = f'{app["name"]}-dev'
+    cluster, why = (None, '--no-cluster') if a.no_cluster else kubectl_json('cronjobs,jobs', '-n', namespace)
+    rows = job_rows(local_jobs(app), cluster)
+    if a.json:
+        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows}, indent=1))
+        return
+    if not rows:
+        print(f'{app["name"]} has no jobs: add one with `magehand job add NAME --schedule CRON -- COMMAND`')
+        return
+    for row in rows:
+        where = row['file'] or 'in dev only: not in this checkout\'s deploy/ (removed on this branch?)'
+        command = shlex.join(map(str, row['command'])) if row['command'] else '-'
+        print(f'{row["name"]}: {row["schedule"]} ({row["timezone"]}), {command} [{where}]')
+        dev = row['dev']
+        if cluster is None:
+            print(f'  dev: not checked ({why})')
+        elif dev is None:
+            print('  dev: not deployed yet (it deploys when merged)')
+        else:
+            state = 'suspended' if dev['suspended'] else f'{dev["active"]} running' if dev['active'] else 'idle'
+            print(f'  dev: {state}; last run {when(dev["last_schedule"])}, last success {when(dev["last_success"])}')
+            for run in dev['runs']:
+                took = f', {run["seconds"]}s' if run['seconds'] is not None else ''
+                print(f'    {STATUS_MARK[run["state"]]} {run["job"]} {when(run["started"])}{took}')
+            if dev['runs']:
+                print(f'  logs: kubectl -n {namespace} logs job/{dev["runs"][0]["job"]}')
+
+
+def cmd_job(a):
+    app = job_app(a.app_flag)
+    base = pathlib.Path(app['root']) / DEPLOY / 'base'
+    if a.job_action == 'add':
+        job_add(a, app, base)
+    elif a.job_action == 'rm':
+        job_rm(a, app, base)
+    else:
+        job_ls(a, app)
+
+
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new',)),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'update-agents')),
-          ('ship an app', ('release',)),
+          ('ship an app', ('release', 'job')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
 SHORT = {}
@@ -3796,6 +4312,46 @@ def build_parser():
     p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read the dev pods with kubectl (GitHub only)")
     json_option(p)
+    p = command('job', cmd_job, 'add, remove and list scheduled jobs (CronJobs)', "add, remove or list the app's scheduled jobs: CronJobs in its deploy/base that run its image with another command",
+                'A job is the app\'s own image run on a schedule with another command and the Deployment\'s env (its\n'
+                'blocks, keys and settings), in a fresh pod that exits when the command does. `add` writes\n'
+                'deploy/base/job-NAME.yaml with the settings the platform needs (no overlapping runs, a start\n'
+                'deadline, the timeout, one retry, three runs kept) and lists it in the base\'s kustomization;\n'
+                '`rm` removes both. Commit and merge: the platform deploys it to dev with the rest of deploy/.\n'
+                'Failed and missed runs alert the owner by themselves. `ls` reads dev\'s CronJobs and runs with\n'
+                'read-only `kubectl get` (--no-cluster skips it) and prints the command for the last run\'s logs.\n'
+                'Make the command safe to run twice, exit non-zero on failure and write nothing then.\n\n'
+                'examples:\n'
+                '  magehand job add collect --schedule "15 6 * * *" -- python -m jobs.collect\n'
+                '  magehand job add cleanup --schedule @hourly --timeout 2m --memory 128Mi -- python -m jobs.cleanup\n'
+                '  magehand job add report --schedule "0 8 * * 1" --timezone America/New_York -- python -m jobs.report\n'
+                '  magehand job ls\n'
+                '  magehand job rm cleanup')
+    p.add_argument('-a', '--app', dest='app_flag', metavar='APP',
+                   help='the app of this checkout (kept for scripts; another app is refused)')
+    jsub = p.add_subparsers(dest='job_action', metavar='ACTION', required=True, parser_class=Parser)
+    q = jsub.add_parser('add', help='write a job (a CronJob) into deploy/base',
+                        usage='magehand job add NAME --schedule CRON [--timezone ZONE] [--timeout DURATION] '
+                              '[--memory SIZE] [--json] -- COMMAND...')
+    q.add_argument('name', metavar='NAME', help='the job: lowercase letters, digits and dashes')
+    q.add_argument('--schedule', required=True, metavar='CRON',
+                   help='five cron fields ("15 6 * * *") or @hourly, @daily, ...; in --timezone')
+    q.add_argument('--timezone', default=JOB_TIMEZONE, metavar='ZONE',
+                   help='an IANA time zone for the schedule (default: %(default)s); avoid 01:00-03:00 where '
+                        'clocks change')
+    q.add_argument('--timeout', default=JOB_TIMEOUT, metavar='DURATION',
+                   help='stop a run after this long: 90s, 10m, 2h (default: %(default)s)')
+    q.add_argument('--memory', default=JOB_MEMORY, metavar='SIZE',
+                   help=f'the memory limit, at most {JOB_MAX_MEMORY_MI}Mi (default: %(default)s)')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
+    q.set_defaults(cmd=[])  # the words after `--`: main() takes them off before parsing
+    q = jsub.add_parser('rm', help='remove a job that `job add` wrote')
+    q.add_argument('name', metavar='NAME')
+    q.add_argument('--json', action='store_true', help='print a JSON object')
+    q = jsub.add_parser('ls', help="the app's jobs and their runs in dev")
+    q.add_argument('--no-cluster', action='store_true', dest='no_cluster',
+                   help="don't read dev with kubectl (this checkout's files only)")
+    q.add_argument('--json', action='store_true', help='print JSON')
     p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
                 'Run it before every push; CI runs the same check. Each finding names the guide section\n'
                 'that explains it. Exit status 1 when there are errors; fix warnings or explain them in the PR.\n\n'
@@ -3932,8 +4488,14 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:2] == ['runtime', 'use']:  # the 0.4.0 form keeps working
         del argv[1]
+    command = None
+    if argv[:1] == ['job'] and '--' in argv:  # `job add NAME --schedule ... -- COMMAND`: argparse can't take a
+        cut = argv.index('--')                 # positional, then options, then everything after --
+        argv, command = argv[:cut], argv[cut + 1:]
     parser = build_parser()
     a = parser.parse_args(argv)
+    if command is not None:
+        a.cmd = command
     if a.version:
         a.command, a.func = 'version', cmd_version
     if not a.command:
