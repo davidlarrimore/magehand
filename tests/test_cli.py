@@ -3631,8 +3631,23 @@ class Jobs(unittest.TestCase):
                          ('foo * * * *', 'values are 0 to 59'), ('0 6 * * 7', 'values are 0 to 6'),
                          ('0 0 1,,2 * *', 'values are 1 to 31'), ('0 0 * FOO *', 'JAN'), ('0 0 * * MON-', 'SUN')):
             self.assertIn(why, magehand.cron_problem(bad) or '', bad)
-        for good in ('0 9 * * MON-FRI', '0 0 1 jan,jul *', '0 0 ? * SUN', '5/10 * * * *', '@every 1h30m', '@midnight'):
+        for good in ('0 9 * * MON-FRI', '0 0 1 jan,jul *', '0 0 ? * SUN', '5/10 * * * *', '@midnight', '@daily'):
             self.assertIsNone(magehand.cron_problem(good), good)
+        # Descriptors: spelled exactly (one only when the schedule starts with @), and @every refused: its
+        # duration is Go's (no tab after @every, no overflow), which we can't check.
+        for bad, why in (('@every 1h', 'not supported'), ('@every\t1h', 'not supported'),
+                         ('@every 10000000h', 'not supported'), ('@Daily', 'spelled exactly'),
+                         ('@daily ', 'spelled exactly'), (' @daily', 'five fields')):
+            self.assertIn(why, magehand.cron_problem(bad) or '', repr(bad))
+        for schedule in ('@every\t1h', '@every 10000000h'):  # the command and check refuse them too
+            self.assertEqual(self.run_main('job', 'add', 'x', '--schedule', schedule, '--', 'true')[0], 2, repr(schedule))
+            doc = self.cronjob(spec__schedule=schedule)
+            self.write(doc, name='job-every.yaml')
+            self.assertTrue(any('not supported' in e for e in texts(magehand.check_jobs(self.app(), CATALOG_MODELS),
+                                                                    'error')), repr(schedule))
+            (self.root / 'deploy/base/job-every.yaml').unlink()
+            k = self.root / 'deploy/base/kustomization.yaml'
+            k.write_text(magehand.remove_resource(k.read_text(), 'job-every.yaml'))
         code, _, err = self.run_main('job', 'add', 'x', '--schedule', '*/0 * * * *', '--', 'true')
         self.assertEqual(code, 2)
         self.assertIn('above 0', err)

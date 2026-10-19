@@ -3693,9 +3693,9 @@ def cmd_bucket(a):
 JOB_NAME = re.compile(r'^[a-z]([a-z0-9-]{0,50}[a-z0-9])?$')  # a CronJob name: its Jobs add 11 characters (63 at most)
 # The schedule grammar of Kubernetes' CronJob controller (robfig/cron v3 ParseStandard): five fields, each a
 # list of `*`, `?`, a value or a low-high range, optionally /step (a whole number above 0); months and days of
-# the week also by name; days of the week 0-6 (Sunday is 0). Or a descriptor.
+# the week also by name; days of the week 0-6 (Sunday is 0). Or a descriptor, spelled exactly (a schedule is
+# one only when it starts with @). `@every DURATION` is refused: its duration is Go's, which we can't check.
 CRON_MACROS = ('@yearly', '@annually', '@monthly', '@weekly', '@daily', '@midnight', '@hourly')
-CRON_EVERY = re.compile(r'@every\s+(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+')
 CRON_MONTHS = {m: i + 1 for i, m in enumerate(('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct',
                                                'nov', 'dec'))}
 CRON_DAYS = {d: i for i, d in enumerate(('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'))}
@@ -3713,9 +3713,13 @@ JOB_SEE = 'recipes "Run background or scheduled work"'
 def cron_problem(schedule):
     """Why `schedule` is not a CronJob schedule, or None. Five fields or a macro; the time zone goes in
     timeZone, not the schedule."""
-    text = str(schedule or '').strip()
-    if text in CRON_MACROS or CRON_EVERY.fullmatch(text):
-        return None
+    text = str(schedule or '')
+    if text.startswith('@'):
+        if text in CRON_MACROS:
+            return None
+        if text.startswith('@every'):
+            return '@every is not supported: write five cron fields (*/30 * * * * for every 30 minutes)'
+        return f'{text!r} is not a descriptor: {", ".join(CRON_MACROS)}, spelled exactly'
     if text.startswith(('TZ=', 'CRON_TZ=')):
         return 'set the time zone with timeZone (--timezone), not in the schedule'
     fields = text.split()
