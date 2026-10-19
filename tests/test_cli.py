@@ -3441,7 +3441,7 @@ class Jobs(unittest.TestCase):
         for good in ('15 6 * * *', '*/15 * * * *', '0 8 * * 1-5', '0 0 1,15 * *', '@daily', '30 2 * JAN MON'):
             self.assertIsNone(magehand.cron_problem(good), good)
         for bad, why in (('15 6 * *', 'five fields'), ('61 * * * *', '0 to 59'), ('0 24 * * *', '0 to 23'),
-                         ('TZ=UTC 0 6 * * *', 'timeZone'), ('0 6 * * $', 'digits'), ('', 'five fields')):
+                         ('TZ=UTC 0 6 * * *', 'timeZone'), ('0 6 * * $', 'values are 0 to 6'), ('', 'five fields')):
             self.assertIn(why, magehand.cron_problem(bad), bad)
 
     def test_too_frequent(self):
@@ -3624,6 +3624,55 @@ class Jobs(unittest.TestCase):
         warnings = [f for f in found if 'scheduler in the app' in f['text']]
         self.assertEqual(sorted(f['where'] for f in warnings), ['app.py:1', 'web.js:1'])
         self.assertTrue(all(f['level'] == 'warning' for f in warnings))
+
+    def test_cron_grammar_is_the_controllers(self):
+        """robfig/cron v3 ParseStandard, which Kubernetes' CronJob controller uses: what it rejects, we reject."""
+        for bad, why in (('*/0 * * * *', 'above 0'), ('*/no * * * *', 'above 0'), ('10-1 * * * *', 'high to low'),
+                         ('foo * * * *', 'values are 0 to 59'), ('0 6 * * 7', 'values are 0 to 6'),
+                         ('0 0 1,,2 * *', 'values are 1 to 31'), ('0 0 * FOO *', 'JAN'), ('0 0 * * MON-', 'SUN')):
+            self.assertIn(why, magehand.cron_problem(bad) or '', bad)
+        for good in ('0 9 * * MON-FRI', '0 0 1 jan,jul *', '0 0 ? * SUN', '5/10 * * * *', '@every 1h30m', '@midnight'):
+            self.assertIsNone(magehand.cron_problem(good), good)
+        code, _, err = self.run_main('job', 'add', 'x', '--schedule', '*/0 * * * *', '--', 'true')
+        self.assertEqual(code, 2)
+        self.assertIn('above 0', err)
+
+    def test_a_multiline_flow_list_keeps_every_resource(self):
+        k = self.root / 'deploy/base/kustomization.yaml'
+        k.write_text('kind: Kustomization\nresources: [\n  deployment.yaml,  # the app\n  es.yaml\n]\nimages: []\n')
+        self.assertEqual(self.add()[0], 0)
+        self.assertEqual(magehand.kustomization_resources(k.read_text()), ['deployment.yaml', 'es.yaml',
+                                                                           'job-collect.yaml'])
+        self.assertIn('images: []', k.read_text())
+        self.assertEqual(self.run_main('job', 'rm', 'collect')[0], 0)
+        self.assertEqual(magehand.kustomization_resources(k.read_text()), ['deployment.yaml', 'es.yaml'])
+
+    def test_a_layout_it_cannot_edit_safely_writes_nothing(self):
+        k = self.root / 'deploy/base/kustomization.yaml'
+        odd = 'kind: Kustomization\nlist: &r [deployment.yaml, es.yaml]\nresources: *r\n'
+        k.write_text(odd)
+        code, _, _ = self.add()
+        self.assertEqual(code, 1)
+        self.assertEqual(k.read_text(), odd)
+        self.assertFalse((self.root / 'deploy/base/job-collect.yaml').exists())
+        self.assertIsNone(magehand.edit_kustomization(odd, 'job-x.yaml'))
+        self.assertIsNone(magehand.edit_kustomization('resources: [a.yaml]\n', 'a.yaml'))  # already there
+
+    def test_a_job_named_like_the_app_is_not_selected(self):
+        code, _, err = self.run_main('job', 'add', 'demo', '--schedule', '@daily', '--', 'true')
+        self.assertEqual(code, 0, err)
+        doc = yaml_load((self.root / 'deploy/base/job-demo.yaml').read_text())
+        labels = magehand.cronjob_parts(doc)[1]['template']['metadata']['labels']
+        self.assertNotIn('app.kubernetes.io/name', labels)
+        self.assertEqual(labels[magehand.JOB_LABEL], 'demo')
+        self.assertEqual(magehand.check_jobs(self.app(), CATALOG_MODELS), [])
+
+    def test_add_refuses_when_the_deployment_selects_what_a_job_carries(self):
+        (self.root / 'deploy/base/deployment.yaml').write_text(
+            SELECTED.replace('app.kubernetes.io/name: demo', 'app.kubernetes.io/part-of: demo'))
+        code, _, _ = self.add()
+        self.assertEqual(code, 1)
+        self.assertFalse((self.root / 'deploy/base/job-collect.yaml').exists())
 
 
 def yaml_load(text):

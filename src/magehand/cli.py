@@ -3691,9 +3691,17 @@ def cmd_bucket(a):
 # on a schedule, with the app's env. `job add` writes the CronJob; merging deploys it like the rest of deploy/.
 
 JOB_NAME = re.compile(r'^[a-z]([a-z0-9-]{0,50}[a-z0-9])?$')  # a CronJob name: its Jobs add 11 characters (63 at most)
+# The schedule grammar of Kubernetes' CronJob controller (robfig/cron v3 ParseStandard): five fields, each a
+# list of `*`, `?`, a value or a low-high range, optionally /step (a whole number above 0); months and days of
+# the week also by name; days of the week 0-6 (Sunday is 0). Or a descriptor.
 CRON_MACROS = ('@yearly', '@annually', '@monthly', '@weekly', '@daily', '@midnight', '@hourly')
-CRON_FIELD = re.compile(r'^[0-9A-Za-z*?/,-]+$')
-CRON_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))  # minute, hour, day of month, month, day of week
+CRON_EVERY = re.compile(r'@every\s+(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+')
+CRON_MONTHS = {m: i + 1 for i, m in enumerate(('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct',
+                                               'nov', 'dec'))}
+CRON_DAYS = {d: i for i, d in enumerate(('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'))}
+CRON_FIELDS = (('minute', 0, 59, {}), ('hour', 0, 23, {}), ('day of month', 1, 31, {}), ('month', 1, 12, CRON_MONTHS),
+               ('day of week', 0, 6, CRON_DAYS))
+JOB_LABEL = 'homelab.davidlarrimore.com/job'  # on a job's pods; never app.kubernetes.io/name, the app's selector
 JOB_TIMEOUT, JOB_MEMORY, JOB_TIMEZONE = '10m', '256Mi', 'Etc/UTC'
 JOB_MAX_MEMORY_MI = 1024   # a container's memory limit at most (homelab platform/agent-apps-baseline limit-range)
 JOB_START_DEADLINE = 3600  # a run that can't start within an hour is skipped, and the controller never gives up
@@ -3706,7 +3714,7 @@ def cron_problem(schedule):
     """Why `schedule` is not a CronJob schedule, or None. Five fields or a macro; the time zone goes in
     timeZone, not the schedule."""
     text = str(schedule or '').strip()
-    if text in CRON_MACROS:
+    if text in CRON_MACROS or CRON_EVERY.fullmatch(text):
         return None
     if text.startswith(('TZ=', 'CRON_TZ=')):
         return 'set the time zone with timeZone (--timezone), not in the schedule'
@@ -3714,14 +3722,31 @@ def cron_problem(schedule):
     if len(fields) != 5:
         return (f'{text!r} is not a cron schedule: five fields (minute hour day-of-month month day-of-week), '
                 f'or one of {", ".join(CRON_MACROS)}')
-    for field, (low, high), what in zip(fields, CRON_RANGES, ('minute', 'hour', 'day of month', 'month',
-                                                               'day of week')):
-        if not CRON_FIELD.match(field):
-            return f'{what} {field!r}: digits, *, ranges (1-5), lists (1,3) and steps (*/15) only'
-        for part in field.split(','):
-            base = part.split('/', 1)[0]
-            if any(n.isdigit() and not low <= int(n) <= high for n in base.split('-')):
-                return f'{what} {field!r}: values go from {low} to {high}'
+    for field, (what, low, high, names) in zip(fields, CRON_FIELDS):
+        problem = cron_field_problem(field, low, high, names)
+        if problem:
+            return f'{what} {field!r}: {problem}'
+    return None
+
+
+def cron_field_problem(field, low, high, names):
+    """Why one cron field is not valid for the controller's parser, or None."""
+    def value(text):
+        number = int(text) if text.isdigit() else names.get(text.lower())
+        return number if number is not None and low <= number <= high else None
+    named = f' or {", ".join(n.upper() for n in names)}' if names else ''
+    for part in field.split(','):
+        span, slash, step = part.partition('/')
+        if slash and not (step.isdigit() and int(step) > 0):
+            return 'a step (after /) is a whole number above 0'
+        if span in ('*', '?'):
+            continue
+        start, dash, end = span.partition('-')
+        first, last = value(start), (value(end) if dash else value(start))
+        if first is None or last is None:
+            return f'values are {low} to {high}{named}; parts are *, a value or a range (1-5), with an optional /step'
+        if first > last:
+            return f'the range {span} goes from high to low'
     return None
 
 
@@ -3769,10 +3794,10 @@ def memory_mi(text):
 def job_manifest(app, name, schedule, command, timeout, memory, timezone):
     """The CronJob for job `name`: the Deployment's image, env and security settings with `command`, and the
     settings the platform needs (no overlapping runs, deadlines, one retry, kept history). Its pods have their
-    own labels, so the app's Service never sends them requests."""
+    own labels, without app.kubernetes.io/name (the app's selector), so the app's Service never sends them
+    requests whatever the job is called."""
     container, pod = app['container'], app['pod']
-    labels = {'app.kubernetes.io/name': name, 'app.kubernetes.io/part-of': app['name'],
-              'app.kubernetes.io/component': 'job'}
+    labels = {JOB_LABEL: name, 'app.kubernetes.io/part-of': app['name'], 'app.kubernetes.io/component': 'job'}
     job = {'name': 'app', 'image': container.get('image') or f'ghcr.io/davidlarrimore/homelab-apps/{app["name"]}',
            'command': list(command)}
     for key in ('env', 'envFrom'):
@@ -3806,17 +3831,31 @@ def kustomization_resources(text):
     return [str(r) for r in spec.get('resources') or []]
 
 
+# resources as a flow list, on one line or several: `resources: [a.yaml, b.yaml]`.
+FLOW_RESOURCES = re.compile(r'^resources:[ \t]*\[(?P<items>[^\]]*)\]', re.MULTILINE)
+
+
+def flow_items(match):
+    try:
+        items = yaml.safe_load('[' + match.group('items') + ']')
+    except yaml.YAMLError:
+        return None
+    return [str(r) for r in items] if isinstance(items, list) else None
+
+
 def add_resource(text, entry):
-    """kustomization.yaml's text with `entry` added to resources, keeping its comments and layout."""
+    """kustomization.yaml's text with `entry` added to resources, keeping its comments and layout (a flow list
+    is rewritten on one line). edit_kustomization checks the result."""
+    flow = FLOW_RESOURCES.search(text)
+    if flow:
+        items = flow_items(flow)
+        if items is None:
+            return text
+        return text[:flow.start()] + 'resources: [' + ', '.join(items + [entry]) + ']' + text[flow.end():]
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
-        match = re.match(r'^resources:\s*(\[.*\])?\s*(#.*)?$', line.rstrip('\n'))
-        if not match:
+        if not re.match(r'^resources:\s*(#.*)?$', line.rstrip('\n')):
             continue
-        if match.group(1) is not None:  # resources: [a.yaml, b.yaml]
-            items = [str(r) for r in yaml.safe_load(match.group(1)) or []]
-            lines[i] = 'resources: [' + ', '.join(items + [entry]) + ']\n'
-            return ''.join(lines)
         last, indent = i, '  '
         for j in range(i + 1, len(lines)):
             stripped = lines[j].strip()
@@ -3832,16 +3871,37 @@ def add_resource(text, entry):
 
 
 def remove_resource(text, entry):
-    """kustomization.yaml's text without `entry` in resources."""
-    out = []
-    for line in text.splitlines(keepends=True):
-        flow = re.match(r'^resources:\s*(\[.*\])\s*(#.*)?$', line.rstrip('\n'))
-        if flow:
-            items = [str(r) for r in yaml.safe_load(flow.group(1)) or [] if str(r) != entry]
-            out.append('resources: [' + ', '.join(items) + ']\n')
-        elif not re.match(r'^\s*-\s*["\']?' + re.escape(entry) + r'["\']?\s*(#.*)?$', line.rstrip('\n')):
-            out.append(line)
-    return ''.join(out)
+    """kustomization.yaml's text without `entry` in resources. edit_kustomization checks the result."""
+    flow = FLOW_RESOURCES.search(text)
+    if flow:
+        items = flow_items(flow)
+        if items is None:
+            return text
+        return text[:flow.start()] + 'resources: [' + ', '.join(i for i in items if i != entry) + ']' + text[flow.end():]
+    return ''.join(line for line in text.splitlines(keepends=True)
+                   if not re.match(r'^\s*-\s*["\']?' + re.escape(entry) + r'["\']?\s*(#.*)?$', line.rstrip('\n')))
+
+
+def edit_kustomization(text, entry, add=True):
+    """kustomization.yaml's text with `entry` added to (or removed from) resources, or None when the edit
+    would change anything else: every other resource and key must come out the same."""
+    try:
+        before = yaml.safe_load(text) or {}
+    except yaml.YAMLError:
+        return None
+    old = kustomization_resources(text)
+    if not isinstance(before, dict) or old is None or (entry in old) == add:
+        return None
+    new = (add_resource if add else remove_resource)(text, entry)
+    try:
+        after = yaml.safe_load(new) or {}
+    except yaml.YAMLError:
+        return None
+    wanted = old + [entry] if add else [r for r in old if r != entry]
+    rest = lambda spec: {k: v for k, v in spec.items() if k != 'resources'}  # noqa: E731
+    if not isinstance(after, dict) or kustomization_resources(new) != wanted or rest(after) != rest(before):
+        return None
+    return new
 
 
 def deploy_documents(local):
@@ -4018,19 +4078,27 @@ def job_add(a, app, base):
     if cron_too_frequent(a.schedule):
         print(f'warning: {a.schedule!r} runs more often than every {JOB_MIN_INTERVAL} minutes', file=sys.stderr)
     manifest = job_manifest(app, a.name, a.schedule, command, timeout, a.memory, a.timezone)
+    pod_labels = manifest['spec']['jobTemplate']['spec']['template']['metadata']['labels']
+    selector = app.get('selector') or {}
+    if selector and all(pod_labels.get(k) == v for k, v in selector.items()):
+        die(f'the Deployment selects pods by {", ".join(f"{k}={v}" for k, v in selector.items())}, which a job\'s '
+            "pods would match, so the app's Service would send them requests: select the app's pods by "
+            'app.kubernetes.io/name')
+    # Every check before any write: the kustomization edit is made (and verified) first, written last.
+    kustomization = base / 'kustomization.yaml'
+    listed = new = None
+    if kustomization.is_file():
+        new = edit_kustomization(kustomization.read_text(), path.name)
+        if new is None:
+            die(f'could not add {path.name} to {DEPLOY}/base/kustomization.yaml without changing its other '
+                'resources (an unusual layout): nothing written. Add the job by hand, or write resources as a '
+                'block list (`resources:` then `  - deployment.yaml` lines)')
+        listed = f'{DEPLOY}/base/kustomization.yaml'
     header = (f'# Job {a.name}: written by `magehand job add`. Edit it freely; `magehand check` checks it.\n'
               f'# The app\'s image and env with another command; `magehand job ls` shows its runs in dev.\n')
     path.write_text(header + yaml.safe_dump(manifest, sort_keys=False, default_flow_style=False))
-    kustomization = base / 'kustomization.yaml'
-    listed = None
-    if kustomization.is_file():
-        text = kustomization.read_text()
-        new = add_resource(text, path.name)
-        if path.name not in (kustomization_resources(new) or []):
-            die(f'wrote {DEPLOY}/base/{path.name} but could not add it to {DEPLOY}/base/kustomization.yaml: '
-                'add it to resources by hand')
+    if new is not None:
         kustomization.write_text(new)
-        listed = f'{DEPLOY}/base/kustomization.yaml'
     if a.json:
         print(json.dumps({'action': 'add', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed,
                           'schedule': a.schedule, 'timezone': a.timezone, 'command': command,
@@ -4051,12 +4119,19 @@ def job_rm(a, app, base):
         close = difflib.get_close_matches(a.name, names, n=1)
         die(f'no {DEPLOY}/base/{path.name}' + (f"; did you mean '{close[0]}'?" if close else '')
             + (f' (jobs: {", ".join(names)}; a job not written by `job add` is removed by hand)' if names else ''))
-    path.unlink()
     kustomization = base / 'kustomization.yaml'
-    listed = None
+    listed = new = None
     if kustomization.is_file():
-        kustomization.write_text(remove_resource(kustomization.read_text(), path.name))
-        listed = f'{DEPLOY}/base/kustomization.yaml'
+        text = kustomization.read_text()
+        if path.name in (kustomization_resources(text) or []):
+            new = edit_kustomization(text, path.name, add=False)
+            if new is None:
+                die(f'could not take {path.name} out of {DEPLOY}/base/kustomization.yaml without changing its other '
+                    'resources: nothing removed. Remove the file and its entry by hand')
+            listed = f'{DEPLOY}/base/kustomization.yaml'
+    path.unlink()
+    if new is not None:
+        kustomization.write_text(new)
     if a.json:
         print(json.dumps({'action': 'rm', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed}))
         return
