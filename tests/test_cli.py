@@ -3399,3 +3399,233 @@ class MergedBranch(unittest.TestCase):
         found = magehand.check_merged_branch(self.root)
         self.assertEqual(len(found), 1)
         self.assertIn('PR #9', found[0]['text'])  # the latest merge, not #5
+
+
+SELECTED = ('apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: demo}\nspec:\n'
+            '  selector: {matchLabels: {app.kubernetes.io/name: demo}}\n  template:\n'
+            '    metadata: {labels: {app.kubernetes.io/name: demo}}\n    spec:\n'
+            '      securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}\n'
+            '      containers:\n        - name: app\n          image: ghcr.io/davidlarrimore/homelab-apps/demo\n'
+            '          env:\n            - {name: PORT, value: "8000"}\n'
+            '            - name: KEY\n              valueFrom: {secretKeyRef: {name: ai-connection, key: api_key}}\n')
+
+
+class Jobs(unittest.TestCase):
+    """`magehand job add/rm/ls` and the CronJob rules of `check` (homelab docs/app-jobs-plan.md)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = deploy_repo(self.tmp.name, extra={
+            'deploy/base/kustomization.yaml': '# the base\nresources:\n  - deployment.yaml  # the app\n  - es.yaml\n'})
+        (self.root / 'deploy/base/deployment.yaml').write_text(SELECTED)
+        self.cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, self.cwd)
+        for p in (mock.patch.object(magehand, 'app_repo_here', lambda: 'demo'),
+                  mock.patch.object(magehand, 'app_here', lambda name=None: self.app())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def app(self):
+        app = magehand.try_load_app('demo', self.root)
+        return app
+
+    run_main = CommandLine.run_main
+
+    def add(self, *extra):
+        return self.run_main('job', 'add', 'collect', '--schedule', '15 6 * * *', *extra,
+                             '--', 'python', '-m', 'jobs.collect', '--out', '/tmp/x.json')
+
+    def test_cron_schedules(self):
+        for good in ('15 6 * * *', '*/15 * * * *', '0 8 * * 1-5', '0 0 1,15 * *', '@daily', '30 2 * JAN MON'):
+            self.assertIsNone(magehand.cron_problem(good), good)
+        for bad, why in (('15 6 * *', 'five fields'), ('61 * * * *', '0 to 59'), ('0 24 * * *', '0 to 23'),
+                         ('TZ=UTC 0 6 * * *', 'timeZone'), ('0 6 * * $', 'digits'), ('', 'five fields')):
+            self.assertIn(why, magehand.cron_problem(bad), bad)
+
+    def test_too_frequent(self):
+        for often in ('* * * * *', '*/2 * * * *', '0-10 6 * * *', '0,3 * * * *', '58,1 * * * *'):
+            self.assertTrue(magehand.cron_too_frequent(often), often)
+        for fine in ('*/5 * * * *', '0 * * * *', '0,30 * * * *', '15 6 * * *', '@hourly', '5/10 * * * *'):
+            self.assertFalse(magehand.cron_too_frequent(fine), fine)
+
+    def test_durations_and_memory(self):
+        self.assertEqual([magehand.duration_seconds(t) for t in ('90s', '10m', '2h', '0m', '10', 'm')],
+                         [90, 600, 7200, None, None, None])
+        self.assertEqual([magehand.memory_mi(t) for t in ('256Mi', '1Gi', '1G', '0Mi')], [256, 1024, None, None])
+
+    def test_kustomization_edits_keep_the_file(self):
+        block = '# the base\nresources:\n  - deployment.yaml  # the app\n  - es.yaml\nimages: []\n'
+        added = magehand.add_resource(block, 'job-x.yaml')
+        self.assertEqual(added, '# the base\nresources:\n  - deployment.yaml  # the app\n  - es.yaml\n'
+                                '  - job-x.yaml\nimages: []\n')
+        self.assertEqual(magehand.remove_resource(added, 'job-x.yaml'), block)
+        flow = 'kind: Kustomization\nresources: [deployment.yaml, service.yaml]\n'
+        self.assertEqual(magehand.kustomization_resources(magehand.add_resource(flow, 'job-x.yaml')),
+                         ['deployment.yaml', 'service.yaml', 'job-x.yaml'])
+        self.assertEqual(magehand.remove_resource(magehand.add_resource(flow, 'job-x.yaml'), 'job-x.yaml'), flow)
+        self.assertEqual(magehand.kustomization_resources(magehand.add_resource('kind: Kustomization', 'j.yaml')),
+                         ['j.yaml'])
+        flush = 'resources:\n- deployment.yaml\n'  # items at column 0 are YAML too
+        self.assertEqual(magehand.add_resource(flush, 'j.yaml'), 'resources:\n- deployment.yaml\n- j.yaml\n')
+
+    def test_add_writes_a_cronjob_check_accepts(self):
+        code, out, err = self.add()
+        self.assertEqual(code, 0, err)
+        self.assertIn('wrote deploy/base/job-collect.yaml', out)
+        self.assertIn('job-collect.yaml', magehand.kustomization_resources(
+            (self.root / 'deploy/base/kustomization.yaml').read_text()))
+        self.assertIn('# the app', (self.root / 'deploy/base/kustomization.yaml').read_text())  # comments kept
+        text = (self.root / 'deploy/base/job-collect.yaml').read_text()
+        self.assertNotIn('&id', text)  # no YAML anchors
+        doc = yaml_load(text)
+        spec, job, pod, container = magehand.cronjob_parts(doc)
+        self.assertEqual((spec['schedule'], spec['timeZone'], spec['concurrencyPolicy']),
+                         ('15 6 * * *', 'Etc/UTC', 'Forbid'))
+        self.assertEqual((job['backoffLimit'], job['activeDeadlineSeconds']), (1, 600))
+        self.assertEqual(container['command'], ['python', '-m', 'jobs.collect', '--out', '/tmp/x.json'])
+        self.assertEqual(container['image'], 'ghcr.io/davidlarrimore/homelab-apps/demo')
+        self.assertEqual([e['name'] for e in container['env']], ['PORT', 'KEY'])  # the Deployment's env
+        self.assertEqual(pod['securityContext']['runAsUser'], 65532)  # the Deployment's user
+        self.assertFalse(pod['automountServiceAccountToken'])
+        labels = job['template']['metadata']['labels']
+        self.assertNotEqual(labels.get('app.kubernetes.io/name'), 'demo')  # the Service doesn't select it
+        self.assertEqual(magehand.check_jobs(self.app(), CATALOG_MODELS), [])
+
+    def test_add_refuses_bad_input_and_a_second_job_of_the_same_name(self):
+        for extra, why in ((('--timeout', '10'), '--timeout'), (('--memory', '2Gi'), '--memory'),
+                           (('--timezone', 'Mars/Base'), '--timezone')):
+            code, _, err = self.add(*extra)
+            self.assertEqual(code, 2, extra)
+            self.assertIn(why, err)
+        code, _, err = self.run_main('job', 'add', 'collect', '--schedule', '@daily')
+        self.assertEqual(code, 2)
+        self.assertIn('give the command after --', err)
+        code, _, err = self.run_main('job', 'add', 'Bad_Name', '--schedule', '@daily', '--', 'true')
+        self.assertEqual(code, 2)
+        self.assertEqual(self.add()[0], 0)
+        self.assertEqual(self.add()[0], 1)  # exists
+        self.assertFalse(any(self.root.glob('deploy/base/job-*.yaml.*')))
+
+    def test_rm_removes_the_file_and_its_line(self):
+        before = (self.root / 'deploy/base/kustomization.yaml').read_text()
+        self.add()
+        code, out, _ = self.run_main('job', 'rm', 'collect', '--json')
+        self.assertEqual((code, json.loads(out)['action']), (0, 'rm'))
+        self.assertFalse((self.root / 'deploy/base/job-collect.yaml').exists())
+        self.assertEqual((self.root / 'deploy/base/kustomization.yaml').read_text(), before)
+        code, _, _ = self.run_main('job', 'rm', 'collect')
+        self.assertEqual(code, 1)
+
+    def test_only_this_checkouts_app(self):
+        code, _, _ = self.run_main('job', '-a', 'other', 'ls', '--no-cluster')
+        self.assertEqual(code, 1)
+
+    def cronjob(self, **changes):
+        doc = magehand.job_manifest(self.app(), 'nightly', '0 3 * * *', ['true'], 600, '256Mi', 'Etc/UTC')
+        spec, job, pod, container = magehand.cronjob_parts(doc)
+        for key, value in changes.items():
+            target = {'spec': spec, 'job': job, 'pod': pod, 'container': container}[key.split('__')[0]]
+            name = key.split('__')[1]
+            if value is None:
+                target.pop(name, None)
+            else:
+                target[name] = value
+        return doc
+
+    def write(self, doc, name='job-nightly.yaml', listed=True):
+        import yaml as pyyaml
+        (self.root / 'deploy/base' / name).write_text(pyyaml.safe_dump(doc, sort_keys=False))
+        if listed:
+            k = self.root / 'deploy/base/kustomization.yaml'
+            k.write_text(magehand.add_resource(k.read_text(), name))
+
+    def test_check_rules(self):
+        self.write(self.cronjob(spec__concurrencyPolicy='Allow', spec__startingDeadlineSeconds=None,
+                                job__activeDeadlineSeconds=None, job__backoffLimit=None,
+                                container__image='ghcr.io/davidlarrimore/homelab-apps/other'))
+        errors = texts(magehand.check_jobs(self.app(), CATALOG_MODELS), 'error')
+        for why in ('concurrencyPolicy: Forbid', 'startingDeadlineSeconds', 'activeDeadlineSeconds', 'backoffLimit',
+                    "the app's own image"):
+            self.assertTrue(any(why in e for e in errors), why)
+
+    def test_check_finds_a_job_the_service_selects_secrets_nothing_makes_and_an_unlisted_file(self):
+        doc = self.cronjob(spec__schedule='*/2 * * * *',
+                           container__env=[ref('X', 'missing-connection', 'uri')])
+        doc['spec']['jobTemplate']['spec']['template']['metadata']['labels'] = {'app.kubernetes.io/name': 'demo'}
+        self.write(doc, listed=False)
+        found = magehand.check_jobs(self.app(), CATALOG_MODELS)
+        errors = texts(found, 'error')
+        self.assertTrue(any("Service would send requests" in e for e in errors))
+        self.assertTrue(any("Secret 'missing-connection'" in e for e in errors))
+        self.assertTrue(any('never deployed' in e for e in errors))
+        self.assertTrue(any('more often than every 5' in w for w in texts(found, 'warning')))
+
+    def test_a_bare_job_is_a_warning(self):
+        (self.root / 'deploy/base/once.yaml').write_text('kind: Job\nmetadata: {name: once}\n')
+        found = magehand.check_jobs(self.app(), CATALOG_MODELS)
+        self.assertEqual([(f['level'], f['where']) for f in found], [('warning', 'deploy/base/once.yaml')])
+
+    def test_check_command_runs_the_job_rules(self):
+        self.write(self.cronjob(spec__concurrencyPolicy=None))
+        with tempfile.TemporaryDirectory() as apps, mock.patch.object(magehand, 'github_file',
+                                                                      lambda *a, **k: None):
+            code, out, _ = self.run_main('check', 'demo', '--code', str(self.root), '--apps-dir', apps,
+                                         '--manifests-only', '--json')
+        self.assertEqual(code, 1)
+        self.assertTrue(any('concurrencyPolicy' in f['text'] for f in json.loads(out)['findings']))
+
+    def test_ls_with_dev_runs(self):
+        self.add()
+        cluster = {'items': [
+            {'kind': 'CronJob', 'metadata': {'name': 'collect'}, 'spec': {'schedule': '15 6 * * *'},
+             'status': {'lastScheduleTime': '2026-10-18T06:15:00Z', 'lastSuccessfulTime': '2026-10-17T06:15:20Z'}},
+            {'kind': 'CronJob', 'metadata': {'name': 'old'}, 'spec': {'schedule': '@daily'}, 'status': {}},
+            {'kind': 'Job', 'metadata': {'name': 'collect-1', 'ownerReferences': [{'kind': 'CronJob', 'name': 'collect'}]},
+             'status': {'startTime': '2026-10-17T06:15:00Z', 'completionTime': '2026-10-17T06:15:20Z', 'succeeded': 1}},
+            {'kind': 'Job', 'metadata': {'name': 'collect-2', 'ownerReferences': [{'kind': 'CronJob', 'name': 'collect'}]},
+             'status': {'startTime': '2026-10-18T06:15:00Z', 'failed': 2, 'conditions': [
+                 {'type': 'Failed', 'status': 'True', 'lastTransitionTime': '2026-10-18T06:16:00Z'}]}},
+            {'kind': 'Job', 'metadata': {'name': 'other-1', 'ownerReferences': [{'kind': 'CronJob', 'name': 'x'}]},
+             'status': {}}]}
+        seen = []
+        with mock.patch.object(magehand, 'kubectl_json', lambda *a: seen.append(a) or (cluster, None)):
+            code, out, _ = self.run_main('job', 'ls')
+            _, data, _ = self.run_main('job', 'ls', '--json')
+        self.assertEqual(code, 0)
+        self.assertEqual(seen[0], ('cronjobs,jobs', '-n', 'demo-dev'))
+        self.assertIn('✗ collect-2 2026-10-18 06:15Z, 60s', out)
+        self.assertIn('✓ collect-1 2026-10-17 06:15Z, 20s', out)
+        self.assertLess(out.index('collect-2'), out.index('collect-1'))  # newest first
+        self.assertIn('logs: kubectl -n demo-dev logs job/collect-2', out)
+        self.assertIn('old: @daily', out)
+        self.assertIn('in dev only', out)
+        jobs = {j['name']: j for j in json.loads(data)['jobs']}
+        self.assertEqual([r['job'] for r in jobs['collect']['dev']['runs']], ['collect-2', 'collect-1'])
+        with mock.patch.object(magehand, 'kubectl_json', lambda *a: self.fail('read the cluster')):
+            self.assertIn('not checked (--no-cluster)', self.run_main('job', 'ls', '--no-cluster')[1])
+
+    def test_status_ignores_running_job_pods(self):
+        image = 'ghcr.io/example/app@sha256:' + 'a' * 64
+        app_pod = {'metadata': {'name': 'app-1'}, 'status': {'phase': 'Running', 'containerStatuses': [
+            {'ready': True, 'imageID': image, 'state': {'running': {}}}]}}
+        job_pod = {'metadata': {'name': 'collect-1-x', 'ownerReferences': [{'kind': 'Job', 'name': 'collect-1'}]},
+                   'status': {'phase': 'Running', 'containerStatuses': [
+                       {'ready': True, 'imageID': 'ghcr.io/example/app@sha256:' + 'b' * 64, 'state': {'running': {}}}]}}
+        argo = {'status': {'sync': {'status': 'Synced'}, 'health': {'status': 'Healthy'}}}
+        self.assertEqual(magehand.pod_stage({'items': [app_pod, job_pod]}, argo, image)['state'], 'ok')
+
+    def test_in_process_scheduler_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, 'app.py').write_text('from apscheduler.schedulers.background import BackgroundScheduler\n')
+            pathlib.Path(tmp, 'web.js').write_text("const cron = require('node-cron')\n")
+            found = magehand.check_code(pathlib.Path(tmp), None)
+        warnings = [f for f in found if 'scheduler in the app' in f['text']]
+        self.assertEqual(sorted(f['where'] for f in warnings), ['app.py:1', 'web.js:1'])
+        self.assertTrue(all(f['level'] == 'warning' for f in warnings))
+
+
+def yaml_load(text):
+    import yaml as pyyaml
+    return pyyaml.safe_load(text)
