@@ -4339,19 +4339,22 @@ def build_parser():
                        help='container runtime for this run (else MAGEHAND_RUNTIME, then `magehand runtime`)')
 
     # start an app
-    p = command('new', cmd_new, "create an app's repo (private, from the template) for OpenClaw too",
-                "create an app's private repo from homelab-app-template and invite OpenClaw's bot (write)",
-                'Uses gh as you (only the owner can create the repo). It also adds the approval ruleset\n'
-                "'main: owner approves'. Safe to re-run, and how to repair a repo made without it (`magehand\n"
-                "doctor` says when one is): on an existing repo it invites the bot (or gives it write) and adds\n"
-                'the ruleset only if missing, warns if the repo is public, clones nothing when run in its\n'
-                'checkout, and lists only what is left for you. OpenClaw accepts the invitation by itself;\n'
-                'the platform registers the app once deploy/ is on main.\n'
+    p = command('new', cmd_new, "create an app's repo for the platform, or repair one",
+                "create an app's private repo from homelab-app-template, invite OpenClaw's bot (write) and add\n"
+                "the approval ruleset 'main: owner approves'; on an existing repo, add whichever is missing",
+                'Uses gh as you (only the owner can create the repo).\n\n'
+                'Repair: run it again on a repo made without it (`magehand doctor` says when one is). It\n'
+                'invites a missing bot, gives a read-only one write, renews a pending invitation and adds a\n'
+                'missing ruleset. It never removes anything, edits an existing ruleset or changes visibility\n'
+                '(a public repo gets a warning and the command), leaves an archived repo (a retired app)\n'
+                'alone, clones nothing when run in the repo\'s checkout, and lists only what is left for you.\n\n'
+                'OpenClaw accepts the invitation by itself; the platform registers the app once deploy/ is\n'
+                'on main.\n\n'
                 'The app is named after the repo unless --app-name says otherwise (the repo lab-website\n'
                 'for the app lab: lab-dev.lab.davidlarrimore.com). It clones the repo into ./REPO (--dir\n'
                 'DIR, or --no-clone), then lists what is left for you and what the platform does by itself.\n\n'
                 'examples:\n  magehand new elvis\n  magehand new lab-website --app-name lab\n'
-                '  magehand new elvis --no-clone      # repair an existing repo: bot and ruleset\n'
+                '  magehand new elvis                 # in elvis\'s checkout: repair it, clone nothing\n'
                 '  magehand new elvis --no-clone --json')
     p.add_argument('name', metavar='REPO', help="the repo's name (also the app's, unless --app-name)")
     p.add_argument('--no-clone', action='store_true', help="don't clone the new repo into ./REPO")
@@ -4564,7 +4567,14 @@ def build_parser():
     p.add_argument('--dns', metavar='ADDRESS', help="the homelab's DNS address, if *.lab doesn't resolve "
                    '(else it asks, in a terminal)')
     p.add_argument('--undo', action='store_true', help='remove the *.lab name resolution setup added')
-    p = command('doctor', cmd_doctor, 'check access, sign-in and the container runtime', 'check GitHub access, homelab reach, sign-in, the app repo\'s setup and the container runtime')
+    p = command('doctor', cmd_doctor, "check this machine, sign-in and this app repo's setup",
+                "check GitHub access, homelab reach, sign-in, the app repo's setup and the container runtime",
+                'In an app repo it also checks that OpenClaw\'s bot can write to it (a pending invitation is\n'
+                "a note), that it is private, and that the ruleset 'main: owner approves' is active on the\n"
+                'default branch. Each failure names its fix (`magehand new REPO` repairs the repo). What\n'
+                'needs admin to read (the ruleset, invitations) is a note when unreadable, not a failure;\n'
+                'an archived repo is not checked. Run it at the start of a session. Exit 1 on a failure.\n\n'
+                'examples:\n  magehand doctor\n  magehand doctor --json')
     json_option(p)
     p = command('skill', cmd_skill, 'print or install the homelab-app skill for coding agents', 'print the homelab-app skill for coding agents, or install it')
     p.add_argument('--install', action='store_true', help='install it for Claude Code (and Codex, if installed)')
