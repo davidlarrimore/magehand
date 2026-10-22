@@ -2652,8 +2652,9 @@ def env_findings(app, container, deployment_file, catalog):
 
 
 def check_deploy_files(root, name=None):
-    """deploy/ holds app.yaml, base/ (the Kustomize base) and the optional overlays dev/ (namespace <app>-dev)
-    and prod/ (namespace <app>, needed for production releases): merging copies exactly those."""
+    """deploy/ holds app.yaml, base/ (the Kustomize base), the dev/ overlay (namespace <app>-dev: Argo CD deploys
+    it, and registration and CI need it once base/ exists) and the optional prod/ (namespace <app>, needed for
+    production releases): merging copies exactly those."""
     local = deploy_dir(root)
     if not local:
         return []
@@ -2676,6 +2677,11 @@ def check_deploy_files(root, name=None):
                              'missing: the Kustomize base (Deployment, Service, ...) goes here'
                              + ('' if requested else '; until it exists nothing is deployed or registered'),
                              'README "How an app is put together"'))
+    elif not (local / 'dev' / 'kustomization.yaml').is_file():
+        # build-app.yaml fails on it and the platform can't register or deploy the app without it.
+        found.append(finding('error', f'{DEPLOY}/dev/kustomization.yaml',
+                             f'missing: the dev overlay (namespace: {name or "<app>"}-dev, resources: [../base]); '
+                             'nothing registers or deploys without it', 'README "How an app is put together"'))
     for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
         path = local / overlay / 'kustomization.yaml'
         if not name or not path.is_file():

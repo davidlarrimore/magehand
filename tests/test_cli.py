@@ -1269,6 +1269,8 @@ def deploy_repo(tmp, app_yaml='services:\n  ai: {type: llm, models: [paid/m2]}\n
     (root / 'deploy/app.yaml').write_text(app_yaml)
     (root / 'deploy/base/deployment.yaml').write_text(DEPLOYMENT)
     (root / 'deploy/base/es.yaml').write_text('kind: ExternalSecret\nmetadata: {name: x}\nspec: {target: {name: own}}\n')
+    (root / 'deploy/dev').mkdir()
+    (root / 'deploy/dev/kustomization.yaml').write_text('namespace: demo-dev\nresources: [../base]\n')
     for name, text in (extra or {}).items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text(text)
@@ -1349,6 +1351,15 @@ class DeployDir(unittest.TestCase):
             self.assertTrue(any('without a digest' in e for e in errors))
             self.assertEqual(sorted(f['where'] for f in magehand.check_deploy_files(root)),
                              ['deploy/base/README.md', 'deploy/stage/kustomization.yaml'])
+
+    def test_a_base_without_the_dev_overlay_is_an_error(self):
+        # CI (build-app.yaml) fails without it, and the platform can't register the app: check must say so first.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp)
+            (root / 'deploy/dev/kustomization.yaml').unlink()
+            found = magehand.check_deploy_files(root, 'demo')
+        self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/dev/kustomization.yaml')])
+        self.assertIn('namespace: demo-dev', found[0]['text'])
 
     def test_overlays_and_their_namespaces(self):
         with tempfile.TemporaryDirectory() as tmp:
