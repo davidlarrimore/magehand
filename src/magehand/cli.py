@@ -1525,10 +1525,13 @@ def bot_access(repo):
     on the others `gh pr edit --add-reviewer` exits 0 and adds nobody."""
     code, _, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
     if code == 0:
-        code, out, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}/permission', '--jq', '.permission')
+        # permission is the legacy level (maintain reads as write, triage as read); role_name is the role itself.
+        code, out, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}/permission', '--jq',
+                                  '.permission + " " + (.role_name // "")')
         if code != 0:
             return None, err or 'gh api failed'
-        return ('write', '') if out.strip() in ('admin', 'write') else ('read', out.strip())
+        levels = set(out.split())
+        return ('write', '') if levels & {'admin', 'maintain', 'write', 'push'} else ('read', out.strip())
     if code is None or 'HTTP 404' not in err:
         return None, err or 'gh api failed'
     invitations, err = gh_json_pages(f'repos/{repo}/invitations')
@@ -1735,7 +1738,7 @@ def cmd_new(a):
     elif created:
         print(new_summary(repo, name, app, dest, named, cloned))
     else:
-        print(repair_summary(repo, private, bot, ruleset, cloned, dest))
+        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
 
@@ -1761,10 +1764,13 @@ def new_summary(repo, name, app, dest, named, cloned):
     return '\n'.join(lines)
 
 
-def repair_summary(repo, private, bot, ruleset, cloned, dest):
+def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None):
     """What `new` on an existing repo leaves for you: only what it could not do itself (its changes went to
     stderr as it made them)."""
     steps = []
+    if named in ('failed', 'differs'):
+        steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (until then the app is named '
+                     f"{repo.split('/', 1)[1]})")
     if not private:
         steps.append(f'run:   gh repo edit {repo} --visibility private --accept-visibility-change-consequences')
     if bot == 'invited':
@@ -2465,7 +2471,7 @@ def cmd_doctor(a):
     if repo:
         state = repo_state(repo)
         # Run in the checkout, `new` repairs the repo it is in and clones nothing.
-        fix = f'`magehand new {repo.split("/", 1)[1]}` (re-running it is safe)'
+        fix = f'`magehand new {repo.split("/", 1)[1]}` (safe to re-run; it repairs an existing repo)'
         weak = f'{state["ruleset_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
         unread = 'could not be read (needs gh, and admin for the ruleset and invitations)'
         bot = state['bot']

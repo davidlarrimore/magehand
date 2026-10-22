@@ -1614,7 +1614,7 @@ class New(unittest.TestCase):
             if args[:1] == ('api',) and args[1].endswith('/collaborators/davidlarrimore-bot'):
                 return (0, '', '') if collaborator else (1, '', 'gh: Not Found (HTTP 404)')
             if args[:1] == ('api',) and args[1].endswith('/collaborators/davidlarrimore-bot/permission'):
-                return 0, ('read' if collaborator == 'read' else 'write') + '\n', ''
+                return 0, {'read': 'read read', 'maintain': 'write maintain'}.get(collaborator, 'write write') + '\n', ''
             if args[:1] == ('api',) and args[1].startswith('repos/davidlarrimore/elvis/invitations'):
                 return 0, json.dumps([{'invitee': {'login': 'davidlarrimore-bot'}}] if invited else []), ''
             return 0, '', ''
@@ -1719,6 +1719,20 @@ class New(unittest.TestCase):
             magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis']))
         self.assertIn('nothing left for you', out.getvalue())
         self.assertFalse([c for c in self.calls if c[:2] == ('repo', 'clone')])
+
+    def test_a_maintainer_bot_is_left_alone(self):
+        self.fake(exists='true', collaborator='maintain', ruleset=True)
+        self.run_new('elvis', '--no-clone')
+        self.assertFalse([c for c in self.calls if '-X' in c])
+
+    def test_repair_summary_keeps_an_app_name_it_could_not_write(self):
+        # `new REPO --app-name APP` on an existing repo whose deploy/app.yaml names another app exits 1: the
+        # summary must not say there is nothing left.
+        for named in ('differs', 'failed'):
+            text = magehand.repair_summary('davidlarrimore/lab-website', True, 'collaborator', 'exists', None,
+                                           pathlib.Path('lab-website'), 'lab', named)
+            self.assertIn('app: "lab"', text)
+            self.assertNotIn('nothing left', text)
 
     def test_existing_public_repo_gets_the_bot_and_a_warning(self):
         import contextlib
@@ -2224,7 +2238,7 @@ class RepoConformance(unittest.TestCase):
         on which the bot, once a collaborator, can write."""
         saved = magehand.gh_cli
         answers = dict({'': lambda args: (0, 'main\n' if '.default_branch' in args else 'true\n', ''),
-                        BOT_PATH + '/permission': (0, 'write\n', ''), '/invitations': (0, '[]', '')}, **answers)
+                        BOT_PATH + '/permission': (0, 'write write\n', ''), '/invitations': (0, '[]', '')}, **answers)
 
         def gh(*args, **kw):
             for suffix, answer in answers.items():
@@ -2254,10 +2268,10 @@ class RepoConformance(unittest.TestCase):
         # issue #44: a repo without the bot made `gh pr edit --add-reviewer` add nobody, and nothing said so.
         gone = (1, '', 'gh: Not Found (HTTP 404)')
         self.assertEqual(self.with_gh(self.answers(bot=gone))['bot'], 'missing')
-        self.assertEqual(self.with_gh(dict(self.answers(), **{BOT_PATH + '/permission': (0, 'read\n', '')}))['bot'],
-                         'read')
-        self.assertEqual(self.with_gh(dict(self.answers(), **{BOT_PATH + '/permission': (0, 'admin\n', '')}))['bot'],
-                         'write')
+        for answer, state in (('read read', 'read'), ('read triage', 'read'), ('write maintain', 'write'),
+                              ('admin admin', 'write')):
+            got = self.with_gh(dict(self.answers(), **{BOT_PATH + '/permission': (0, answer + '\n', '')}))['bot']
+            self.assertEqual(got, state, answer)
         invited = (0, json.dumps([{'invitee': {'login': 'someone-else'}}, {'invitee': {'login': magehand.BOT},
                                                                            'permissions': 'write'}]), '')
         self.assertEqual(self.with_gh(dict(self.answers(bot=gone), **{'/invitations': invited}))['bot'], 'invited')
