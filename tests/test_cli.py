@@ -1734,6 +1734,12 @@ class New(unittest.TestCase):
             self.assertIn('app: "lab"', text)
             self.assertNotIn('nothing left', text)
 
+    def test_an_archived_repo_is_a_retired_app_and_left_alone(self):
+        self.fake(exists='true\ntrue')
+        with self.assertRaises(SystemExit):
+            self.run_new('elvis', '--no-clone')
+        self.assertFalse([c for c in self.calls if '-X' in c])
+
     def test_existing_public_repo_gets_the_bot_and_a_warning(self):
         import contextlib
         import io
@@ -2263,6 +2269,10 @@ class RepoConformance(unittest.TestCase):
         gone = (1, '', 'gh: Not Found (HTTP 404)')
         none = self.with_gh({'/rulesets': (0, '[]', ''), BOT_PATH: gone, '': (0, 'false\n', '')})
         self.assertEqual((none['ruleset'], none['bot'], none['private']), ('missing', 'missing', False))
+
+    def test_an_archived_repo_is_not_checked(self):
+        state = self.with_gh({'': (0, 'true\ntrue\n', '')})  # any other call would raise
+        self.assertEqual((state['archived'], state['bot'], state['ruleset']), (True, None, None))
 
     def test_the_bot_needs_write_and_a_pending_invitation_is_not_missing(self):
         # issue #44: a repo without the bot made `gh pr edit --add-reviewer` add nobody, and nothing said so.

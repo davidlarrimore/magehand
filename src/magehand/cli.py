@@ -1685,7 +1685,7 @@ def cmd_new(a):
     dest = pathlib.Path(a.dir or name)
     if not a.no_clone and dest.exists() and not dest.is_dir():  # before anything is created on GitHub
         usage('new', f'{dest} exists and is not a directory: pick another with --dir, or use --no-clone')
-    code, out, _ = gh_cli('api', f'repos/{repo}', '--jq', '.private')
+    code, out, _ = gh_cli('api', f'repos/{repo}', '--jq', '.private, .archived')
     created = code != 0
     if created:
         code, _, err = gh_cli('repo', 'create', repo, '--private', '--template', TEMPLATE_REPO)
@@ -1694,7 +1694,11 @@ def cmd_new(a):
         print(f'{repo}: created (private, from {TEMPLATE_REPO})', file=sys.stderr)
         private = True
     else:
-        private = out.strip() == 'true'
+        flags = out.split() + ['false', 'false']
+        private, archived = flags[0] == 'true', flags[1] == 'true'
+        if archived:  # how an app is retired: magehand leaves it alone
+            die(f'{repo} is archived (a retired app), so magehand changes nothing on it. To work on it again, '
+                f'unarchive it (`gh repo unarchive {repo}`) and run `magehand new` again')
         print(f'{repo}: exists' + ('' if private else
               f'; it is PUBLIC, app repos are private: gh repo edit {repo} --visibility private '
               '--accept-visibility-change-consequences'), file=sys.stderr)
@@ -2428,14 +2432,17 @@ def gh_probe(*args):
 
 def repo_state(repo):
     """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'bot': 'write'|'read'|'invited'|'missing'|None,
-    'private': True|False|None}: the repo's approval ruleset, whether OpenClaw's bot can write to it, and whether
-    it is private. None means unknown (no gh, no admin, rate limit, a server or network error), which is not
+    'private': True|False|None, 'archived': bool}: the repo's approval ruleset, whether OpenClaw's bot can write
+    to it, and whether it is private (an archived repo, a retired app, is not checked further). None means unknown (no gh, no admin, rate limit, a server or network error), which is not
     the same as a confirmed 'missing' (HTTP 404)."""
+    code, out, _ = gh_probe('api', f'repos/{repo}', '--jq', '.private, .archived')
+    flags = out.split() if code == 0 else []
+    private = {'true': True, 'false': False}.get(flags[0]) if flags else None
+    if flags[1:2] == ['true']:  # archived: a retired app, nothing to check or repair
+        return {'ruleset': None, 'ruleset_detail': '', 'bot': None, 'private': private, 'archived': True}
     ruleset, detail = ruleset_status(repo)
     bot, _ = bot_access(repo)
-    code, out, _ = gh_probe('api', f'repos/{repo}', '--jq', '.private')
-    private = {'true': True, 'false': False}.get(out.strip()) if code == 0 else None
-    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot, 'private': private}
+    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot, 'private': private, 'archived': False}
 
 
 def cmd_doctor(a):
@@ -2468,8 +2475,13 @@ def cmd_doctor(a):
         if not a.json:
             print(f'--   {note}')
     repo = current_repo()
-    if repo:
-        state = repo_state(repo)
+    state = repo_state(repo) if repo else None
+    if state and state['archived']:
+        note = 'archived (a retired app): its setup is not checked'
+        results.append({'check': repo, 'ok': None, 'hint': note})
+        if not a.json:
+            print(f'--   {repo}: {note}')
+    elif state:
         # Run in the checkout, `new` repairs the repo it is in and clones nothing.
         fix = f'`magehand new {repo.split("/", 1)[1]}` (safe to re-run; it repairs an existing repo)'
         weak = f'{state["ruleset_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
