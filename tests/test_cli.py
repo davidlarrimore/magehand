@@ -1590,8 +1590,9 @@ class New(unittest.TestCase):
         self.calls = []
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
-    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None):
-        """`existing` is the ruleset already on the repo (default: ours when `ruleset`)."""
+    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None, invited=False):
+        """`existing` is the ruleset already on the repo (default: ours when `ruleset`); `collaborator` is True
+        (write), 'read' or False, and `invited` says an invitation for the bot is pending."""
         existing = existing if existing is not None else (dict(magehand.RULESET, id=7) if ruleset else None)
 
         def gh(*args, **kw):
@@ -1611,7 +1612,11 @@ class New(unittest.TestCase):
             if args[:2] == ('api', 'repos/davidlarrimore/elvis'):
                 return (1, '', 'Not Found') if exists is None else (0, exists + '\n', '')
             if args[:1] == ('api',) and args[1].endswith('/collaborators/davidlarrimore-bot'):
-                return (0 if collaborator else 1), '', ''
+                return (0, '', '') if collaborator else (1, '', 'gh: Not Found (HTTP 404)')
+            if args[:1] == ('api',) and args[1].endswith('/collaborators/davidlarrimore-bot/permission'):
+                return 0, ('read' if collaborator == 'read' else 'write') + '\n', ''
+            if args[:1] == ('api',) and args[1].startswith('repos/davidlarrimore/elvis/invitations'):
+                return 0, json.dumps([{'invitee': {'login': 'davidlarrimore-bot'}}] if invited else []), ''
             return 0, '', ''
         magehand.gh_cli = gh
 
@@ -1668,6 +1673,52 @@ class New(unittest.TestCase):
         self.fake(exists='true', collaborator=True, ruleset=True)
         self.run_new('elvis')
         self.assertFalse([c for c in self.calls if c[:2] == ('repo', 'create') or '-X' in c])
+
+    def test_repairs_an_existing_repo_and_says_what_is_left(self):
+        # issue #44: a repo made without `new` has neither the bot nor the ruleset.
+        import contextlib
+        import io
+        self.fake(exists='false')
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone']))
+        self.assertIn(('api', '-X', 'PUT', 'repos/davidlarrimore/elvis/collaborators/davidlarrimore-bot',
+                       '-f', 'permission=push'), self.calls)
+        self.assertIn(('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-'), self.calls)
+        self.assertIn('invited with write', err.getvalue())
+        self.assertIn("ruleset 'main: owner approves' added", err.getvalue())
+        left = out.getvalue()
+        self.assertIn('--visibility private', left)
+        self.assertIn('--add-reviewer davidlarrimore-bot', left)
+        self.assertNotIn('write: the code', left)  # not the new-repo steps
+
+    def test_a_read_only_or_invited_bot_is_given_write_again(self):
+        import contextlib
+        import io
+        for collaborator, invited, said in (('read', False, 'raised from read to write'),
+                                            (False, True, 'invitation renewed')):
+            self.calls.clear()
+            self.fake(exists='true', collaborator=collaborator, ruleset=True, invited=invited)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.run_new('elvis', '--no-clone')
+            self.assertIn(said, err.getvalue())
+            self.assertEqual([c for c in self.calls if '-X' in c],
+                             [('api', '-X', 'PUT', 'repos/davidlarrimore/elvis/collaborators/davidlarrimore-bot',
+                               '-f', 'permission=push')])
+
+    def test_nothing_left_on_a_set_up_repo_and_no_clone_inside_its_checkout(self):
+        import contextlib
+        import io
+        self.fake(exists='true', collaborator=True, ruleset=True)
+        saved = magehand.current_repo
+        magehand.current_repo = lambda *a: 'davidlarrimore/elvis'
+        self.addCleanup(setattr, magehand, 'current_repo', saved)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis']))
+        self.assertIn('nothing left for you', out.getvalue())
+        self.assertFalse([c for c in self.calls if c[:2] == ('repo', 'clone')])
 
     def test_existing_public_repo_gets_the_bot_and_a_warning(self):
         import contextlib
@@ -2169,8 +2220,11 @@ class RepoConformance(unittest.TestCase):
         self.assertIsNone(magehand.current_repo(tempfile.gettempdir()))
 
     def with_gh(self, answers):
-        """Run repo_state with gh answering from `answers` {path suffix: (code, out, err)}."""
+        """Run repo_state with gh answering from `answers` {path suffix: (code, out, err)}, over a private repo
+        on which the bot, once a collaborator, can write."""
         saved = magehand.gh_cli
+        answers = dict({'': lambda args: (0, 'main\n' if '.default_branch' in args else 'true\n', ''),
+                        BOT_PATH + '/permission': (0, 'write\n', ''), '/invitations': (0, '[]', '')}, **answers)
 
         def gh(*args, **kw):
             for suffix, answer in answers.items():
@@ -2186,14 +2240,30 @@ class RepoConformance(unittest.TestCase):
     APPLIED = (0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]), '')  # rules GitHub applies to main
 
     def answers(self, detail=None, applied=APPLIED, bot=(0, '', '')):
-        return {'/rulesets': self.LISTED, '/rulesets/7': (0, json.dumps(detail or self.GOOD), ''), '': (0, 'main\n', ''),
+        return {'/rulesets': self.LISTED, '/rulesets/7': (0, json.dumps(detail or self.GOOD), ''),
                 '/rules/branches/main': applied, BOT_PATH: bot}
 
     def test_repo_state(self):
         ok = self.with_gh(self.answers())
-        self.assertEqual((ok['ruleset'], ok['bot']), ('ok', True))
-        none = self.with_gh({'/rulesets': (0, '[]', ''), BOT_PATH: (1, '', 'gh: Not Found (HTTP 404)')})
-        self.assertEqual((none['ruleset'], none['bot']), ('missing', False))
+        self.assertEqual((ok['ruleset'], ok['bot'], ok['private']), ('ok', 'write', True))
+        gone = (1, '', 'gh: Not Found (HTTP 404)')
+        none = self.with_gh({'/rulesets': (0, '[]', ''), BOT_PATH: gone, '': (0, 'false\n', '')})
+        self.assertEqual((none['ruleset'], none['bot'], none['private']), ('missing', 'missing', False))
+
+    def test_the_bot_needs_write_and_a_pending_invitation_is_not_missing(self):
+        # issue #44: a repo without the bot made `gh pr edit --add-reviewer` add nobody, and nothing said so.
+        gone = (1, '', 'gh: Not Found (HTTP 404)')
+        self.assertEqual(self.with_gh(self.answers(bot=gone))['bot'], 'missing')
+        self.assertEqual(self.with_gh(dict(self.answers(), **{BOT_PATH + '/permission': (0, 'read\n', '')}))['bot'],
+                         'read')
+        self.assertEqual(self.with_gh(dict(self.answers(), **{BOT_PATH + '/permission': (0, 'admin\n', '')}))['bot'],
+                         'write')
+        invited = (0, json.dumps([{'invitee': {'login': 'someone-else'}}, {'invitee': {'login': magehand.BOT},
+                                                                           'permissions': 'write'}]), '')
+        self.assertEqual(self.with_gh(dict(self.answers(bot=gone), **{'/invitations': invited}))['bot'], 'invited')
+        # Invitations only an admin can list: unknown, not missing.
+        refused = (1, '', 'gh: Must have admin rights to Repository. (HTTP 403)')
+        self.assertIsNone(self.with_gh(dict(self.answers(bot=gone), **{'/invitations': refused}))['bot'])
 
     def test_a_ruleset_that_would_not_pause_a_merge_is_weak(self):
         for weak in (dict(self.GOOD, enforcement='disabled'), dict(self.GOOD, enforcement='evaluate'),
@@ -2232,8 +2302,8 @@ class RepoConformance(unittest.TestCase):
     def test_failures_are_unknown_not_missing(self):
         for code, err in ((1, 'HTTP 403: Resource not accessible'), (1, 'HTTP 500'), (1, 'dial tcp: connection refused'),
                           (1, 'HTTP 403: API rate limit exceeded')):
-            state = self.with_gh({'/rulesets': (code, '', err), BOT_PATH: (code, '', err)})
-            self.assertEqual((state['ruleset'], state['bot']), (None, None), err)
+            state = self.with_gh({'/rulesets': (code, '', err), BOT_PATH: (code, '', err), '': (code, '', err)})
+            self.assertEqual((state['ruleset'], state['bot'], state['private']), (None, None, None), err)
 
     def test_repo_state_without_gh_is_unknown_not_a_crash(self):
         saved = magehand.gh_cli
@@ -2278,7 +2348,7 @@ class RepoConformance(unittest.TestCase):
                 setattr(magehand, n, f)
             magehand.urllib.request.urlopen = saved_urlopen
         report = json.loads(out.getvalue())
-        self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None, None])
+        self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None, None, None])
         self.assertEqual(len(calls), 1)  # only the (mocked, failing) OpenBao health probe was attempted
 
 

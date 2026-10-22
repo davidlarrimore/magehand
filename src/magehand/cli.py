@@ -1518,6 +1518,47 @@ def ruleset_status(repo):
     return ('weak', '; '.join(problems)) if problems else ('ok', '')
 
 
+def bot_access(repo):
+    """(state, detail) of OpenClaw's bot on the repo: 'write' (write, maintain or admin), 'read' (a collaborator
+    that can't push), 'invited' (an invitation is pending), 'missing', or None when it could not be read (no gh,
+    no admin, rate limit, network: detail has the reason). A request for the bot's review only works on 'write':
+    on the others `gh pr edit --add-reviewer` exits 0 and adds nobody."""
+    code, _, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
+    if code == 0:
+        code, out, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}/permission', '--jq', '.permission')
+        if code != 0:
+            return None, err or 'gh api failed'
+        return ('write', '') if out.strip() in ('admin', 'write') else ('read', out.strip())
+    if code is None or 'HTTP 404' not in err:
+        return None, err or 'gh api failed'
+    invitations, err = gh_json_pages(f'repos/{repo}/invitations')
+    if invitations is None:
+        return None, err
+    pending = [i for i in invitations if (i.get('invitee') or {}).get('login', '').lower() == BOT.lower()]
+    if pending:
+        return 'invited', pending[0].get('permissions') or ''
+    return 'missing', ''
+
+
+def ensure_bot(repo):
+    """Make sure OpenClaw's bot can write to the repo: 'collaborator' (it already can), 'invited' (an invitation
+    is pending: new, renewed, or raised from read to write). Dies when GitHub refuses the invitation."""
+    state, _ = bot_access(repo)
+    if state == 'write':
+        print(f'{BOT}: already a collaborator with write', file=sys.stderr)
+        return 'collaborator'
+    # PUT invites a missing bot, raises a read-only one to write and renews a pending invitation.
+    code, _, err = gh_cli('api', '-X', 'PUT', f'repos/{repo}/collaborators/{BOT}', '-f', 'permission=push')
+    if code != 0:
+        die(f'cannot invite {BOT} to {repo}: {err or "gh api failed"}')
+    if state == 'read':
+        print(f'{BOT}: raised from read to write', file=sys.stderr)
+        return 'collaborator'
+    print(f'{BOT}: {"invitation renewed" if state == "invited" else "invited"} with write; OpenClaw accepts it '
+          'within about 5 minutes', file=sys.stderr)
+    return 'invited'
+
+
 def ensure_ruleset(repo):
     """Make sure the repo has the approval ruleset: 'exists', 'created', 'weak' or 'failed' (a warning, not an
     error: the owner can fix it by hand). An existing ruleset is never changed: if it is weaker than ours
@@ -1669,15 +1710,7 @@ def cmd_new(a):
                'on main: its template copy did not complete (a ruleset or an early commit blocks it). '
                'An app repo with nothing in it yet is quickest to recreate: `gh repo delete '
                f'{repo}` and run `magehand new` again; otherwise restore the files through a pull request'))
-    if gh_cli('api', f'repos/{repo}/collaborators/{BOT}')[0] == 0:
-        bot = 'collaborator'
-        print(f'{BOT}: already a collaborator', file=sys.stderr)
-    else:
-        code, _, err = gh_cli('api', '-X', 'PUT', f'repos/{repo}/collaborators/{BOT}', '-f', 'permission=push')
-        if code != 0:
-            die(f'cannot invite {BOT} to {repo}: {err or "gh api failed"}')
-        bot = 'invited'
-        print(f'{BOT}: invited with write; OpenClaw accepts it within about 5 minutes', file=sys.stderr)
+    bot = ensure_bot(repo)
     # Before the ruleset: the owner's one commit to main, so deploy/app.yaml names the app from the start.
     named = ensure_app_name(repo, app) if app != name else None
     if named == 'seeded':
@@ -1687,7 +1720,8 @@ def cmd_new(a):
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
-    cloned = None if a.no_clone else clone_repo(repo, dest)
+    here = not a.dir and current_repo() == repo  # repairing the checkout you are in: no second copy inside it
+    cloned = None if a.no_clone or here else clone_repo(repo, dest)
     if cloned == 'cloned':
         print(f'{repo}: cloned to {dest}', file=sys.stderr)
     elif cloned == 'exists':
@@ -1698,8 +1732,10 @@ def cmd_new(a):
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
                           'ruleset': ruleset, 'app_name': named, 'clone': cloned,
                           'dir': str(dest) if cloned in ('cloned', 'exists') else None}, indent=1))
-    else:
+    elif created:
         print(new_summary(repo, name, app, dest, named, cloned))
+    else:
+        print(repair_summary(repo, private, bot, ruleset, cloned, dest))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
 
@@ -1723,6 +1759,28 @@ def new_summary(repo, name, app, dest, named, cloned):
               f'  - {live} is registered and deployed to https://{live}-dev.{LAB}/',
               '  - its blocks and its own LLM key are created (until then, mock the LLM)']
     return '\n'.join(lines)
+
+
+def repair_summary(repo, private, bot, ruleset, cloned, dest):
+    """What `new` on an existing repo leaves for you: only what it could not do itself (its changes went to
+    stderr as it made them)."""
+    steps = []
+    if not private:
+        steps.append(f'run:   gh repo edit {repo} --visibility private --accept-visibility-change-consequences')
+    if bot == 'invited':
+        steps.append('wait:  OpenClaw accepts the invitation within about 5 minutes; then request its review '
+                     f'again (gh pr edit N --add-reviewer {BOT}) and check it took: gh pr view N --json reviewRequests')
+    if ruleset == 'weak':
+        steps.append(f"do:    fix the ruleset '{RULESET['name']}' in the repo's Settings > Rules (magehand leaves an "
+                     'existing ruleset alone)')
+    elif ruleset == 'failed':
+        steps.append(f"do:    add the ruleset '{RULESET['name']}' (only an admin can): run `magehand new "
+                     f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
+    if cloned == 'failed':
+        steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
+    if not steps:
+        return f'{repo}: set up (private, {BOT} can write, the approval ruleset is on main); nothing left for you'
+    return '\n'.join(['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)])
 
 
 # --- the container runtime: what runs local blocks and `run --container` -------------
@@ -2363,13 +2421,15 @@ def gh_probe(*args):
 
 
 def repo_state(repo):
-    """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'bot': True|False|None}: the repo's approval
-    ruleset and whether OpenClaw's bot can write to it. None means unknown (no gh, no admin, rate limit, a
-    server or network error), which is not the same as a confirmed 'missing' or False (HTTP 404)."""
+    """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'bot': 'write'|'read'|'invited'|'missing'|None,
+    'private': True|False|None}: the repo's approval ruleset, whether OpenClaw's bot can write to it, and whether
+    it is private. None means unknown (no gh, no admin, rate limit, a server or network error), which is not
+    the same as a confirmed 'missing' (HTTP 404)."""
     ruleset, detail = ruleset_status(repo)
-    code, _, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}')
-    bot = True if code == 0 else False if code is not None and 'HTTP 404' in err else None
-    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot}
+    bot, _ = bot_access(repo)
+    code, out, _ = gh_probe('api', f'repos/{repo}', '--jq', '.private')
+    private = {'true': True, 'false': False}.get(out.strip()) if code == 0 else None
+    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot, 'private': private}
 
 
 def cmd_doctor(a):
@@ -2404,14 +2464,23 @@ def cmd_doctor(a):
     repo = current_repo()
     if repo:
         state = repo_state(repo)
+        # Run in the checkout, `new` repairs the repo it is in and clones nothing.
         fix = f'`magehand new {repo.split("/", 1)[1]}` (re-running it is safe)'
         weak = f'{state["ruleset_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
-        for label, value, hint in ((f"{repo}: OpenClaw's bot can write", state['bot'], fix),
-                                   (f"{repo}: ruleset '{RULESET['name']}'",
-                                    None if state['ruleset'] is None else state['ruleset'] == 'ok',
-                                    weak if state['ruleset'] == 'weak' else fix)):
-            if value is None:  # unknown (no gh, no admin, rate limit, network): a note, never a failure
-                note = 'could not be read (needs gh, and admin for the ruleset)'
+        unread = 'could not be read (needs gh, and admin for the ruleset and invitations)'
+        bot = state['bot']
+        for label, value, hint, note in (
+                (f"{repo}: OpenClaw's bot can write", None if bot in (None, 'invited') else bot == 'write',
+                 f'{BOT} can only read: {fix}' if bot == 'read' else
+                 f'not a collaborator and not invited, so a review request adds nobody: {fix}',
+                 'invited; OpenClaw accepts it within about 5 minutes, then request its review again'
+                 if bot == 'invited' else unread),
+                (f"{repo}: ruleset '{RULESET['name']}'", None if state['ruleset'] is None else state['ruleset'] == 'ok',
+                 weak if state['ruleset'] == 'weak' else fix, unread),
+                (f'{repo}: private', state['private'],
+                 f'app repos are private: gh repo edit {repo} --visibility private '
+                 '--accept-visibility-change-consequences', unread)):
+            if value is None:  # pending, or unknown (no gh, no admin, rate limit, network): a note, never a failure
                 results.append({'check': label, 'ok': None, 'hint': note})
                 if not a.json:
                     print(f'--   {label}: {note}')
@@ -3069,7 +3138,9 @@ ask the platform, with magehand (installed with `uv tool install magehand`).
 5. If the guide doesn't answer, say so in the PR or issue (what you searched
    for) instead of inventing a mechanism; the owner adds it to the guide.
 6. Opening a PR: open it as a draft (`gh pr create --draft`) and request the
-   reviewer at once, `gh pr edit N --add-reviewer davidlarrimore-bot`. CI runs
+   reviewer at once, `gh pr edit N --add-reviewer davidlarrimore-bot` (it exits
+   0 even when it adds nobody: if `gh pr view N --json reviewRequests` is
+   empty, run `magehand doctor`, which says how to fix the repo). CI runs
    on drafts and OpenClaw ignores them: push until `magehand check` and CI are
    green, then `gh pr ready N`, which starts the review (each review costs a
    model run). A push starts no review and dismisses the approval: to change a
@@ -4252,13 +4323,17 @@ def build_parser():
     # start an app
     p = command('new', cmd_new, "create an app's repo (private, from the template) for OpenClaw too",
                 "create an app's private repo from homelab-app-template and invite OpenClaw's bot (write)",
-                'Uses gh as you (only the owner can create the repo). Safe to re-run: on an existing repo it\n'
-                'only invites the bot if needed, and warns if the repo is public. OpenClaw accepts the\n'
-                'invitation by itself; the platform registers the app once deploy/ is on main.\n'
+                'Uses gh as you (only the owner can create the repo). It also adds the approval ruleset\n'
+                "'main: owner approves'. Safe to re-run, and how to repair a repo made without it (`magehand\n"
+                "doctor` says when one is): on an existing repo it invites the bot (or gives it write) and adds\n"
+                'the ruleset only if missing, warns if the repo is public, clones nothing when run in its\n'
+                'checkout, and lists only what is left for you. OpenClaw accepts the invitation by itself;\n'
+                'the platform registers the app once deploy/ is on main.\n'
                 'The app is named after the repo unless --app-name says otherwise (the repo lab-website\n'
                 'for the app lab: lab-dev.lab.davidlarrimore.com). It clones the repo into ./REPO (--dir\n'
                 'DIR, or --no-clone), then lists what is left for you and what the platform does by itself.\n\n'
                 'examples:\n  magehand new elvis\n  magehand new lab-website --app-name lab\n'
+                '  magehand new elvis --no-clone      # repair an existing repo: bot and ruleset\n'
                 '  magehand new elvis --no-clone --json')
     p.add_argument('name', metavar='REPO', help="the repo's name (also the app's, unless --app-name)")
     p.add_argument('--no-clone', action='store_true', help="don't clone the new repo into ./REPO")
@@ -4471,7 +4546,7 @@ def build_parser():
     p.add_argument('--dns', metavar='ADDRESS', help="the homelab's DNS address, if *.lab doesn't resolve "
                    '(else it asks, in a terminal)')
     p.add_argument('--undo', action='store_true', help='remove the *.lab name resolution setup added')
-    p = command('doctor', cmd_doctor, 'check access, sign-in and the container runtime', 'check GitHub access, homelab reach, sign-in and the container runtime')
+    p = command('doctor', cmd_doctor, 'check access, sign-in and the container runtime', 'check GitHub access, homelab reach, sign-in, the app repo\'s setup and the container runtime')
     json_option(p)
     p = command('skill', cmd_skill, 'print or install the homelab-app skill for coding agents', 'print the homelab-app skill for coding agents, or install it')
     p.add_argument('--install', action='store_true', help='install it for Claude Code (and Codex, if installed)')
