@@ -1811,7 +1811,7 @@ class New(unittest.TestCase):
         self.assertIn("ruleset 'main: owner approves' added", err.getvalue())
         left = out.getvalue()
         self.assertIn('--visibility private', left)
-        self.assertIn('--add-reviewer davidlarrimore-bot', left)
+        self.assertIn('magehand pr ready N', left)
         self.assertNotIn('write: the code', left)  # not the new-repo steps
 
     def test_a_read_only_or_invited_bot_is_given_write_again(self):
@@ -2302,7 +2302,7 @@ BOT_PATH = f"/collaborators/{magehand.BOT}"
 
 class SkillProcess(unittest.TestCase):
     def test_the_skill_teaches_the_review_and_agents_process(self):
-        for text in ('gh pr edit N --add-reviewer davidlarrimore-bot', 'magehand update-agents', 'gh pr create --draft', 'gh pr ready N',
+        for text in ('magehand pr ready', 'magehand update-agents', 'gh pr create --draft', 'gh pr ready N --undo',
                      'Base every PR on `main`'):
             self.assertIn(text, magehand.SKILL)
 
@@ -2513,6 +2513,100 @@ def setUpModule():
     unittest.addModuleCleanup(patch.stop)
     ci = os.environ.pop('CI', None)  # GitHub Actions sets it, and check treats a skip as an error there
     unittest.addModuleCleanup(lambda: ci is not None and os.environ.update(CI=ci))
+
+
+class PrReady(unittest.TestCase):
+    """`pr ready`: only on green checks, and the review request is confirmed, never assumed."""
+
+    GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
+
+    def run_pr(self, checks=GREEN, draft=True, author='davidlarrimore', requested_before=False, sticks=True,
+               access='write', pushed=False, owner='davidlarrimore', json_out=False):
+        state = {'requested': requested_before, 'reads': 0}
+        writes = []
+
+        def pr():
+            state['reads'] += 1
+            head = 'b' * 40 if pushed and state['reads'] > 1 else 'a' * 40
+            return {'number': 12, 'url': f'https://github.com/{owner}/demo/pull/12', 'state': 'OPEN',
+                    'isDraft': draft, 'headRefOid': head, 'author': {'login': author}, 'statusCheckRollup': checks,
+                    'reviewRequests': [{'login': magehand.BOT}] if state['requested'] else []}
+
+        def gh(*args, **kw):
+            writes.append(args)
+            if args[:2] == ('pr', 'edit') and sticks:
+                state['requested'] = True
+            return 0, '', ''
+        with mock.patch.object(magehand, 'gh_query', lambda *a: (pr(), None)), \
+                mock.patch.object(magehand, 'gh_cli', gh), \
+                mock.patch.object(magehand, 'bot_access', lambda repo: (access, 'HTTP 403' if access is None else '')):
+            code, out, _ = CommandLine.run_main(self, 'pr', 'ready', '12', *(['--json'] if json_out else []))
+        return code, out, writes
+
+    def test_refuses_until_checks_are_green(self):
+        for checks, why in (([{'name': 'tests', 'status': 'IN_PROGRESS'}], 'still running: tests'),
+                            ([{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}], 'not green: tests (failure)'),
+                            ([{'name': 'deploy', 'status': 'COMPLETED', 'conclusion': 'ACTION_REQUIRED'}],
+                             'not green: deploy (action_required)'),
+                            ([{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'STALE'}], 'not green: tests (stale)'),
+                            ([{'name': 'tests', 'status': 'COMPLETED'}], 'not green: tests (no conclusion)'),
+                            ([{'context': 'policy', 'state': 'ERROR'}], 'not green: policy (error)'),
+                            ([{'context': 'policy', 'state': 'PENDING'}], 'still running: policy'),
+                            ([], 'no checks have reported yet')):
+            code, out, writes = self.run_pr(checks=checks)
+            self.assertEqual((code, writes), (1, []), why)
+            self.assertIn(why, out)
+            self.assertTrue(out.splitlines()[-1].startswith('next: '), why)
+
+    def test_neutral_and_skipped_checks_are_green(self):
+        checks = self.GREEN + [{'name': 'docs', 'status': 'COMPLETED', 'conclusion': 'SKIPPED'},
+                               {'name': 'lint', 'status': 'COMPLETED', 'conclusion': 'NEUTRAL'},
+                               {'context': 'policy', 'state': 'SUCCESS'}]
+        self.assertEqual(self.run_pr(checks=checks)[0], 0)
+
+    def test_requests_confirms_then_readies(self):
+        # the request first, on the draft: a request that didn't stick never leaves a ready PR without its reviewer
+        code, out, writes = self.run_pr()
+        self.assertEqual(code, 0)
+        self.assertEqual([w[:2] for w in writes], [('pr', 'edit'), ('pr', 'ready')])
+        self.assertIn('--add-reviewer', writes[0])
+        self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
+        self.assertIn("wait for OpenClaw's review", out.splitlines()[-1])
+
+    def test_a_request_that_did_not_stick_says_why_and_leaves_the_draft(self):
+        for access, why, step in (('missing', 'is not a collaborator', 'magehand new demo'),
+                                  ('read', 'can only read', 'magehand new demo'),
+                                  ('invited', 'has not accepted', 'wait about 5 minutes'),
+                                  ('write', 'though the bot can write', 'request it on the PR page'),
+                                  (None, "could not check davidlarrimore-bot's access", '`magehand doctor`')):
+            code, out, writes = self.run_pr(sticks=False, access=access)
+            self.assertEqual(code, 1, access)
+            self.assertEqual([w[:2] for w in writes], [('pr', 'edit')], access)  # not marked ready
+            self.assertIn('NOT recorded', out)
+            self.assertIn(why, out)
+            self.assertIn(step, out.splitlines()[-1])
+        # another owner's repo: magehand new can't repair it
+        _, out, _ = self.run_pr(sticks=False, access='missing', owner='someone')
+        self.assertIn(f'ask someone to add {magehand.BOT} with write', out)
+        report = json.loads(self.run_pr(sticks=False, access='missing', json_out=True)[1])
+        self.assertEqual((report['ok'], report['requested'], report['changed']), (False, False, []))
+
+    def test_a_push_after_the_checks_were_read_is_refused(self):
+        code, out, writes = self.run_pr(pushed=True)
+        self.assertEqual(code, 1)
+        self.assertIn('a new commit arrived', out)
+        self.assertNotIn(('pr', 'ready'), [w[:2] for w in writes])
+
+    def test_nothing_to_do_and_openclaws_own_prs(self):
+        code, out, writes = self.run_pr(draft=False, requested_before=True)
+        self.assertEqual((code, writes), (0, []))
+        self.assertIn('already ready', out)
+        code, out, writes = self.run_pr(author=magehand.BOT)
+        self.assertEqual([w[:2] for w in writes], [('pr', 'ready')])  # never requests the author's own review
+        self.assertIn('the owner reviews', out.splitlines()[-1])
+        code, out, writes = self.run_pr(author=magehand.BOT, draft=False)
+        self.assertEqual((code, writes), (0, []))
+        self.assertIn('no review is requested', out)
 
 
 class ManagedCopy(unittest.TestCase):
