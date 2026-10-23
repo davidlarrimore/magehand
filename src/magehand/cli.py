@@ -2850,9 +2850,16 @@ def check_rendered(root, name):
     found, skipped = [], []
     domain = LAB.split('.', 1)[1]
     for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
-        if not (local / overlay / 'kustomization.yaml').is_file():
-            continue  # a missing dev overlay is check_deploy_files' error; prod is optional
         where = f'{DEPLOY}/{overlay}'
+        if overlay == 'dev' and not (local / overlay / 'kustomization.yaml').is_file():
+            continue  # check_deploy_files reports a missing dev overlay
+        if overlay == 'prod' and not (local / overlay).is_dir():
+            continue  # production is optional, but CI renders deploy/prod whenever it exists
+        if not (local / overlay / 'kustomization.yaml').is_file():
+            found.append(finding('error', f'{where}/kustomization.yaml', f'missing: CI renders {where} because it '
+                                 f'exists (namespace: {namespace}, resources: [../base]), or remove {where}',
+                                 'README "How an app is put together"'))
+            continue
         docs, why = render_overlay(local, overlay)
         if docs == 'failed':
             found.append(finding('error', where, f'kustomize cannot render it: {why}', 'README "How an app is put together"'))
@@ -3048,11 +3055,32 @@ def check_dockerfile(root):
                 if match.search(part) and not required.search(part):
                     found.append(finding('error', f'Dockerfile:{n}', f'{advice}: {part.strip()[:120]}', see))
                     break
-    users = [line.split()[1] for line in text.splitlines() if len(line.split()) > 1 and line.split()[0].upper() == 'USER']
-    user = users[-1] if users else ''
+    user = final_user(text)
     if not user or user == 'root' or user.split(':')[0] == '0':
-        found.append(finding('error', 'Dockerfile', 'the final stage needs USER <non-root uid>, e.g. USER 65532', see))
+        found.append(finding('error', 'Dockerfile', 'the final stage needs USER <non-root uid>, e.g. USER 65532 '
+                             '(after its FROM, or in the stage it builds on)', see))
     return found
+
+
+def final_user(text):
+    """The user the final stage runs as: its last USER, else the user of the earlier stage it is built FROM;
+    None when nothing sets one (an outside base image's own user isn't known here, so it counts as root)."""
+    stages = []  # [name, base, user] in order
+    for line in text.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if words[0].upper() == 'FROM':
+            base = next((w for w in words[1:] if not w.startswith('--')), '')
+            stages.append([words[-1] if len(words) >= 4 and words[-2].upper() == 'AS' else None, base, None])
+        elif words[0].upper() == 'USER' and len(words) > 1 and stages:
+            stages[-1][2] = words[1]
+    seen = set()
+    stage = stages[-1] if stages else None
+    while stage and not stage[2] and stage[1] not in seen:  # inherit from an earlier stage, never loop
+        seen.add(stage[1])
+        stage = next((s for s in stages if s[0] == stage[1]), None)
+    return stage[2] if stage else None
 
 
 def check_code(root, app, catalog=None):

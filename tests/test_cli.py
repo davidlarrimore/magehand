@@ -1239,6 +1239,12 @@ class CheckCode(unittest.TestCase):
             self.assertIn('needs USER', found(good.replace('USER 65532', 'USER root'))[0])
             self.assertIn('needs USER', found(good.replace('USER 65532', 'USER 0:0'))[0])
             self.assertIn('needs USER', found(good.replace('USER 65532\n', ''))[0])
+            # The final stage's own user, not the last USER anywhere (a gap in CI's version of this rule).
+            self.assertIn('needs USER', found('FROM scratch AS test\nUSER 65532\nFROM scratch\n')[0])
+            inherited = (f"FROM python@sha256:{'a' * 64} AS base\nUSER 65532\nFROM base AS test\n"
+                         'FROM base\n')
+            self.assertEqual(found(inherited), [])
+            self.assertIn('needs USER', found(inherited.replace('USER 65532', 'USER 65532\nUSER root'))[0])
 
     def test_dependencies_only_from_a_lockfile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1446,6 +1452,14 @@ class DeployDir(unittest.TestCase):
         self.assertEqual(self.rendered(good, prod=[public_ok]), ([], []))
         public_bad = self.ingress(f'demo.{domain}', lab, 'demo')
         self.assertIn('a public host needs', texts(self.rendered(good, prod=[public_bad]))[0])
+
+    def test_a_prod_directory_without_its_kustomization_is_an_error(self):
+        # CI renders deploy/prod whenever the directory exists: a patch alone fails there.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp, extra={'deploy/prod/patch.yaml': 'kind: Deployment\n'})
+            found, _ = magehand.check_rendered(root, 'demo')
+        self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/prod/kustomization.yaml')])
+        self.assertIn('namespace: demo', found[0]['text'])
 
     def test_render_failure_is_an_error_and_no_kubectl_a_skip(self):
         found, skipped = self.rendered([], failed='accumulating resources: missing kustomization.yaml')
