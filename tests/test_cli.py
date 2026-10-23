@@ -3672,6 +3672,26 @@ class Status(unittest.TestCase):
             code, out, _ = CommandLine.run_main(self, 'status', '--watch', '--interval', '0', '--json')
         self.assertEqual((code, json.loads(out)['ok'], len(calls)), (0, True, 3))
 
+    def test_watch_reads_the_lifecycle_again_when_main_moves(self):
+        first = [{'stage': 'config', 'state': 'ok', 'text': 'deploy/ on main (app.yaml, base/, dev/)'}]
+        second = [{'stage': 'config', 'state': 'ok', 'text': 'deploy/ on main (app.yaml, base/, dev/, prod/)'}]
+        calls, polls = [], []
+
+        def collect(*a, **k):
+            polls.append(1)
+            done = len(polls) > 1
+            return {'app': 'demo', 'repo': 'o/demo', 'commit': ('b' if done else 'a') * 40, 'subject': 's',
+                    'stages': [{'stage': 'build', 'state': 'ok', 'text': ''},
+                               {'stage': 'deploy', 'state': 'ok' if done else 'pending', 'text': ''}]}
+        with mock.patch.object(magehand, 'status_target', lambda name=None: ('demo', 'o/demo')), \
+                mock.patch.object(magehand, 'lifecycle_stages',
+                                  lambda repo, name: calls.append(1) or (first if len(calls) == 1 else second)), \
+                mock.patch.object(magehand, 'collect_status', collect):
+            code, out, _ = CommandLine.run_main(self, 'status', '--watch', '--interval', '0', '--json')
+        report = json.loads(out)
+        self.assertEqual((code, len(calls)), (0, 2))
+        self.assertIn('prod/', report['stages'][0]['text'])  # the lifecycle of the commit it ended on
+
     def test_status_prefers_the_registered_repo(self):
         with mock.patch.object(magehand, 'repo_root', lambda name: pathlib.Path('/x')), \
                 mock.patch.object(magehand, 'remote_repo', lambda root=None: 'myfork'), \

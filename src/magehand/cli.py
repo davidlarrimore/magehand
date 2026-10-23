@@ -1213,11 +1213,14 @@ def cmd_status(a):
     name, repo = status_target(a.app_flag or a.app)
     deadline = time.monotonic() + a.timeout * 60
     last = None
-    lifecycle, polls = lifecycle_stages(repo, name), 0
+    lifecycle, polls, seen = lifecycle_stages(repo, name), 0, None
     while True:
-        if polls and any(st['state'] in ('pending', 'failed', 'error') for st in lifecycle):
-            lifecycle = lifecycle_stages(repo, name)  # a registration, an invitation or a repair can land mid-watch
         report = collect_status(repo, name, cluster=not a.no_cluster)
+        # Read again when main moved (a merge can add deploy/prod/ or change the blocks) or while a stage can
+        # still change (a registration, an invitation or a repair can land mid-watch).
+        if polls and (report['commit'] != seen or any(st['state'] in ('pending', 'failed', 'error') for st in lifecycle)):
+            lifecycle = lifecycle_stages(repo, name)
+        seen = report['commit']
         report['stages'] = lifecycle + report['stages']
         # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
         states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev')]
