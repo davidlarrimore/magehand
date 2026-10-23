@@ -89,6 +89,12 @@ def die(msg):
     sys.exit(f'magehand: {msg}')
 
 
+def next_line(step):
+    """The last line of a command's human output: the one thing to do next, so neither a person nor an agent
+    has to work it out ('nothing' when there is nothing to do). --json carries the same as "next" (null)."""
+    return f'next: {step or "nothing"}'
+
+
 # --- GitHub (read-only: the guide, app manifests, block images) ---------------
 
 def github_token():
@@ -640,6 +646,8 @@ def cmd_app(a):
     keys = {block: llm_key_state(name, block, deployed)
             for block, svc in app['services'].items() if (svc or {}).get('type') == 'llm'}
     left = signin_left(soft=True)
+    step = ('merge deploy/ (app.yaml, base/, dev/) to main; the platform then registers the app '
+            '(`magehand status` follows it)' if deployed is None else None)
     if a.json:
         env = []
         for entry in env_plan(app):
@@ -653,7 +661,7 @@ def cmd_app(a):
                           'deployment': app['where'], 'dev_url': f'https://{name}-dev.{LAB}',
                           'port': app_port(app), 'registered': deployed is not None, 'blocks': app['services'],
                           'llm_keys': keys, 'env': env,
-                          'signin_seconds_left': left if left != UNREACHABLE else None}, indent=1))
+                          'signin_seconds_left': left if left != UNREACHABLE else None, 'next': step}, indent=1))
         return
     deployment = ('deploy/ in this repo (merging copies it to homelab-apps apps/%s)' % name if app['root']
                   else app['where'])
@@ -691,6 +699,7 @@ def cmd_app(a):
             print(f'  {entry[0]} <- Secret {entry[2]} (not a block; magehand run leaves it unset)')
         else:
             print(f'  {entry[0]} <- block {entry[1]} ({entry[2]}) key {entry[3]}')
+    print(next_line(step))
 
 
 # --- status: where a merge to main has got to ---------------------------------------
@@ -1026,6 +1035,27 @@ def collect_status(repo, name, cluster=True, ref='main'):
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
 
+def status_next(report, failed, done):
+    """What to do about a status report: fix the first stage that failed, wait for one in progress, or release
+    what dev runs and production doesn't yet. Commands name the app: the report may be about another app than
+    the checkout's."""
+    app = report['app']
+    watch = f'magehand status {app} --watch'
+    for st in report['stages']:
+        if st['state'] == 'error':
+            return f'fix the access problem it names, then `magehand status {app}` again'
+        if st['state'] == 'failed':
+            return {'build': f'fix the failed build (its run is linked above), push, then `{watch}`',
+                    'deploy': "tell the owner: the platform's dev deploy PR failed",
+                    'dev': f'fix what the dev line says, push, then `{watch}`'}.get(st['stage'], 'fix what that line says')
+    if report.get('timeout') or not done:
+        return f'`{watch}` (waits for the build and the dev deploy)'
+    prod = next((st for st in report['stages'] if st['stage'] == 'prod'), None)
+    if prod and prod.get('ahead'):
+        return f'`magehand release {app} --dry-run`: dev runs commits production does not have yet'
+    return None
+
+
 def render_status(report):
     lines = [f'{report["app"]}  ({report["repo"]} main {report["commit"][:7]}: {report["subject"]})']
     for st in report['stages']:
@@ -1065,10 +1095,12 @@ def cmd_status(a):
             last = text
         time.sleep(a.interval)
     report['ok'] = done and not failed  # build and the dev deploy both finished for the newest commit
+    report['next'] = status_next(report, failed, done)
     if a.json:
         print(json.dumps(report, indent=1))
     else:
         print(render_status(report))
+        print(next_line(report['next']))
         if report.get('timeout'):
             print(f'magehand: still not deployed to dev after {a.timeout} min; run it again to keep waiting',
                   file=sys.stderr)
@@ -1379,6 +1411,15 @@ def render_release(plan):
     return '\n'.join(lines)
 
 
+def release_next(plan, refuse, created=False):
+    """The next step after a release plan, naming its app (not whatever app the checkout is)."""
+    if created:
+        return f'`magehand status {plan["app"]}`: the platform deploys it to production within minutes'
+    if refuse:
+        return f'fix what blocks it (above), then `magehand release {plan["app"]} --dry-run` again'
+    return f'`magehand release {plan["app"]}` (the owner only: it deploys {plan["app"]} to production)'
+
+
 def cmd_release(a):
     if sum(map(bool, (a.major, a.minor, a.patch))) > 1:
         usage('release', 'choose one of --major, --minor, --patch')
@@ -1387,11 +1428,13 @@ def cmd_release(a):
     plan = plan_release(code_repo(app), app['name'], forced, cluster=not a.no_cluster)
     plan['created'] = False
     refuse = f'not releasing {plan["version"]}: ' + '; '.join(plan['problems']) if plan['problems'] else None
+    plan['next'] = release_next(plan, refuse)
     if a.dry_run or refuse:
         if a.json:
             print(json.dumps(plan, indent=1))
         else:
             print(render_release(plan))
+            print(next_line(plan['next']))
         if refuse:
             print(f'magehand: {refuse}', file=sys.stderr)
         sys.exit(1 if refuse else 0)
@@ -1408,12 +1451,12 @@ def cmd_release(a):
     if code != 0:
         die(f'gh could not create the release: {err}')
     plan['created'], plan['url'] = True, out.strip()
+    plan['next'] = release_next(plan, None, created=True)
     if a.json:
         print(json.dumps(plan, indent=1))
     else:
         print(f'released {plan["version"]}: {plan["url"]}')
-        print(f'The platform deploys it to production within minutes; follow it with `magehand status {plan["app"]}`.',
-              file=sys.stderr)
+        print(next_line(plan['next']))
 
 
 # --- new: start an app's repo --------------------------------------------------------
@@ -1735,10 +1778,13 @@ def cmd_new(a):
         print(f'{dest}: already exists; not cloned (is it {repo}?)', file=sys.stderr)
     elif cloned == 'failed':
         print(f'{repo}: could not clone it; run `gh repo clone {repo} {shell_path(dest)}`', file=sys.stderr)
+    steps = (new_steps(repo, name, app, dest, named, cloned) if created else
+             repair_steps(repo, private, bot, ruleset, cloned, dest, app, named))
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
                           'ruleset': ruleset, 'app_name': named, 'clone': cloned,
-                          'dir': str(dest) if cloned in ('cloned', 'exists') else None}, indent=1))
+                          'dir': str(dest) if cloned in ('cloned', 'exists') else None,
+                          'next': step_text(steps[0]) if steps else None}, indent=1))
     elif created:
         print(new_summary(repo, name, app, dest, named, cloned))
     else:
@@ -1747,10 +1793,13 @@ def cmd_new(a):
         sys.exit(1)
 
 
-def new_summary(repo, name, app, dest, named, cloned):
-    """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
-    what the platform does by itself afterwards. Everything already done went to stderr as it happened."""
-    live = name if named in ('failed', 'differs') else app
+def step_text(step):
+    """A summary step without its marker ("run:   cd elvis" -> "cd elvis"), for the `next:` line."""
+    return step.split(':', 1)[1].strip() if re.match(r'^[a-z]+:\s', step) else step
+
+
+def new_steps(repo, name, app, dest, named, cloned):
+    """The steps `new` leaves you after creating a repo, in order."""
     # run: a command to type, write:/edit: work in the repo, do: a decision or action of yours. A program
     # can't change its parent shell's directory, so `cd` is a step even when it cloned.
     steps = [f'run:   gh repo clone {repo} {shell_path(dest)}'] if cloned not in ('cloned', 'exists') else []
@@ -1761,16 +1810,25 @@ def new_summary(repo, name, app, dest, named, cloned):
     steps += ['write: the code, and deploy/ (app.yaml and base/)   guide: magehand guide search new app',
               'run:   magehand check          # the platform\'s rules, before you push',
               'do:    open a PR and merge it  # the platform deploys what is on main']
+    return steps
+
+
+def new_summary(repo, name, app, dest, named, cloned):
+    """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
+    what the platform does by itself afterwards, then the first step as `next:`. Everything already done went
+    to stderr as it happened."""
+    live = name if named in ('failed', 'differs') else app
+    steps = new_steps(repo, name, app, dest, named, cloned)
     lines = ['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
     lines += ['', 'Then, by itself (about 5 minutes after deploy/ with base/ is merged to main):',
               f'  - {live} is registered and deployed to https://{live}-dev.{LAB}/',
-              '  - its blocks and its own LLM key are created (until then, mock the LLM)']
+              '  - its blocks and its own LLM key are created (until then, mock the LLM)',
+              next_line(step_text(steps[0]))]
     return '\n'.join(lines)
 
 
-def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None):
-    """What `new` on an existing repo leaves for you: only what it could not do itself (its changes went to
-    stderr as it made them)."""
+def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None):
+    """The steps `new` on an existing repo leaves you: only what it could not do itself."""
     steps = []
     if named in ('failed', 'differs'):
         steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (until then the app is named '
@@ -1788,9 +1846,17 @@ def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=No
                      f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
     if cloned == 'failed':
         steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
+    return steps
+
+
+def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None):
+    """What `new` on an existing repo leaves for you (its changes went to stderr as it made them)."""
+    steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named)
     if not steps:
-        return f'{repo}: set up (private, {BOT} can write, the approval ruleset is on main); nothing left for you'
-    return '\n'.join(['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)])
+        return (f'{repo}: set up (private, {BOT} can write, the approval ruleset is on main); nothing left for you\n'
+                + next_line(None))
+    return '\n'.join(['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
+                     + [next_line(step_text(steps[0]))])
 
 
 # --- the container runtime: what runs local blocks and `run --container` -------------
@@ -2117,6 +2183,8 @@ def cmd_dev(a):
         (STATE / f'{app["name"]}.json').unlink(missing_ok=True)
         if cli:
             engine('network', 'rm', network, check=False)
+    print(next_line('`magehand run -- <your run command>` (the app with these blocks and its pod\'s env)'
+                    if action == 'up' else None))
 
 
 def local_bucket_name(app_name, block):
@@ -2508,12 +2576,14 @@ def cmd_doctor(a):
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
     # Not a failure without one: only postgres/redis blocks and run --container need it.
+    step = next((r['hint'] for r in results if r['ok'] is False), None)
     if a.json:
-        print(json.dumps({'ok': ok, 'checks': results, 'runtime': chosen}, indent=1))
+        print(json.dumps({'ok': ok, 'checks': results, 'runtime': chosen, 'next': step}, indent=1))
     else:
         print(f'{"ok  " if chosen else "--  "} container runtime: {chosen or "none"}'
               + ('' if chosen else f' (needed only for local postgres/redis blocks and run --container: '
                                    f'{SUPPORTED}; `magehand runtime`)'))
+        print(next_line(step))
     sys.exit(0 if ok else 1)
 
 
@@ -3059,19 +3129,25 @@ def cmd_check(a):
         note = (f'{name} is pinned to {OWNER}/{repo} at {ref[:7]}: its manifests are in that repo and are checked by its '
                 'build (`magehand check` there); nothing to check in this homelab-apps checkout')
         if a.json:
-            print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': []}, indent=1))
+            print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': [],
+                              'next': None}, indent=1))
         else:
             print(f'magehand check {name}: {note}')
+            print(next_line(None))
         sys.exit(0)
     found = (check_manifests(app, catalog) + check_jobs(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
     if not manifests_only:
         found += check_code(root, app, catalog) + check_agents_drift(root) + check_merged_branch(root)
     errors = sum(f['level'] == 'error' for f in found)
+    step = ('fix the errors, then `magehand check` again' if errors else
+            'fix each warning or say in the PR why it is fine, then push' if found else
+            'push (CI runs this check too)')
     if a.json:
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
                           'deployment': app['where'] if app else None, 'errors': errors,
-                          'findings': sorted(found, key=lambda f: (f['level'] != 'error', f['where']))}, indent=1))
+                          'findings': sorted(found, key=lambda f: (f['level'] != 'error', f['where'])),
+                          'next': step}, indent=1))
         sys.exit(1 if errors else 0)
     print(f'magehand check {name}: code {"(skipped)" if manifests_only else root.resolve()}, deployment '
           + (app['where'] if app else 'none yet (code rules only)'))
@@ -3079,6 +3155,7 @@ def cmd_check(a):
         see = f['see'] if f['see'].startswith('homelab-apps') else f"magehand guide {f['see']}"
         print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> {see}")
     print(f'{len(found)} finding(s), {errors} error(s)' if found else 'no findings')
+    print(next_line(step))
     sys.exit(1 if errors else 0)
 
 
@@ -3109,8 +3186,10 @@ def cmd_agents(a):
                 f'notes. Put the heading above the app\'s own notes (see {TEMPLATE_REPO}), then run it again')
         new = platform + own
     changed = new != current
+    step = (('`magehand update-agents`' if a.check else f'review the diff (`git diff {path}`) and commit it')
+            if changed else None)
     if a.json:
-        print(json.dumps({'path': str(path), 'changed': changed, 'written': changed and not a.check}))
+        print(json.dumps({'path': str(path), 'changed': changed, 'written': changed and not a.check, 'next': step}))
     elif not changed:
         print(f'{path}: up to date', file=sys.stderr)
     elif a.check:
@@ -3118,7 +3197,9 @@ def cmd_agents(a):
     if changed and not a.check:
         path.write_text(new)
         if not a.json:
-            print(f'{path}: updated from {TEMPLATE_REPO}; review the diff and commit it', file=sys.stderr)
+            print(f'{path}: updated from {TEMPLATE_REPO}', file=sys.stderr)
+    if not a.json:
+        print(next_line(step))
     sys.exit(1 if changed and a.check else 0)
 
 
@@ -3134,6 +3215,7 @@ description: Use when writing, changing, reviewing or debugging the code or depl
 The homelab decides how an app gets databases, AI, web search, secrets,
 sign-in and deploys. Don't rely on habits from other platforms or guess:
 ask the platform, with magehand (installed with `uv tool install magehand`).
+Its commands end with `next: ...`: do that next, or say why not.
 
 1. Before designing or changing behavior: `magehand app` (in the app's repo).
    It lists the app's blocks, every env var its pod gets and where each comes
@@ -3249,6 +3331,7 @@ def cmd_setup(a):
         if RESOLVER.exists():
             subprocess.run(['sudo', 'rm', '-f', str(RESOLVER)], check=True)  # nosec B603 B607
             print(f'removed {RESOLVER}')
+        print(next_line(None))
         return
     print('1/5 GitHub')
     try:
@@ -3294,7 +3377,8 @@ def cmd_setup(a):
     print('5/5 the homelab-app skill for coding agents (Claude Code, Codex)')
     for path in install_skill():
         print(f'    ok: {path}')
-    print('Done. Try `magehand app <name>` or, in an app repo, `magehand run -- <command>`.')
+    print('Done: this machine is set up.')
+    print(next_line('in an app repo, `magehand status` (or `magehand new REPO` to start one)'))
 
 
 # --- staying current -------------------------------------------------------------
@@ -3395,7 +3479,8 @@ def cmd_upgrade(_a):
     # The new version, from this install's own bin (not whatever is first on PATH).
     exe = pathlib.Path(sys.executable).with_name('magehand')
     if not exe.is_file():
-        print('upgraded; run `magehand skill --install` if you use the skill')
+        print('upgraded')
+        print(next_line('`magehand skill --install`, if you use the skill'))
         return
     # Its skill text, only where the user installed the skill (magehand setup).
     if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
@@ -3403,6 +3488,7 @@ def cmd_upgrade(_a):
             print('refreshed the homelab-app skill')
     out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603
     print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}')
+    print(next_line(None))
 
 
 def cmd_version(_a):
@@ -4198,17 +4284,17 @@ def job_add(a, app, base):
     path.write_text(header + yaml.safe_dump(manifest, sort_keys=False, default_flow_style=False))
     if new is not None:
         kustomization.write_text(new)
+    step = '`magehand check`, then commit and merge: the platform deploys it to dev with the rest of deploy/'
     if a.json:
         print(json.dumps({'action': 'add', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed,
                           'schedule': a.schedule, 'timezone': a.timezone, 'command': command,
-                          'timeout_seconds': timeout, 'memory': a.memory}, indent=1))
+                          'timeout_seconds': timeout, 'memory': a.memory, 'next': step}, indent=1))
         return
     print(f'wrote {DEPLOY}/base/{path.name}: {a.schedule} ({a.timezone}), {shlex.join(command)}, '
           f'timeout {a.timeout}, memory {a.memory}')
     print(f'added it to {listed}' if listed else
           f'warning: no {DEPLOY}/base/kustomization.yaml: list {path.name} in the base\'s resources', file=sys.stderr)
-    print('next: `magehand check`, commit, and merge; the platform deploys it to dev with the rest of deploy/',
-          file=sys.stderr)
+    print(next_line(step))
 
 
 def job_rm(a, app, base):
@@ -4231,22 +4317,29 @@ def job_rm(a, app, base):
     path.unlink()
     if new is not None:
         kustomization.write_text(new)
+    step = 'commit and merge: that removes the CronJob from dev (its finished runs go with it)'
     if a.json:
-        print(json.dumps({'action': 'rm', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed}))
+        print(json.dumps({'action': 'rm', 'job': a.name, 'file': f'{DEPLOY}/base/{path.name}', 'kustomization': listed,
+                          'next': step}))
         return
     print(f'removed {DEPLOY}/base/{path.name}' + (f' and its line in {listed}' if listed else ''))
-    print('merging removes the CronJob from dev (its finished runs go with it)', file=sys.stderr)
+    print(next_line(step))
 
 
 def job_ls(a, app):
     namespace = f'{app["name"]}-dev'
     cluster, why = (None, '--no-cluster') if a.no_cluster else kubectl_json('cronjobs,jobs', '-n', namespace)
     rows = job_rows(local_jobs(app), cluster)
+    failed = [run['job'] for row in rows for run in ((row['dev'] or {}).get('runs') or [])[:1] if run['state'] == 'failed']
+    step = ('`magehand job add NAME --schedule CRON -- COMMAND`' if not rows else
+            f'read why its last run failed: `kubectl -n {namespace} logs job/{failed[0]}`' if failed else None)
     if a.json:
-        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows}, indent=1))
+        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows,
+                          'next': step}, indent=1))
         return
     if not rows:
-        print(f'{app["name"]} has no jobs: add one with `magehand job add NAME --schedule CRON -- COMMAND`')
+        print(f'{app["name"]} has no jobs')
+        print(next_line(step))
         return
     for row in rows:
         where = row['file'] or 'in dev only: not in this checkout\'s deploy/ (removed on this branch?)'
@@ -4265,6 +4358,7 @@ def job_ls(a, app):
                 print(f'    {STATUS_MARK[run["state"]]} {run["job"]} {when(run["started"])}{took}')
             if dev['runs']:
                 print(f'  logs: kubectl -n {namespace} logs job/{dev["runs"][0]["job"]}')
+    print(next_line(step))
 
 
 def cmd_job(a):
@@ -4281,10 +4375,16 @@ def cmd_job(a):
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new',)),
-          ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'update-agents')),
+          ('learn the platform and check an app', ('guide', 'app', 'status', 'check')),
           ('ship an app', ('release', 'job')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
-          ('this machine', ('setup', 'doctor', 'upgrade', 'skill', 'version', 'help')))
+          ('this machine', ('setup', 'doctor', 'upgrade')))
+# Working, but not what a person needs to learn: -V and -h do version's and help's jobs, setup and upgrade
+# install the skill (OpenClaw's provisioning runs `skill --install`), and check says when to update-agents.
+PLUMBING = ('update-agents', 'skill', 'version', 'help')
+# Commands whose output is the result itself (data, or your own command's output): no `next:` line. Every
+# other command ends its human output with next_line() and puts "next" in its --json.
+NO_NEXT = ('guide', 'run', 'bucket', 'runtime', 'login', 'skill', 'version', 'help')
 SHORT = {}
 
 
@@ -4295,7 +4395,7 @@ class RootParser(Parser):
             lines.append(f'{title}:')
             lines += [f'  {name:14} {SHORT[name]}' for name in names]
             lines.append('')
-        lines += ['options:', '  -h, --help     show this help and exit', '  -V, --version  print the version and exit',
+        lines += [f'also: {", ".join(PLUMBING)} (rarely needed: `magehand help COMMAND`)', '', 'options:', '  -h, --help     show this help and exit', '  -V, --version  print the version and exit',
                   '', self.epilog, '']
         return '\n'.join(lines)
 
