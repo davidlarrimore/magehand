@@ -176,15 +176,24 @@ def registration_lookup(name):
     """(spec, None) of the app's homelab-apps apps/<name>/app.yaml on main; (None, None) when it isn't registered
     (HTTP 404); (None, why) when it couldn't be read. registration() exits on that, which status can't afford."""
     if APPS_DIR:
-        return registration(name), None
-    code, out, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
-                              f'repos/{APPS_REPO}/contents/apps/{name}/app.yaml')
-    if code != 0:
-        return (None, None) if code is not None and 'HTTP 404' in err else (None, err or 'gh failed')
+        local = pathlib.Path(APPS_DIR) / 'apps' / name / 'app.yaml'
+        if not local.is_file():
+            return None, None
+        out = local.read_text()
+    else:
+        code, out, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
+                                  f'repos/{APPS_REPO}/contents/apps/{name}/app.yaml')
+        if code != 0:
+            if code is None or 'HTTP 404' not in err:
+                return None, err or 'gh failed'
+            # GitHub answers 404 for a repo this account can't see, too: "not registered" only if it can
+            seen, _, why = gh_probe('api', f'repos/{APPS_REPO}', '--jq', '.full_name')
+            return (None, None) if seen == 0 else (None, f'cannot see {APPS_REPO} ({why or "gh failed"})')
     try:
-        return yaml.safe_load(out) or {}, None
+        spec = yaml.safe_load(out) or {}
     except yaml.YAMLError:
         return None, f'apps/{name}/app.yaml is not valid YAML'
+    return (spec, None) if isinstance(spec, dict) else (None, f'apps/{name}/app.yaml is not a mapping')
 
 
 # --- The app ------------------------------------------------------------------
@@ -861,12 +870,12 @@ def prod_stage(tag, ahead, prs):
     since = f'  ({ahead} commit{"" if ahead == 1 else "s"} on main since {tag})' if ahead else ''
     mine = [p for p in prs or [] if (PROD_TITLE.search(p.get('title') or '') or [None, None])[1] == tag]
     if mine and mine[0].get('state') == 'MERGED':
-        return {'stage': 'prod', 'state': 'ok', 'text': f'{tag} deployed{since}', 'tag': tag, 'ahead': ahead}
+        return {'stage': 'prod', 'state': 'ok', 'text': f'{tag} deployed{since}', 'tag': tag, 'ahead': ahead, 'released': True}
     if mine and mine[0].get('state') == 'OPEN':
         return {'stage': 'prod', 'state': 'pending', 'text': f'{tag}: homelab-apps#{mine[0]["number"]} is open{since}',
-                'tag': tag, 'ahead': ahead}
+                'tag': tag, 'ahead': ahead, 'released': True}
     return {'stage': 'prod', 'state': 'unknown', 'text': f'{tag} released; its deploy PR was not found{since}',
-            'tag': tag, 'ahead': ahead}
+            'tag': tag, 'ahead': ahead, 'released': True}
 
 
 BLOCK_LABEL = 'homelab.davidlarrimore.com/block'  # on a building block's pods (postgres, redis): not the app's image
@@ -1087,8 +1096,11 @@ def lifecycle_stages(repo, name):
     if state['archived']:
         repo_stage = {'state': 'unknown', 'text': 'archived (a retired app)'}
     elif problems:
+        only_public = problems == ['it is public']
         repo_stage = {'state': 'failed', 'text': 'not set up: ' + '; '.join(problems),
-                      'next': f'ask the owner to run `magehand new {short}` (it repairs the repo)'}
+                      'next': (f'ask the owner to make it private: `gh repo edit {repo} --visibility private '
+                               '--accept-visibility-change-consequences`' if only_public else
+                               f'ask the owner to run `magehand new {short}` (it repairs the repo)')}
     elif state['ruleset'] == 'weak':
         repo_stage = {'state': 'failed', 'text': f"ruleset '{RULESET['name']}' would not pause a merge "
                       f"({state['ruleset_detail']})", 'next': "ask the owner to fix the ruleset in the repo's Settings > Rules"}
@@ -1113,8 +1125,9 @@ def lifecycle_stages(repo, name):
         config = {'state': 'error', 'text': f'cannot read {DEPLOY}/ on main ({unread})',
                   'next': f'fix the access problem it names, then `magehand status {name}` again'}
     elif not missing:
-        config = {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/)'}
-    elif spec is not None and not pinned:  # an older layout: the deployment is in homelab-apps, not the repo
+        config = {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/'
+                  + (', prod/)' if 'prod' in names[DEPLOY] else ')'), 'prod': 'prod' in names[DEPLOY]}
+    elif spec is not None and not pinned and len(missing) == 3:  # an older layout: the deployment is in homelab-apps
         config = {'state': 'unknown', 'text': f'no {DEPLOY}/ on main: the deployment is homelab-apps apps/{name}/'}
     elif spec is not None:
         config = {'state': 'failed', 'text': f'missing on main: {", ".join(missing)} (the next deploy reads them)',
@@ -1160,7 +1173,8 @@ def status_next(report, failed, done):
     prod = next((st for st in report['stages'] if st['stage'] == 'prod'), None)
     if prod and prod.get('ahead'):
         return f'`magehand release {app} --dry-run`: dev runs commits production does not have yet'
-    if prod and prod.get('released') is False:
+    config = next((st for st in report['stages'] if st['stage'] == 'config'), {})
+    if prod and prod.get('released') is False and config.get('prod'):  # a dev-only app has no deploy/prod/
         return f'when it is ready for production: `magehand release {app} --dry-run`'
     return None
 
@@ -1186,14 +1200,12 @@ def status_target(name=None):
     and status is where it learns what's missing."""
     name = name or current_app()
     root = repo_root(name)
-    source = remote_repo(root) if root else None
+    spec, _ = registration_lookup(name)
+    source = ((spec or {}).get('source') or {}).get('repo') or (remote_repo(root) if root else None)
     if not source:
-        spec = registration(name)
-        if spec is None:
-            die(f'{name} is not registered yet and this is not its checkout: run `magehand status` in its repo')
-        source = (spec.get('source') or {}).get('repo')
-        if not source:
-            die(f'{name} has no code repo (its image is built in homelab-apps), so there is no main to follow')
+        die(f'{name} is not registered yet and this is not its checkout: run `magehand status` in its repo'
+            if spec is None else
+            f'{name} has no code repo (its image is built in homelab-apps), so there is no main to follow')
     return name, f'{OWNER}/{source}'
 
 
@@ -1203,18 +1215,18 @@ def cmd_status(a):
     last = None
     lifecycle, polls = lifecycle_stages(repo, name), 0
     while True:
-        if polls and any(st['state'] == 'pending' for st in lifecycle):
-            lifecycle = lifecycle_stages(repo, name)  # registration or an invitation can land mid-watch
+        if polls and any(st['state'] in ('pending', 'failed', 'error') for st in lifecycle):
+            lifecycle = lifecycle_stages(repo, name)  # a registration, an invitation or a repair can land mid-watch
         report = collect_status(repo, name, cluster=not a.no_cluster)
         report['stages'] = lifecycle + report['stages']
         # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
         states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev')]
-        stopped = 'failed' in states or any(st['state'] == 'error' for st in report['stages'])
+        stopped = 'failed' in states or any(st['state'] == 'error' for st in report['stages'] if st not in lifecycle)
         waiting = [st['stage'] for st in report['stages'] if st['state'] == 'pending'
                    and (st['stage'] in ('build', 'deploy', 'dev') or st in lifecycle)]
         done = all(st == 'ok' for st in states if st != 'unknown') and len(
             [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2 \
-            and not any(st['state'] == 'pending' for st in lifecycle)  # an invitation, config or registration
+            and not any(st['state'] in ('pending', 'error') for st in lifecycle)  # waiting, or not read yet
         if not a.watch or stopped or done:  # a repo-setup problem doesn't stop the watch: the deploy goes on
             break
         if time.monotonic() > deadline:
@@ -1226,7 +1238,7 @@ def cmd_status(a):
             last = text
         time.sleep(a.interval)
         polls += 1
-    failed = stopped or any(st['state'] == 'failed' for st in lifecycle)
+    failed = stopped or any(st['state'] in ('failed', 'error') for st in lifecycle)
     report['ok'] = done and not failed  # set up, registered, and built and deployed to dev for the newest commit
     report['next'] = status_next(report, failed, done)
     if a.json:

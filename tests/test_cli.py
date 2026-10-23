@@ -2695,8 +2695,9 @@ class CommandLine(unittest.TestCase):
         ahead = ok[:3] + [stage('prod', 'ok', ahead=2)]
         self.assertIn('`magehand release demo --dry-run`', magehand.status_next(report(ahead), False, True))
         unreleased = ok[:3] + [stage('prod', 'unknown', released=False)]
-        unreleased[3]['text'] = 'no release yet (the owner\'s GitHub Release vX.Y.Z deploys to prod)'
-        self.assertIn('ready for production', magehand.status_next(report(unreleased), False, True))
+        self.assertIsNone(magehand.status_next(report(unreleased), False, True))  # dev-only: no deploy/prod/
+        with_prod = [stage('config', 'ok', prod=True)] + unreleased
+        self.assertIn('ready for production', magehand.status_next(report(with_prod), False, True))
         failed = [stage('build', 'failed')] + ok[1:]
         self.assertIn('fix the failed build', magehand.status_next(report(failed), True, False))
         self.assertIn('`magehand status demo --watch`', magehand.status_next(report(failed), True, False))
@@ -3617,12 +3618,18 @@ class Status(unittest.TestCase):
                 self.assertEqual(magehand.github_listing('o/r', 'deploy'), expected, answer)
 
     def test_registration_lookup_tells_unregistered_from_unreadable(self):
-        for answer, expected in (((0, 'services: {}\n', ''), ({'services': {}}, None)),
-                                 ((1, '', 'gh: Not Found (HTTP 404)'), (None, None)),
-                                 ((1, '', 'HTTP 502'), (None, 'HTTP 502'))):
-            with mock.patch.object(magehand, 'gh_probe', lambda *a, answer=answer: answer), \
-                    mock.patch.object(magehand, 'APPS_DIR', None):
-                self.assertEqual(magehand.registration_lookup('demo'), expected, answer)
+        missing = (1, '', 'gh: Not Found (HTTP 404)')
+        for file, repo, expected in (((0, 'services: {}\n', ''), None, ({'services': {}}, None)),
+                                     (missing, (0, 'davidlarrimore/homelab-apps\n', ''), (None, None)),
+                                     # a 404 for homelab-apps itself: this account can't see it, not "unregistered"
+                                     (missing, missing, (None, 'cannot see davidlarrimore/homelab-apps '
+                                                                '(gh: Not Found (HTTP 404))')),
+                                     ((1, '', 'HTTP 502'), None, (None, 'HTTP 502')),
+                                     ((0, '- a list\n', ''), None, (None, 'apps/demo/app.yaml is not a mapping')),
+                                     ((0, 'a: [\n', ''), None, (None, 'apps/demo/app.yaml is not valid YAML'))):
+            answer = lambda *a, file=file, repo=repo: file if 'contents' in ' '.join(a) else repo  # noqa: E731
+            with mock.patch.object(magehand, 'gh_probe', answer), mock.patch.object(magehand, 'APPS_DIR', None):
+                self.assertEqual(magehand.registration_lookup('demo'), expected, file)
 
     def test_lifecycle_older_layouts_and_errors(self):
         # registered, deployment in homelab-apps: no deploy/ in the repo is not pending forever
@@ -3638,6 +3645,38 @@ class Status(unittest.TestCase):
         self.assertEqual(unreadable['register']['state'], 'error')
         stages = self.lifecycle(unreadable=lambda repo, path, ref='main': (None, 'HTTP 503'), registered=False)
         self.assertEqual(stages['register']['text'], 'not registered yet')
+
+    def test_a_partial_deploy_dir_is_not_the_older_layout(self):
+        partial = self.lifecycle(files=('app.yaml', 'base'), registered={'services': {}})['config']
+        self.assertEqual(partial['state'], 'failed')
+        self.assertIn('deploy/dev/', partial['text'])
+
+    def test_a_public_repo_gets_the_visibility_command(self):
+        public = self.lifecycle({'private': False})['repo']
+        self.assertIn('--visibility private', public['next'])
+
+    def test_a_lifecycle_error_mid_watch_does_not_end_the_watch(self):
+        answers = [[{'stage': 'register', 'state': 'pending', 'text': '', 'next': 'w'}],
+                   [{'stage': 'config', 'state': 'error', 'text': 'gh did not answer', 'next': 'fix'}],
+                   [{'stage': 'register', 'state': 'ok', 'text': 'registered'}]]
+        calls, polls = [], []
+
+        def collect(*a, **k):
+            polls.append(1)
+            return {'app': 'demo', 'repo': 'o/demo', 'commit': 'a' * 40, 'subject': 's',
+                    'stages': [{'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''}]}
+        with mock.patch.object(magehand, 'status_target', lambda name=None: ('demo', 'o/demo')), \
+                mock.patch.object(magehand, 'lifecycle_stages',
+                                  lambda repo, name: calls.append(1) or answers[min(len(calls), 3) - 1]), \
+                mock.patch.object(magehand, 'collect_status', collect):
+            code, out, _ = CommandLine.run_main(self, 'status', '--watch', '--interval', '0', '--json')
+        self.assertEqual((code, json.loads(out)['ok'], len(calls)), (0, True, 3))
+
+    def test_status_prefers_the_registered_repo(self):
+        with mock.patch.object(magehand, 'repo_root', lambda name: pathlib.Path('/x')), \
+                mock.patch.object(magehand, 'remote_repo', lambda root=None: 'myfork'), \
+                mock.patch.object(magehand, 'registration_lookup', lambda name: ({'source': {'repo': 'demo'}}, None)):
+            self.assertEqual(magehand.status_target('demo'), ('demo', 'davidlarrimore/demo'))
 
     def test_a_failure_outranks_a_stage_that_is_only_waiting(self):
         report = {'app': 'demo', 'stages': [
@@ -3707,11 +3746,13 @@ class Status(unittest.TestCase):
     def test_status_finds_a_new_app_without_its_deployment(self):
         with mock.patch.object(magehand, 'repo_root', lambda name: pathlib.Path('/x')), \
                 mock.patch.object(magehand, 'remote_repo', lambda root=None: 'ai-learning-catalog'), \
+                mock.patch.object(magehand, 'registration_lookup', lambda name: (None, None)), \
                 mock.patch.object(magehand, 'load_app', lambda *a, **k: self.fail('loaded the Deployment')):
             self.assertEqual(magehand.status_target('ai-learning-catalog'),
                              ('ai-learning-catalog', 'davidlarrimore/ai-learning-catalog'))
         with mock.patch.object(magehand, 'repo_root', lambda name: None), \
-                mock.patch.object(magehand, 'registration', lambda name: None), self.assertRaises(SystemExit):
+                mock.patch.object(magehand, 'registration_lookup', lambda name: (None, None)), \
+                self.assertRaises(SystemExit):
             magehand.status_target('nope')
 
     def test_a_repo_not_set_up_fails_status(self):
