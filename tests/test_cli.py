@@ -3556,14 +3556,16 @@ class Status(unittest.TestCase):
         self.assertEqual(stage['state'], 'unknown')
         self.assertIn('forbidden', stage['text'])
 
-    def lifecycle(self, repo=None, files=('app.yaml', 'base', 'dev'), registered=True):
+    def lifecycle(self, repo=None, files=('app.yaml', 'base', 'dev'), registered=True, unreadable=None):
         """REAL_LIFECYCLE for demo, with its repo's setup, the deploy/ files on main and registration given."""
         state = dict({'bot': 'write', 'ruleset': 'ok', 'ruleset_detail': '', 'private': True, 'archived': False},
                      **(repo or {}))
-        main = {'deploy/app.yaml': 'app.yaml' in files, 'deploy/dev/kustomization.yaml': 'dev' in files}
+        main = {'deploy': ['app.yaml'] if 'app.yaml' in files else [],
+                'deploy/base': ['deployment.yaml'] if 'base' in files else [],
+                'deploy/dev': ['kustomization.yaml'] if 'dev' in files else []}
+        listing = unreadable or (lambda repo, path, ref='main': (main[path], None))
         with mock.patch.object(magehand, 'repo_state', lambda repo: state), \
-                mock.patch.object(magehand, 'github_dir', lambda repo, path, ref='main': ['deployment.yaml'] if 'base' in files else []), \
-                mock.patch.object(magehand, 'github_file', lambda repo, path, required=True, ref='main': 'x' if main.get(path) else None), \
+                mock.patch.object(magehand, 'github_listing', listing), \
                 mock.patch.object(magehand, 'registration', lambda name: {'services': {'db': {'type': 'postgres'}}} if registered else None):
             return {st['stage']: st for st in REAL_LIFECYCLE('davidlarrimore/demo', 'demo')}
 
@@ -3596,6 +3598,55 @@ class Status(unittest.TestCase):
                   + [{'stage': 'build', 'state': 'pending', 'text': ''}]}
         self.assertIn('write them', magehand.status_next(report, False, False))  # the first stage's step wins
 
+    def test_a_failed_lookup_is_an_error_not_missing_config(self):
+        stages = self.lifecycle(unreadable=lambda repo, path, ref='main': (None, 'HTTP 503'))
+        self.assertEqual(stages['config']['state'], 'error')
+        self.assertIn('cannot read deploy/ on main (deploy: HTTP 503)', stages['config']['text'])
+        self.assertIn('access problem', stages['config']['next'])
+
+    def test_github_listing_tells_missing_from_unreadable(self):
+        def answer(error):
+            def urlopen(*a, **k):
+                raise error
+            return urlopen
+        with mock.patch.object(magehand, 'github_token', lambda: 't'):
+            for error, expected in ((magehand.urllib.error.HTTPError('u', 404, 'nf', {}, None), ([], None)),
+                                    (magehand.urllib.error.HTTPError('u', 403, 'rate', {}, None), (None, 'HTTP 403')),
+                                    (magehand.urllib.error.URLError('timed out'), (None, '<urlopen error timed out>'))):
+                with mock.patch.object(magehand.urllib.request, 'urlopen', answer(error)):
+                    self.assertEqual(magehand.github_listing('o/r', 'deploy'), expected)
+
+    def test_watch_refreshes_a_pending_registration(self):
+        # Registered while watching: status must notice, not finish "ok" with a stale pending line.
+        answers = [[{'stage': 'register', 'state': 'pending', 'text': 'not registered yet', 'next': 'watch'}],
+                   [{'stage': 'register', 'state': 'ok', 'text': 'registered'}]]
+        calls = []
+        ok = {'app': 'demo', 'repo': 'o/demo', 'commit': 'a' * 40, 'subject': 's',
+              'stages': [{'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''}]}
+        with mock.patch.object(magehand, 'status_target', lambda name=None: ({'name': 'demo'}, 'o/demo')), \
+                mock.patch.object(magehand, 'lifecycle_stages', lambda repo, name: calls.append(1) or answers[min(len(calls), 2) - 1]), \
+                mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):
+            code, out, _ = CommandLine.run_main(self, 'status', '--watch', '--interval', '0', '--json')
+        report = json.loads(out)
+        self.assertEqual((code, report['ok'], len(calls)), (0, True, 2))
+        self.assertEqual(report['stages'][0]['state'], 'ok')
+        # still pending when the time runs out: not ok
+        with mock.patch.object(magehand, 'status_target', lambda name=None: ({'name': 'demo'}, 'o/demo')), \
+                mock.patch.object(magehand, 'lifecycle_stages', lambda repo, name: answers[0]), \
+                mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):
+            code, out, _ = CommandLine.run_main(self, 'status', '--json')
+        self.assertFalse(json.loads(out)['ok'])
+
+    def test_status_finds_a_new_app_without_its_deployment(self):
+        with mock.patch.object(magehand, 'repo_root', lambda name: pathlib.Path('/x')), \
+                mock.patch.object(magehand, 'remote_repo', lambda root=None: 'ai-learning-catalog'), \
+                mock.patch.object(magehand, 'load_app', lambda *a, **k: self.fail('loaded the Deployment')):
+            self.assertEqual(magehand.status_target('ai-learning-catalog'),
+                             ({'name': 'ai-learning-catalog'}, 'davidlarrimore/ai-learning-catalog'))
+        with mock.patch.object(magehand, 'repo_root', lambda name: None), \
+                mock.patch.object(magehand, 'registration', lambda name: None), self.assertRaises(SystemExit):
+            magehand.status_target('nope')
+
     def test_a_repo_not_set_up_fails_status(self):
         failed = [{'stage': 'repo', 'state': 'failed', 'text': 'not set up', 'next': 'ask the owner'}]
         with mock.patch.object(magehand, 'lifecycle_stages', lambda repo, name: failed):
@@ -3621,9 +3672,9 @@ class Status(unittest.TestCase):
             magehand.kubectl_json = saved
 
     def test_watch_waits_for_the_pods_and_ignores_unreadable_ones(self):
-        names = ('app_here', 'collect_status', 'time')
+        names = ('status_target', 'collect_status', 'time')
         before = {n: getattr(magehand, n) for n in names}
-        magehand.app_here = lambda name=None: {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.status_target = lambda name=None: ({'name': 'demo'}, 'davidlarrimore/demo')
         magehand.time = type('T', (), {'monotonic': staticmethod(lambda: 0), 'sleep': staticmethod(lambda s: None)})
         seen = []
         script = [['ok', 'ok', 'pending'], ['ok', 'ok', 'ok']]
@@ -3678,9 +3729,9 @@ class Status(unittest.TestCase):
             if '/compare/' in line:
                 return 0, json.dumps({'ahead_by': 2}), ''
             return 1, '', 'unexpected: ' + line
-        names = ('app_here', 'gh_probe')
+        names = ('status_target', 'gh_probe')
         before = {n: getattr(magehand, n) for n in names}
-        magehand.app_here = lambda name=None: {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
+        magehand.status_target = lambda name=None: ({'name': 'demo'}, 'davidlarrimore/demo')
         magehand.gh_probe = probe
         try:
             code, out, err = self.run_main('status', '-a', 'demo', '--json')
@@ -3709,10 +3760,9 @@ class Status(unittest.TestCase):
         self.assertEqual((code, report['stages'][1]['state']), (0, 'pending'))
 
     def test_status_command_and_watch_exit_codes(self):
-        names = ('app_here', 'collect_status')
+        names = ('status_target', 'collect_status')
         before = {n: getattr(magehand, n) for n in names}
-        app = {'name': 'demo', 'root': None, 'spec': {'source': {'repo': 'demo'}}}
-        magehand.app_here = lambda name=None: app
+        magehand.status_target = lambda name=None: ({'name': 'demo'}, 'davidlarrimore/demo')
         stages = {'state': 'ok'}
 
         def collect(repo, name, cluster=True):

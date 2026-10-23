@@ -159,6 +159,23 @@ def github_dir(repo, path, ref='main'):
         return []
 
 
+def github_listing(repo, path, ref='main'):
+    """(names, None) in a directory on main; ([], None) when it doesn't exist (HTTP 404); (None, why) when GitHub
+    couldn't be asked (rate limit, authorization, network), which github_dir() reports as empty."""
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref)}',
+        headers={'Authorization': f'Bearer {github_token()}', 'Accept': 'application/vnd.github+json',
+                 'User-Agent': 'magehand'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310  # fixed https URL
+            got = json.load(resp)
+    except urllib.error.HTTPError as error:
+        return ([], None) if error.code == 404 else (None, f'HTTP {error.code}')
+    except (OSError, ValueError) as error:
+        return None, str(error) or 'GitHub did not answer'
+    return (sorted(item['name'] for item in got if isinstance(item, dict)), None) if isinstance(got, list) else ([], None)
+
+
 # --- The app ------------------------------------------------------------------
 
 def current_app(root=None):
@@ -1072,15 +1089,21 @@ def lifecycle_stages(repo, name):
                       'invitations need admin)'}
     else:
         repo_stage = {'state': 'ok', 'text': f'set up: private, {BOT} can write, approval ruleset on main'}
-    base = [n for n in github_dir(repo, f'{DEPLOY}/base') if n.endswith(('.yaml', '.yml'))]
+    listings = {path: github_listing(repo, path) for path in (DEPLOY, f'{DEPLOY}/base', f'{DEPLOY}/dev')}
+    unread = next((f'{path}: {why}' for path, (_, why) in listings.items() if why), None)
+    names = {path: names or [] for path, (names, _) in listings.items()}
     missing = [path for path, there in (
-        (f'{DEPLOY}/app.yaml', github_file(repo, f'{DEPLOY}/app.yaml', required=False) is not None),
-        (f'{DEPLOY}/base/', bool(base)),
-        (f'{DEPLOY}/dev/', github_file(repo, f'{DEPLOY}/dev/kustomization.yaml', required=False) is not None))
-        if not there]
-    config = ({'state': 'pending', 'text': f'not on main yet: {", ".join(missing)}',
-               'next': 'write them (`magehand guide search deploy`), `magehand check`, then merge a PR'} if missing
-              else {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/)'})
+        (f'{DEPLOY}/app.yaml', 'app.yaml' in names[DEPLOY]),
+        (f'{DEPLOY}/base/', any(n.endswith(('.yaml', '.yml')) for n in names[f'{DEPLOY}/base'])),
+        (f'{DEPLOY}/dev/', 'kustomization.yaml' in names[f'{DEPLOY}/dev'])) if not there]
+    if unread:  # a failed lookup is not a missing file
+        config = {'state': 'error', 'text': f'cannot read {DEPLOY}/ on main ({unread})',
+                  'next': f'fix the access problem it names, then `magehand status {name}` again'}
+    elif missing:
+        config = {'state': 'pending', 'text': f'not on main yet: {", ".join(missing)}',
+                  'next': 'write them (`magehand guide search deploy`), `magehand check`, then merge a PR'}
+    else:
+        config = {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/)'}
     spec = registration(name)
     if spec is None:
         register = {'state': 'pending', 'text': 'not registered yet: ' + (
@@ -1134,13 +1157,30 @@ def code_repo(app):
     return f'{OWNER}/{source}'
 
 
+def status_target(name=None):
+    """(app, OWNER/REPO) for status, without loading the app's Deployment: a new app's checkout has none yet,
+    and status is where it learns what's missing."""
+    name = name or current_app()
+    root = repo_root(name)
+    source = remote_repo(root) if root else None
+    if not source:
+        spec = registration(name)
+        if spec is None:
+            die(f'{name} is not registered yet and this is not its checkout: run `magehand status` in its repo')
+        source = (spec.get('source') or {}).get('repo')
+        if not source:
+            die(f'{name} has no code repo (its image is built in homelab-apps), so there is no main to follow')
+    return {'name': name}, f'{OWNER}/{source}'
+
+
 def cmd_status(a):
-    app = app_here(a.app_flag or a.app)
-    repo = code_repo(app)
+    app, repo = status_target(a.app_flag or a.app)
     deadline = time.monotonic() + a.timeout * 60
     last = None
-    lifecycle = lifecycle_stages(repo, app['name'])  # once: it changes on a merge, not while watching a deploy
+    lifecycle, polls = lifecycle_stages(repo, app['name']), 0
     while True:
+        if polls and any(st['state'] != 'ok' for st in lifecycle):
+            lifecycle = lifecycle_stages(repo, app['name'])  # registration or an invitation can land mid-watch
         report = collect_status(repo, app['name'], cluster=not a.no_cluster)
         report['stages'] = lifecycle + report['stages']
         # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
@@ -1148,7 +1188,8 @@ def cmd_status(a):
         failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages']) \
             or any(st['state'] == 'failed' for st in lifecycle)
         done = all(st == 'ok' for st in states if st != 'unknown') and len(
-            [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2
+            [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2 \
+            and not any(st['stage'] in ('config', 'register') and st['state'] == 'pending' for st in lifecycle)
         if not a.watch or failed or done:
             break
         if time.monotonic() > deadline:
@@ -1159,6 +1200,7 @@ def cmd_status(a):
             print(text, file=sys.stderr)
             last = text
         time.sleep(a.interval)
+        polls += 1
     report['ok'] = done and not failed  # build and the dev deploy both finished for the newest commit
     report['next'] = status_next(report, failed, done)
     if a.json:
