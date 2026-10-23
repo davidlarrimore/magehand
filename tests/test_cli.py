@@ -2543,13 +2543,24 @@ class PrReady(unittest.TestCase):
 
     def test_refuses_until_checks_are_green(self):
         for checks, why in (([{'name': 'tests', 'status': 'IN_PROGRESS'}], 'still running: tests'),
-                            ([{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}], 'failed: tests'),
+                            ([{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}], 'not green: tests (failure)'),
+                            ([{'name': 'deploy', 'status': 'COMPLETED', 'conclusion': 'ACTION_REQUIRED'}],
+                             'not green: deploy (action_required)'),
+                            ([{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'STALE'}], 'not green: tests (stale)'),
+                            ([{'name': 'tests', 'status': 'COMPLETED'}], 'not green: tests (no conclusion)'),
+                            ([{'context': 'policy', 'state': 'ERROR'}], 'not green: policy (error)'),
                             ([{'context': 'policy', 'state': 'PENDING'}], 'still running: policy'),
                             ([], 'no checks have reported yet')):
             code, out, writes = self.run_pr(checks=checks)
             self.assertEqual((code, writes), (1, []), why)
             self.assertIn(why, out)
             self.assertTrue(out.splitlines()[-1].startswith('next: '), why)
+
+    def test_neutral_and_skipped_checks_are_green(self):
+        checks = self.GREEN + [{'name': 'docs', 'status': 'COMPLETED', 'conclusion': 'SKIPPED'},
+                               {'name': 'lint', 'status': 'COMPLETED', 'conclusion': 'NEUTRAL'},
+                               {'context': 'policy', 'state': 'SUCCESS'}]
+        self.assertEqual(self.run_pr(checks=checks)[0], 0)
 
     def test_readies_requests_and_confirms(self):
         code, out, writes = self.run_pr()

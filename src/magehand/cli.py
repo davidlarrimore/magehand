@@ -821,6 +821,24 @@ def failing_checks(rollup):
     return names
 
 
+# A finished check is a pass only with one of these conclusions (GitHub's CheckConclusionState): anything
+# else, ACTION_REQUIRED and STALE included, or one GitHub adds later, is not green.
+GREEN_CONCLUSIONS = ('SUCCESS', 'NEUTRAL', 'SKIPPED')
+
+
+def not_green_checks(rollup):
+    """'name (result)' for each finished entry of a PR's statusCheckRollup that isn't a pass: a CheckRun whose
+    conclusion isn't in GREEN_CONCLUSIONS, a StatusContext in FAILURE or ERROR."""
+    out = []
+    for c in rollup or []:
+        name = c.get('name') or c.get('context') or '?'
+        if c.get('state') in ('FAILURE', 'ERROR'):
+            out.append(f'{name} ({c["state"].lower()})')
+        elif c.get('status') == 'COMPLETED' and c.get('conclusion') not in GREEN_CONCLUSIONS:
+            out.append(f'{name} ({(c.get("conclusion") or "no conclusion").lower()})')
+    return out
+
+
 def pending_checks(rollup):
     """Names of the entries of a PR's statusCheckRollup that haven't finished: CheckRuns not COMPLETED and
     StatusContexts still PENDING or EXPECTED."""
@@ -4773,9 +4791,9 @@ def cmd_pr(a):
     number, repo = pr['number'], '/'.join(pr['url'].split('/')[3:5])
     if pr['state'] != 'OPEN':
         die(f'PR #{number} is {pr["state"].lower()}: only an open PR can be readied')
-    failing, running = failing_checks(pr.get('statusCheckRollup')), pending_checks(pr.get('statusCheckRollup'))
+    failing, running = not_green_checks(pr.get('statusCheckRollup')), pending_checks(pr.get('statusCheckRollup'))
     if failing or running or not pr.get('statusCheckRollup'):
-        why = (f'its checks failed: {", ".join(failing)}' if failing else
+        why = (f'its checks are not green: {", ".join(failing)}' if failing else
                f'its checks are still running: {", ".join(running)}' if running else 'no checks have reported yet')
         step = ('fix them and push, then `magehand pr ready ' + str(number) + '` again' if failing else
                 f'`gh pr checks {number} --watch`, then `magehand pr ready {number}` again')
