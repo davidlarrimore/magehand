@@ -1127,7 +1127,7 @@ def lifecycle_stages(repo, name):
                       f"({state['ruleset_detail']})", 'next': "ask the owner to fix the ruleset in the repo's Settings > Rules"}
     elif state['bot'] == 'invited':
         repo_stage = {'state': 'pending', 'text': f'{BOT} is invited; OpenClaw accepts within about 5 minutes',
-                      'next': 'wait, then request its review on open PRs again'}
+                      'next': 'wait, then `magehand pr ready N` on open PRs'}
     elif None in (state['bot'], state['ruleset'], state['private']):
         repo_stage = {'state': 'unknown', 'text': 'setup not fully readable from this account (the ruleset and '
                       'invitations need admin)'}
