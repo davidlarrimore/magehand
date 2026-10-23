@@ -959,10 +959,19 @@ def argo_problem(application):
     return None
 
 
+# kubectl's answers when this machine has no cluster to ask (a laptop): not a problem, so said plainly.
+NO_CLUSTER = re.compile(r'kubectl is not installed|localhost:8080|no configuration has been provided|'
+                        r'current-context is not set|context was not found', re.I)
+
+
 def dev_stage(name, deploy, cluster=True):
     """The running pods for a merged dev deploy, or an unknown stage saying why they weren't read."""
     unknown = lambda why: {'stage': 'dev', 'state': 'unknown',  # noqa: E731
-                           'text': f'config deployed ({deploy["digest"]}); the running pod is not checked ({why})'}
+                           'text': f'config deployed ({deploy["digest"]}); ' + (
+                               'its pods are not visible from this machine ('
+                               + ('kubectl is not installed' if 'not installed' in why else 'no cluster access')
+                               + ': normal on a laptop)' if NO_CLUSTER.search(why) else
+                               f'the running pod is not checked ({why})')}
     if not cluster:
         return unknown('--no-cluster')
     pods, err = kubectl_json('pods', '-n', f'{name}-dev')
@@ -1037,12 +1046,61 @@ def collect_status(repo, name, cluster=True, ref='main'):
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
 
+def lifecycle_stages(repo, name):
+    """Where the app is before main's build and deploy, as status stages: its repo set up for the platform,
+    deploy/ on main, and registered. Each that isn't ok says what to do in `next`."""
+    short = repo.split('/', 1)[1]
+    state = repo_state(repo)
+    problems = [text for bad, text in (
+        (state['bot'] == 'missing', f'{BOT} is not a collaborator, so its review can\'t be requested'),
+        (state['bot'] == 'read', f'{BOT} can only read'),
+        (state['ruleset'] == 'missing', f"no ruleset '{RULESET['name']}'"),
+        (state['private'] is False, 'it is public')) if bad]
+    if state['archived']:
+        repo_stage = {'state': 'unknown', 'text': 'archived (a retired app)'}
+    elif problems:
+        repo_stage = {'state': 'failed', 'text': 'not set up: ' + '; '.join(problems),
+                      'next': f'ask the owner to run `magehand new {short}` (it repairs the repo)'}
+    elif state['ruleset'] == 'weak':
+        repo_stage = {'state': 'failed', 'text': f"ruleset '{RULESET['name']}' would not pause a merge "
+                      f"({state['ruleset_detail']})", 'next': "ask the owner to fix the ruleset in the repo's Settings > Rules"}
+    elif state['bot'] == 'invited':
+        repo_stage = {'state': 'pending', 'text': f'{BOT} is invited; OpenClaw accepts within about 5 minutes',
+                      'next': 'wait, then request its review on open PRs again'}
+    elif None in (state['bot'], state['ruleset'], state['private']):
+        repo_stage = {'state': 'unknown', 'text': 'setup not fully readable from this account (the ruleset and '
+                      'invitations need admin)'}
+    else:
+        repo_stage = {'state': 'ok', 'text': f'set up: private, {BOT} can write, approval ruleset on main'}
+    base = [n for n in github_dir(repo, f'{DEPLOY}/base') if n.endswith(('.yaml', '.yml'))]
+    missing = [path for path, there in (
+        (f'{DEPLOY}/app.yaml', github_file(repo, f'{DEPLOY}/app.yaml', required=False) is not None),
+        (f'{DEPLOY}/base/', bool(base)),
+        (f'{DEPLOY}/dev/', github_file(repo, f'{DEPLOY}/dev/kustomization.yaml', required=False) is not None))
+        if not there]
+    config = ({'state': 'pending', 'text': f'not on main yet: {", ".join(missing)}',
+               'next': 'write them (`magehand guide search deploy`), `magehand check`, then merge a PR'} if missing
+              else {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/)'})
+    spec = registration(name)
+    if spec is None:
+        register = {'state': 'pending', 'text': 'not registered yet: ' + (
+            'the platform registers it within about 5 minutes of the merge' if not missing else
+            f'it registers itself once {DEPLOY}/ is on main'), 'next': None if missing else f'`magehand status {name} --watch`'}
+    else:
+        blocks = ', '.join(f'{b} ({(svc or {}).get("type")})' for b, svc in (spec.get('services') or {}).items())
+        register = {'state': 'ok', 'text': f'registered; blocks: {blocks or "none"}'}
+    return [{'stage': 'repo', **repo_stage}, {'stage': 'config', **config}, {'stage': 'register', **register}]
+
+
 def status_next(report, failed, done):
     """What to do about a status report: fix the first stage that failed, wait for one in progress, or release
     what dev runs and production doesn't yet. Commands name the app: the report may be about another app than
     the checkout's."""
     app = report['app']
     watch = f'magehand status {app} --watch'
+    for st in report['stages']:  # the lifecycle comes first: its stages carry their own next step
+        if st['state'] in ('failed', 'pending', 'error') and st.get('next'):
+            return st['next']
     for st in report['stages']:
         if st['state'] == 'error':
             return f'fix the access problem it names, then `magehand status {app}` again'
@@ -1055,13 +1113,15 @@ def status_next(report, failed, done):
     prod = next((st for st in report['stages'] if st['stage'] == 'prod'), None)
     if prod and prod.get('ahead'):
         return f'`magehand release {app} --dry-run`: dev runs commits production does not have yet'
+    if prod and prod['text'].startswith('no release yet'):
+        return f'when it is ready for production: `magehand release {app} --dry-run`'
     return None
 
 
 def render_status(report):
     lines = [f'{report["app"]}  ({report["repo"]} main {report["commit"][:7]}: {report["subject"]})']
     for st in report['stages']:
-        lines.append(f'  {st["stage"]:<7}{STATUS_MARK[st["state"]]} {st["text"]}')
+        lines.append(f'  {st["stage"]:<9}{STATUS_MARK[st["state"]]} {st["text"]}')
     return '\n'.join(lines)
 
 
@@ -1079,11 +1139,14 @@ def cmd_status(a):
     repo = code_repo(app)
     deadline = time.monotonic() + a.timeout * 60
     last = None
+    lifecycle = lifecycle_stages(repo, app['name'])  # once: it changes on a merge, not while watching a deploy
     while True:
         report = collect_status(repo, app['name'], cluster=not a.no_cluster)
+        report['stages'] = lifecycle + report['stages']
         # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
         states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev')]
-        failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages'])
+        failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages']) \
+            or any(st['state'] == 'failed' for st in lifecycle)
         done = all(st == 'ok' for st in states if st != 'unknown') and len(
             [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2
         if not a.watch or failed or done:

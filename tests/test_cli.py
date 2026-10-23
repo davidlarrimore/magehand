@@ -2498,10 +2498,17 @@ class RepoConformance(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # only the (mocked, failing) OpenBao health probe was attempted
 
 
+REAL_LIFECYCLE = magehand.lifecycle_stages
+
+
 def setUpModule():
     """No test renders deploy/ with this machine's kubectl (the tests run the same everywhere); the render rules'
     tests give check_rendered its documents."""
     patch = mock.patch.object(magehand, 'render_overlay', lambda local, overlay: (None, 'kubectl is not installed'))
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
+    # status's lifecycle reads GitHub: its own tests call REAL_LIFECYCLE with GitHub mocked.
+    patch = mock.patch.object(magehand, 'lifecycle_stages', lambda repo, name: [])
     patch.start()
     unittest.addModuleCleanup(patch.stop)
     ci = os.environ.pop('CI', None)  # GitHub Actions sets it, and check treats a skip as an error there
@@ -2687,6 +2694,9 @@ class CommandLine(unittest.TestCase):
         self.assertIsNone(magehand.status_next(report(ok), False, True))
         ahead = ok[:3] + [stage('prod', 'ok', ahead=2)]
         self.assertIn('`magehand release demo --dry-run`', magehand.status_next(report(ahead), False, True))
+        unreleased = ok[:3] + [stage('prod', 'unknown')]
+        unreleased[3]['text'] = 'no release yet (the owner\'s GitHub Release vX.Y.Z deploys to prod)'
+        self.assertIn('ready for production', magehand.status_next(report(unreleased), False, True))
         failed = [stage('build', 'failed')] + ok[1:]
         self.assertIn('fix the failed build', magehand.status_next(report(failed), True, False))
         self.assertIn('`magehand status demo --watch`', magehand.status_next(report(failed), True, False))
@@ -3546,6 +3556,52 @@ class Status(unittest.TestCase):
         self.assertEqual(stage['state'], 'unknown')
         self.assertIn('forbidden', stage['text'])
 
+    def lifecycle(self, repo=None, files=('app.yaml', 'base', 'dev'), registered=True):
+        """REAL_LIFECYCLE for demo, with its repo's setup, the deploy/ files on main and registration given."""
+        state = dict({'bot': 'write', 'ruleset': 'ok', 'ruleset_detail': '', 'private': True, 'archived': False},
+                     **(repo or {}))
+        main = {'deploy/app.yaml': 'app.yaml' in files, 'deploy/dev/kustomization.yaml': 'dev' in files}
+        with mock.patch.object(magehand, 'repo_state', lambda repo: state), \
+                mock.patch.object(magehand, 'github_dir', lambda repo, path, ref='main': ['deployment.yaml'] if 'base' in files else []), \
+                mock.patch.object(magehand, 'github_file', lambda repo, path, required=True, ref='main': 'x' if main.get(path) else None), \
+                mock.patch.object(magehand, 'registration', lambda name: {'services': {'db': {'type': 'postgres'}}} if registered else None):
+            return {st['stage']: st for st in REAL_LIFECYCLE('davidlarrimore/demo', 'demo')}
+
+    def test_lifecycle_of_a_set_up_registered_app(self):
+        stages = self.lifecycle()
+        self.assertEqual([st['state'] for st in stages.values()], ['ok', 'ok', 'ok'])
+        self.assertIn('blocks: db (postgres)', stages['register']['text'])
+
+    def test_lifecycle_repo_stage(self):
+        broken = self.lifecycle({'bot': 'missing', 'ruleset': 'missing'})['repo']
+        self.assertEqual(broken['state'], 'failed')
+        self.assertIn("review can't be requested", broken['text'])
+        self.assertEqual(broken['next'], 'ask the owner to run `magehand new demo` (it repairs the repo)')
+        self.assertIn('it is public', self.lifecycle({'private': False})['repo']['text'])
+        weak = self.lifecycle({'ruleset': 'weak', 'ruleset_detail': "enforcement is 'disabled'"})['repo']
+        self.assertEqual((weak['state'], weak['next']), ('failed', "ask the owner to fix the ruleset in the repo's Settings > Rules"))
+        self.assertEqual(self.lifecycle({'bot': 'invited'})['repo']['state'], 'pending')
+        # OpenClaw's bot can't read the ruleset: unknown, never failed
+        self.assertEqual(self.lifecycle({'ruleset': None})['repo']['state'], 'unknown')
+        self.assertEqual(self.lifecycle({'archived': True, 'bot': None})['repo']['state'], 'unknown')
+
+    def test_lifecycle_before_the_first_deploy(self):
+        stages = self.lifecycle(files=('app.yaml',), registered=False)
+        self.assertEqual(stages['config']['state'], 'pending')
+        self.assertIn('deploy/base/, deploy/dev/', stages['config']['text'])
+        self.assertIsNone(stages['register']['next'])  # config's step comes first
+        merged = self.lifecycle(registered=False)['register']
+        self.assertEqual((merged['state'], merged['next']), ('pending', '`magehand status demo --watch`'))
+        report = {'app': 'demo', 'stages': list(self.lifecycle(files=(), registered=False).values())
+                  + [{'stage': 'build', 'state': 'pending', 'text': ''}]}
+        self.assertIn('write them', magehand.status_next(report, False, False))  # the first stage's step wins
+
+    def test_a_repo_not_set_up_fails_status(self):
+        failed = [{'stage': 'repo', 'state': 'failed', 'text': 'not set up', 'next': 'ask the owner'}]
+        with mock.patch.object(magehand, 'lifecycle_stages', lambda repo, name: failed):
+            code, report, _ = self.status_with()
+        self.assertEqual((code, report['stages'][0]['stage'], report['next']), (1, 'repo', 'ask the owner'))
+
     def test_dev_stage_without_a_cluster_says_why_and_does_not_block(self):
         deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
         saved = magehand.kubectl_json
@@ -3553,7 +3609,11 @@ class Status(unittest.TestCase):
             magehand.kubectl_json = lambda *a: (None, 'kubectl is not installed')
             stage = magehand.dev_stage('demo', deploy)
             self.assertEqual(stage['state'], 'unknown')
-            self.assertIn('kubectl is not installed', stage['text'])
+            self.assertIn('not visible from this machine (kubectl is not installed: normal on a laptop)', stage['text'])
+            magehand.kubectl_json = lambda *a: (None, 'The connection to the server localhost:8080 was refused')
+            self.assertIn('not visible from this machine (no cluster access', magehand.dev_stage('demo', deploy)['text'])
+            magehand.kubectl_json = lambda *a: (None, 'Forbidden: pods is forbidden')
+            self.assertIn('not checked (Forbidden', magehand.dev_stage('demo', deploy)['text'])
             self.assertIn('--no-cluster', magehand.dev_stage('demo', deploy, cluster=False)['text'])
             magehand.kubectl_json = lambda *a: (({'items': [self.pod()]} if a[0] == 'pods' else self.argo()), None)
             self.assertEqual(magehand.dev_stage('demo', deploy)['state'], 'ok')
