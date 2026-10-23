@@ -2001,6 +2001,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
+    # dev's host: a deploy/prod/ overlay patches it (magehand guide search production)
     - host: {app}-dev.{lab}
       http:
         paths:
@@ -2020,18 +2021,20 @@ resources:
   - ../base
 """,
 }
-# The code files belong together: written only into a repo that has no Dockerfile yet (another stack keeps its own).
+# The code files belong together: written only into a repo with no code of its own yet (another stack keeps its own).
 SCAFFOLD_CODE = ('Dockerfile', '.dockerignore', 'app.py', 'tests/test_app.py')
+OWN_CODE = ('Dockerfile', 'app.py', 'main.py', 'tests', 'src', 'package.json', 'pyproject.toml', 'requirements.txt',
+            'go.mod', 'Cargo.toml', 'Gemfile', 'pom.xml')
 SCAFFOLD_BASE = tuple(f for f in SCAFFOLD_FILES if f.startswith('deploy/base/'))
 
 
-def scaffold(root, app, repo_name):
+def scaffold(root, app, repo_name, skip=()):
     """Write the scaffold's missing files into the checkout at `root` for app `app`: never over a file that
-    exists, the code only when there is no Dockerfile, the Kustomize base only when deploy/base/ has no
-    manifests. Returns the paths written (relative)."""
+    exists, the code only into a repo with no code of its own (OWN_CODE), the Kustomize base only when
+    deploy/base/ has no manifests, nothing in `skip`. Returns the paths written (relative)."""
     root = pathlib.Path(root)
-    skip = set()
-    if (root / 'Dockerfile').exists():
+    skip = set(skip or ())
+    if any((root / own).exists() for own in OWN_CODE):
         skip.update(SCAFFOLD_CODE)
     if any((root / 'deploy' / 'base').glob('*.y*ml')):
         skip.update(SCAFFOLD_BASE)
@@ -2199,13 +2202,21 @@ def cmd_new(a):
     elif cloned == 'failed':
         print(f'{repo}: could not clone it; run `gh repo clone {repo} {shell_path(dest)}`', file=sys.stderr)
     # The checkout's own files: the scaffold's missing ones, and AGENTS.md's platform rules (local writes only).
-    candidate = checkout_top() if here else dest if cloned == 'cloned' else None
+    candidate = checkout_top() if here else dest if cloned in ('cloned', 'exists') else None
     # Only into a checkout of this repo (its origin says so): never a directory that merely has the name.
     work = candidate if candidate and pathlib.Path(candidate).is_dir() and remote_repo(candidate) == name else None
-    wrote = []
+    wrote, pull = [], False
     if work:
-        wrote = scaffold(work, name if unnamed else app, name)
-        current, text, problem = agents_text(pathlib.Path(work) / 'AGENTS.md')
+        # The app's name: the checkout's own `app:` if it has one, else the one asked for (a failed seed is
+        # what the printed step tells you to write, so the manifests already match it).
+        live = app_override(work) or app
+        # A seed `new` just committed to main isn't in a checkout made before it: pull it, don't write a rival.
+        pull = named == 'seeded' and not (pathlib.Path(work) / DEPLOY / 'app.yaml').exists()
+        wrote = [] if named == 'differs' else scaffold(work, live, name, skip={f'{DEPLOY}/app.yaml'} if pull else ())
+        try:
+            current, text, problem = agents_text(pathlib.Path(work) / 'AGENTS.md')
+        except SystemExit as error:  # GitHub unreachable and nothing cached: report it, keep what was written
+            current, text, problem = None, None, str(error.code).replace('magehand: ', '')
         if problem:
             print(f'magehand: AGENTS.md not refreshed: {problem}', file=sys.stderr)
         elif text != current:
@@ -2215,13 +2226,17 @@ def cmd_new(a):
             print(f'{work}: wrote {", ".join(wrote)} (nothing existing was changed but AGENTS.md\'s platform rules)'
                   if 'AGENTS.md' in wrote else f'{work}: wrote {", ".join(wrote)}', file=sys.stderr)
     elif cloned == 'exists':
-        print(f'{dest}: not touched (run `magehand new {name}` in its checkout to add the missing files)', file=sys.stderr)
+        print(f'{dest}: not touched (it is not a checkout of {repo})', file=sys.stderr)
+    if named == 'differs' and work:
+        print(f'{work}: no scaffold written: deploy/app.yaml on main names another app', file=sys.stderr)
     steps = (new_steps(repo, name, app, dest, named, cloned, wrote) if created else
              repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote))
+    if pull:
+        steps.insert(0, f'run:   git -C {shell_path(work)} pull   # new committed deploy/app.yaml (`app: {app}`) to main')
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
                           'ruleset': ruleset, 'app_name': named, 'clone': cloned,
-                          'dir': str(dest) if cloned in ('cloned', 'exists') else None, 'wrote': wrote,
+                          'dir': str(work or dest) if work or cloned in ('cloned', 'exists') else None, 'wrote': wrote,
                           'next': step_text(steps[0]) if steps else None}, indent=1))
     elif created:
         print(new_summary(repo, name, app, dest, named, cloned, wrote))
@@ -2229,6 +2244,15 @@ def cmd_new(a):
         print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named, wrote))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
+
+
+def commit_step(wrote):
+    """The step after `new` wrote files into the checkout, worded for what it wrote."""
+    deploy = any(path.startswith('deploy/') for path in wrote)
+    if wrote == ['AGENTS.md']:
+        return 'do:    review the AGENTS.md diff (its platform rules were refreshed) and commit it'
+    return ('do:    commit what new wrote, `magehand check`, `gh pr create --draft`, then `magehand pr ready`'
+            + ('; merging it registers the app' if deploy else ''))
 
 
 def step_text(step):
@@ -2246,8 +2270,8 @@ def new_steps(repo, name, app, dest, named, cloned, wrote=()):
         steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
                      f'{name})')
     if wrote:  # the scaffold deploys as it is: the first PR registers the app before any feature code
-        steps += ['do:    commit what new wrote, `magehand check`, `gh pr create --draft`, then `magehand pr ready`; merging it registers the app',
-                  'write: the app (app.py is a starting point)   guide: magehand guide search new app']
+        steps += [commit_step(wrote), 'write: the app' + (' (app.py is a starting point)' if 'app.py' in wrote else '')
+                  + '   guide: magehand guide search new app']
     else:
         steps += ['write: the code, and deploy/ (app.yaml, base/ and dev/)   guide: magehand guide search new app',
                   'run:   magehand check          # the platform\'s rules, before you push',
@@ -2289,7 +2313,7 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     if cloned == 'failed':
         steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
     if wrote:
-        steps.append('do:    commit what new wrote, `magehand check`, `gh pr create --draft`, then `magehand pr ready`; merging it registers the app')
+        steps.append(commit_step(list(wrote)))
     return steps
 
 
