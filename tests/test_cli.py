@@ -2499,18 +2499,33 @@ class CommandLine(unittest.TestCase):
                                                    if inspect.isfunction(names[c])]
             self.assertTrue(any('next_line(' in src for src in sources), f'{name}: no next: line')
 
-    def test_status_next(self):
+    def test_status_next_names_the_app_it_reports(self):
+        # `status demo` from outside demo's checkout: a bare `status --watch` would fail or follow another app.
         stage = lambda name, state, **kw: dict(stage=name, state=state, text='', **kw)  # noqa: E731
         ok = [stage('build', 'ok'), stage('deploy', 'ok'), stage('dev', 'ok'), stage('prod', 'ok', ahead=0)]
-        self.assertIsNone(magehand.status_next({'stages': ok}, False, True))
+        report = lambda stages: {'app': 'demo', 'stages': stages}  # noqa: E731
+        self.assertIsNone(magehand.status_next(report(ok), False, True))
         ahead = ok[:3] + [stage('prod', 'ok', ahead=2)]
-        self.assertIn('release --dry-run', magehand.status_next({'stages': ahead}, False, True))
+        self.assertIn('`magehand release demo --dry-run`', magehand.status_next(report(ahead), False, True))
         failed = [stage('build', 'failed')] + ok[1:]
-        self.assertIn('fix the failed build', magehand.status_next({'stages': failed}, True, False))
+        self.assertIn('fix the failed build', magehand.status_next(report(failed), True, False))
+        self.assertIn('`magehand status demo --watch`', magehand.status_next(report(failed), True, False))
         pending = [stage('build', 'pending')] + ok[1:]
-        self.assertIn('status --watch', magehand.status_next({'stages': pending}, False, False))
+        self.assertIn('`magehand status demo --watch`', magehand.status_next(report(pending), False, False))
         error = [stage('build', 'error')] + ok[1:]
-        self.assertIn('access problem', magehand.status_next({'stages': error}, True, False))
+        self.assertIn('`magehand status demo` again', magehand.status_next(report(error), True, False))
+
+    def test_release_next_names_the_app(self):
+        plan = {'app': 'demo'}
+        self.assertIn('`magehand release demo --dry-run` again', magehand.release_next(plan, 'not releasing'))
+        self.assertIn('`magehand release demo`', magehand.release_next(plan, None))
+        self.assertIn('`magehand status demo`', magehand.release_next(plan, None, created=True))
+
+    def test_setup_undo_says_next(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(magehand, 'RESOLVER', pathlib.Path(tmp) / 'absent'):
+            code, out, _ = self.run_main('setup', '--undo')
+        self.assertEqual((code, out.splitlines()[-1]), (0, 'next: nothing'))
 
     def test_new_summaries_end_with_next(self):
         text = magehand.new_summary('davidlarrimore/elvis', 'elvis', 'elvis', pathlib.Path('elvis'), None, 'cloned')
@@ -2704,6 +2719,14 @@ class PinnedLayout(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn('pinned to', out.getvalue())
         self.assertIn('a' * 7, out.getvalue())
+        self.assertEqual(out.getvalue().splitlines()[-1], 'next: nothing')
+        out = io.StringIO()
+        with mock.patch.object(magehand.sys, 'argv', argv + ['--json']), \
+                mock.patch.object(magehand, 'try_load_app', side_effect=magehand.PinnedApp('elvis', self.PIN)), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            magehand.main()
+        self.assertIsNone(json.loads(out.getvalue())['next'])
 
 
 class Release(unittest.TestCase):
@@ -3749,8 +3772,19 @@ class Jobs(unittest.TestCase):
         self.assertIn('in dev only', out)
         jobs = {j['name']: j for j in json.loads(data)['jobs']}
         self.assertEqual([r['job'] for r in jobs['collect']['dev']['runs']], ['collect-2', 'collect-1'])
+        failed = 'next: read why its last run failed: `kubectl -n demo-dev logs job/collect-2`'
+        self.assertEqual(out.splitlines()[-1], failed)
+        self.assertEqual('next: ' + json.loads(data)['next'], failed)
         with mock.patch.object(magehand, 'kubectl_json', lambda *a: self.fail('read the cluster')):
-            self.assertIn('not checked (--no-cluster)', self.run_main('job', 'ls', '--no-cluster')[1])
+            out = self.run_main('job', 'ls', '--no-cluster')[1]
+            self.assertIn('not checked (--no-cluster)', out)
+            self.assertEqual(out.splitlines()[-1], 'next: nothing')
+            self.assertIsNone(json.loads(self.run_main('job', 'ls', '--no-cluster', '--json')[1])['next'])
+
+    def test_ls_without_jobs_says_how_to_add_one(self):
+        out = self.run_main('job', 'ls', '--no-cluster')[1]
+        self.assertEqual(out.splitlines()[-1], 'next: `magehand job add NAME --schedule CRON -- COMMAND`')
+        self.assertIn('job add', json.loads(self.run_main('job', 'ls', '--no-cluster', '--json')[1])['next'])
 
     def test_status_ignores_running_job_pods(self):
         image = 'ghcr.io/example/app@sha256:' + 'a' * 64

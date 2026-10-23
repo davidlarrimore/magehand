@@ -53,7 +53,9 @@ A new command or option follows the same rules (tests in `CommandLine`):
 - Say what to do next: every command but those in `NO_NEXT` (their output
   is the result itself) ends its human output with `next_line(step)`, the
   one thing to do next or `next: nothing`, and puts it in `--json` as
-  `"next"`. A person or an agent should never have to work it out.
+  `"next"`, on every branch that succeeds (an error says how to fix it
+  instead). A step that names a command names its app too: the output may
+  be about another app than the checkout's. Tests run the branches.
 - The root help lists what a person needs to learn; a command they rarely
   need (`-V` and `-h` cover `version` and `help`) goes in `PLUMBING`, which
   the root help names on one `also:` line.

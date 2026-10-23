@@ -1037,20 +1037,22 @@ def collect_status(repo, name, cluster=True, ref='main'):
 
 def status_next(report, failed, done):
     """What to do about a status report: fix the first stage that failed, wait for one in progress, or release
-    what dev runs and production doesn't yet."""
+    what dev runs and production doesn't yet. Commands name the app: the report may be about another app than
+    the checkout's."""
+    app = report['app']
+    watch = f'magehand status {app} --watch'
     for st in report['stages']:
         if st['state'] == 'error':
-            return 'fix the access problem it names, then `magehand status` again'
+            return f'fix the access problem it names, then `magehand status {app}` again'
         if st['state'] == 'failed':
-            return {'build': 'fix the failed build (its run is linked above), push, then `magehand status --watch`',
+            return {'build': f'fix the failed build (its run is linked above), push, then `{watch}`',
                     'deploy': "tell the owner: the platform's dev deploy PR failed",
-                    'dev': 'fix what the dev line says, push, then `magehand status --watch`'}.get(
-                        st['stage'], 'fix what that line says')
+                    'dev': f'fix what the dev line says, push, then `{watch}`'}.get(st['stage'], 'fix what that line says')
     if report.get('timeout') or not done:
-        return '`magehand status --watch` (waits for the build and the dev deploy)'
+        return f'`{watch}` (waits for the build and the dev deploy)'
     prod = next((st for st in report['stages'] if st['stage'] == 'prod'), None)
     if prod and prod.get('ahead'):
-        return '`magehand release --dry-run`: dev runs commits production does not have yet'
+        return f'`magehand release {app} --dry-run`: dev runs commits production does not have yet'
     return None
 
 
@@ -1409,6 +1411,15 @@ def render_release(plan):
     return '\n'.join(lines)
 
 
+def release_next(plan, refuse, created=False):
+    """The next step after a release plan, naming its app (not whatever app the checkout is)."""
+    if created:
+        return f'`magehand status {plan["app"]}`: the platform deploys it to production within minutes'
+    if refuse:
+        return f'fix what blocks it (above), then `magehand release {plan["app"]} --dry-run` again'
+    return f'`magehand release {plan["app"]}` (the owner only: it deploys {plan["app"]} to production)'
+
+
 def cmd_release(a):
     if sum(map(bool, (a.major, a.minor, a.patch))) > 1:
         usage('release', 'choose one of --major, --minor, --patch')
@@ -1417,8 +1428,7 @@ def cmd_release(a):
     plan = plan_release(code_repo(app), app['name'], forced, cluster=not a.no_cluster)
     plan['created'] = False
     refuse = f'not releasing {plan["version"]}: ' + '; '.join(plan['problems']) if plan['problems'] else None
-    plan['next'] = ('fix what blocks it (above), then `magehand release --dry-run` again' if refuse else
-                    f'`magehand release` (the owner only: it deploys {plan["app"]} to production)')
+    plan['next'] = release_next(plan, refuse)
     if a.dry_run or refuse:
         if a.json:
             print(json.dumps(plan, indent=1))
@@ -1441,7 +1451,7 @@ def cmd_release(a):
     if code != 0:
         die(f'gh could not create the release: {err}')
     plan['created'], plan['url'] = True, out.strip()
-    plan['next'] = f'`magehand status {plan["app"]}`: the platform deploys it to production within minutes'
+    plan['next'] = release_next(plan, None, created=True)
     if a.json:
         print(json.dumps(plan, indent=1))
     else:
@@ -3119,9 +3129,11 @@ def cmd_check(a):
         note = (f'{name} is pinned to {OWNER}/{repo} at {ref[:7]}: its manifests are in that repo and are checked by its '
                 'build (`magehand check` there); nothing to check in this homelab-apps checkout')
         if a.json:
-            print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': []}, indent=1))
+            print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': [],
+                              'next': None}, indent=1))
         else:
             print(f'magehand check {name}: {note}')
+            print(next_line(None))
         sys.exit(0)
     found = (check_manifests(app, catalog) + check_jobs(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
@@ -3319,6 +3331,7 @@ def cmd_setup(a):
         if RESOLVER.exists():
             subprocess.run(['sudo', 'rm', '-f', str(RESOLVER)], check=True)  # nosec B603 B607
             print(f'removed {RESOLVER}')
+        print(next_line(None))
         return
     print('1/5 GitHub')
     try:
@@ -3466,7 +3479,8 @@ def cmd_upgrade(_a):
     # The new version, from this install's own bin (not whatever is first on PATH).
     exe = pathlib.Path(sys.executable).with_name('magehand')
     if not exe.is_file():
-        print('upgraded; run `magehand skill --install` if you use the skill')
+        print('upgraded')
+        print(next_line('`magehand skill --install`, if you use the skill'))
         return
     # Its skill text, only where the user installed the skill (magehand setup).
     if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
@@ -4316,11 +4330,16 @@ def job_ls(a, app):
     namespace = f'{app["name"]}-dev'
     cluster, why = (None, '--no-cluster') if a.no_cluster else kubectl_json('cronjobs,jobs', '-n', namespace)
     rows = job_rows(local_jobs(app), cluster)
+    failed = [run['job'] for row in rows for run in ((row['dev'] or {}).get('runs') or [])[:1] if run['state'] == 'failed']
+    step = ('`magehand job add NAME --schedule CRON -- COMMAND`' if not rows else
+            f'read why its last run failed: `kubectl -n {namespace} logs job/{failed[0]}`' if failed else None)
     if a.json:
-        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows}, indent=1))
+        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows,
+                          'next': step}, indent=1))
         return
     if not rows:
-        print(f'{app["name"]} has no jobs: add one with `magehand job add NAME --schedule CRON -- COMMAND`')
+        print(f'{app["name"]} has no jobs')
+        print(next_line(step))
         return
     for row in rows:
         where = row['file'] or 'in dev only: not in this checkout\'s deploy/ (removed on this branch?)'
@@ -4339,6 +4358,7 @@ def job_ls(a, app):
                 print(f'    {STATUS_MARK[run["state"]]} {run["job"]} {when(run["started"])}{took}')
             if dev['runs']:
                 print(f'  logs: kubectl -n {namespace} logs job/{dev["runs"][0]["job"]}')
+    print(next_line(step))
 
 
 def cmd_job(a):
