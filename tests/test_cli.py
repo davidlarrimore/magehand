@@ -3637,6 +3637,27 @@ class Status(unittest.TestCase):
             code, out, _ = CommandLine.run_main(self, 'status', '--json')
         self.assertFalse(json.loads(out)['ok'])
 
+    def test_watch_waits_for_a_pending_invitation(self):
+        invited = [{'stage': 'repo', 'state': 'pending', 'text': 'invited', 'next': 'wait'}]
+        accepted = [{'stage': 'repo', 'state': 'ok', 'text': 'set up'}]
+        ok = {'app': 'demo', 'repo': 'o/demo', 'commit': 'a' * 40, 'subject': 's',
+              'stages': [{'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''}]}
+        for answers, watch, done in (([invited, accepted], ['--watch', '--interval', '0'], True),
+                                     ([invited], ['--watch', '--interval', '0', '--timeout', '0'], False)):
+            calls = []
+            with mock.patch.object(magehand, 'status_target', lambda name=None: ({'name': 'demo'}, 'o/demo')), \
+                    mock.patch.object(magehand, 'lifecycle_stages',
+                                      lambda repo, name: calls.append(1) or answers[min(len(calls), len(answers)) - 1]), \
+                    mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):
+                code, out, _ = CommandLine.run_main(self, 'status', *watch, '--json')
+            report = json.loads(out)
+            self.assertEqual(report['ok'], done, answers)
+            self.assertEqual(report['stages'][0]['state'], 'ok' if done else 'pending')
+            if done:
+                self.assertEqual((code, len(calls)), (0, 2))
+            else:
+                self.assertEqual(code, 1)  # timed out still invited
+
     def test_status_finds_a_new_app_without_its_deployment(self):
         with mock.patch.object(magehand, 'repo_root', lambda name: pathlib.Path('/x')), \
                 mock.patch.object(magehand, 'remote_repo', lambda root=None: 'ai-learning-catalog'), \

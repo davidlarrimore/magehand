@@ -1189,7 +1189,7 @@ def cmd_status(a):
             or any(st['state'] == 'failed' for st in lifecycle)
         done = all(st == 'ok' for st in states if st != 'unknown') and len(
             [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2 \
-            and not any(st['stage'] in ('config', 'register') and st['state'] == 'pending' for st in lifecycle)
+            and not any(st['state'] == 'pending' for st in lifecycle)  # an invitation, config or registration
         if not a.watch or failed or done:
             break
         if time.monotonic() > deadline:
