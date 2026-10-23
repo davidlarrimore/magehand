@@ -3612,9 +3612,10 @@ Its commands end with `next: ...`: do that next, or say why not.
    marks the PR ready, requests OpenClaw's review and confirms the request
    stuck (or says why not). Each review costs a model run. A push starts no
    review and dismisses the approval: to change a reviewed PR,
-   `gh pr ready N --undo`, push until green, then `magehand pr ready` again. Don't call the PR ready to merge until its
-   review has posted; the owner merges. Base every PR on `main` (the repo's
-   ruleset only guards the default branch).
+   `gh pr ready N --undo`, push until green, then `magehand pr ready` again.
+   Don't call the PR ready to merge until its review has posted; the owner
+   merges. Base every PR on `main` (the repo's ruleset only guards the
+   default branch).
 7. When `magehand check` warns that AGENTS.md is behind the template, run
    `magehand update-agents`, review the diff and commit it. Never edit
    AGENTS.md above its `## This app` heading: that edit is lost.
