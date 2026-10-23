@@ -2515,6 +2515,69 @@ def setUpModule():
     unittest.addModuleCleanup(lambda: ci is not None and os.environ.update(CI=ci))
 
 
+class PrReady(unittest.TestCase):
+    """`pr ready`: only on green checks, and the review request is confirmed, never assumed."""
+
+    GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
+
+    def run_pr(self, checks=GREEN, draft=True, author='davidlarrimore', requested_before=False, sticks=True,
+               access='write'):
+        state = {'requested': requested_before}
+        writes = []
+
+        def pr():
+            return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': 'OPEN',
+                    'isDraft': draft, 'headRefOid': 'a' * 40, 'author': {'login': author}, 'statusCheckRollup': checks,
+                    'reviewRequests': [{'login': magehand.BOT}] if state['requested'] else []}
+
+        def gh(*args, **kw):
+            writes.append(args)
+            if args[:2] == ('pr', 'edit') and sticks:
+                state['requested'] = True
+            return 0, '', ''
+        with mock.patch.object(magehand, 'gh_query', lambda *a: (pr(), None)), \
+                mock.patch.object(magehand, 'gh_cli', gh), \
+                mock.patch.object(magehand, 'bot_access', lambda repo: (access, '')):
+            code, out, _ = CommandLine.run_main(self, 'pr', 'ready', '12')
+        return code, out, writes
+
+    def test_refuses_until_checks_are_green(self):
+        for checks, why in (([{'name': 'tests', 'status': 'IN_PROGRESS'}], 'still running: tests'),
+                            ([{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}], 'failed: tests'),
+                            ([{'context': 'policy', 'state': 'PENDING'}], 'still running: policy'),
+                            ([], 'no checks have reported yet')):
+            code, out, writes = self.run_pr(checks=checks)
+            self.assertEqual((code, writes), (1, []), why)
+            self.assertIn(why, out)
+            self.assertTrue(out.splitlines()[-1].startswith('next: '), why)
+
+    def test_readies_requests_and_confirms(self):
+        code, out, writes = self.run_pr()
+        self.assertEqual(code, 0)
+        self.assertEqual([w[:2] for w in writes], [('pr', 'ready'), ('pr', 'edit')])
+        self.assertIn('--add-reviewer', writes[1])
+        self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
+        self.assertIn("wait for OpenClaw's review", out.splitlines()[-1])
+
+    def test_a_request_that_did_not_stick_says_why(self):
+        for access, why, step in (('missing', 'is not a collaborator', 'magehand new demo'),
+                                  ('read', 'can only read', 'magehand new demo'),
+                                  ('invited', 'has not accepted', 'wait about 5 minutes')):
+            code, out, _ = self.run_pr(sticks=False, access=access)
+            self.assertEqual(code, 1, access)
+            self.assertIn('NOT recorded', out)
+            self.assertIn(why, out)
+            self.assertIn(step, out.splitlines()[-1])
+
+    def test_nothing_to_do_and_openclaws_own_prs(self):
+        code, out, writes = self.run_pr(draft=False, requested_before=True)
+        self.assertEqual((code, writes), (0, []))
+        self.assertIn('already ready', out)
+        code, out, writes = self.run_pr(author=magehand.BOT)
+        self.assertEqual([w[:2] for w in writes], [('pr', 'ready')])  # never requests the author's own review
+        self.assertIn('the owner reviews', out.splitlines()[-1])
+
+
 class ManagedCopy(unittest.TestCase):
     """OpenClaw's VM (the managed copy): commands that can't work there say why and what to do instead."""
 

@@ -821,6 +821,13 @@ def failing_checks(rollup):
     return names
 
 
+def pending_checks(rollup):
+    """Names of the entries of a PR's statusCheckRollup that haven't finished: CheckRuns not COMPLETED and
+    StatusContexts still PENDING or EXPECTED."""
+    return [c.get('name') or c.get('context') or '?' for c in rollup or []
+            if (c.get('status') and c.get('status') != 'COMPLETED') or c.get('state') in ('PENDING', 'EXPECTED')]
+
+
 def deploy_marks(prs):
     """[(pr, commit sha, image)] for the deploy PRs whose body carries the deploy-dev marker."""
     out = []
@@ -3599,15 +3606,13 @@ Its commands end with `next: ...`: do that next, or say why not.
    so): mock the LLM until then. Never use another app's key.
 5. If the guide doesn't answer, say so in the PR or issue (what you searched
    for) instead of inventing a mechanism; the owner adds it to the guide.
-6. Opening a PR: open it as a draft (`gh pr create --draft`) and request the
-   reviewer at once, `gh pr edit N --add-reviewer davidlarrimore-bot` (it exits
-   0 even when it adds nobody: if `gh pr view N --json reviewRequests` is
-   empty, run `magehand doctor`, which says how to fix the repo). CI runs
-   on drafts and OpenClaw ignores them: push until `magehand check` and CI are
-   green, then `gh pr ready N`, which starts the review (each review costs a
-   model run). A push starts no review and dismisses the approval: to change a
-   reviewed PR, `gh pr ready N --undo`, push until green, `gh pr ready N` and
-   request the reviewer again. Don't call the PR ready to merge until its
+6. Opening a PR: open it as a draft (`gh pr create --draft`); CI runs on
+   drafts and OpenClaw ignores them. Push until `magehand check` and CI are
+   green, then `magehand pr ready`: it refuses until the checks are green,
+   marks the PR ready, requests OpenClaw's review and confirms the request
+   stuck (or says why not). Each review costs a model run. A push starts no
+   review and dismisses the approval: to change a reviewed PR,
+   `gh pr ready N --undo`, push until green, then `magehand pr ready` again. Don't call the PR ready to merge until its
    review has posted; the owner merges. Base every PR on `main` (the repo's
    ruleset only guards the default branch).
 7. When `magehand check` warns that AGENTS.md is behind the template, run
@@ -4745,6 +4750,81 @@ def job_ls(a, app):
     print(next_line(step))
 
 
+# --- pr ready: the one step of the review routine that can fail silently ---------------------------
+# A write magehand makes as the user, through gh: it marks a green PR ready for review and requests
+# OpenClaw's bot, then reads the PR back, because `gh pr edit --add-reviewer` exits 0 even when GitHub
+# records nobody (a bot that isn't a collaborator: #44).
+
+PR_FIELDS = 'number,url,state,isDraft,headRefOid,author,statusCheckRollup,reviewRequests'
+
+
+def requested(pr):
+    """Whether OpenClaw's bot is among the PR's requested reviewers."""
+    return any((r.get('login') or '').lower() == BOT.lower() for r in pr.get('reviewRequests') or [])
+
+
+def cmd_pr(a):
+    target = [str(a.number)] if a.number else []
+    pr, err = gh_query('pr', 'view', *target, '--json', PR_FIELDS)
+    if err:
+        die(f'cannot read {"PR #" + str(a.number) if a.number else "the PR for this branch"}: {err} '
+            '(open one with `gh pr create --draft`, or pass its number)')
+    number, repo = pr['number'], '/'.join(pr['url'].split('/')[3:5])
+    if pr['state'] != 'OPEN':
+        die(f'PR #{number} is {pr["state"].lower()}: only an open PR can be readied')
+    failing, running = failing_checks(pr.get('statusCheckRollup')), pending_checks(pr.get('statusCheckRollup'))
+    if failing or running or not pr.get('statusCheckRollup'):
+        why = (f'its checks failed: {", ".join(failing)}' if failing else
+               f'its checks are still running: {", ".join(running)}' if running else 'no checks have reported yet')
+        step = ('fix them and push, then `magehand pr ready ' + str(number) + '` again' if failing else
+                f'`gh pr checks {number} --watch`, then `magehand pr ready {number}` again')
+        if a.json:
+            print(json.dumps({'pr': number, 'ready': False, 'requested': requested(pr), 'why': why, 'next': step}))
+        else:
+            print(f'PR #{number}: not readied, {why}')
+            print(next_line(step))
+        sys.exit(1)
+    changed = []
+    if pr.get('isDraft'):
+        code, _, err = gh_cli('pr', 'ready', str(number), '-R', repo)
+        if code != 0:
+            die(f'gh could not mark PR #{number} ready: {err}')
+        changed.append('marked ready for review')
+    own = (pr.get('author') or {}).get('login', '').lower() == BOT.lower()  # OpenClaw's own PR: the owner reviews it
+    if not own and not requested(pr):
+        code, _, err = gh_cli('pr', 'edit', str(number), '-R', repo, '--add-reviewer', BOT)
+        if code != 0:
+            die(f'gh could not request {BOT} on PR #{number}: {err}')
+        pr, err = gh_query('pr', 'view', str(number), '-R', repo, '--json', PR_FIELDS)
+        if err or not requested(pr):  # the silent failure: say why, from the bot's access to the repo
+            access, _ = (None, None) if err else bot_access(repo)
+            why = (f'could not read the PR back to confirm it ({err})' if err else
+                   {'missing': f'{BOT} is not a collaborator on {repo}',
+                    'read': f'{BOT} can only read {repo}',
+                    'invited': f'{BOT} has not accepted its invitation to {repo} yet'}.get(
+                        access, 'GitHub did not record the request'))
+            step = ('wait about 5 minutes, then `magehand pr ready ' + str(number) + '` again' if access == 'invited'
+                    else f'ask the owner to run `magehand new {repo.split("/", 1)[1]}` (it repairs the repo), then '
+                         f'`magehand pr ready {number}` again')
+            if a.json:
+                print(json.dumps({'pr': number, 'ready': True, 'requested': False, 'changed': changed, 'why': why,
+                                  'next': step}))
+            else:
+                print(f'PR #{number}: ' + (', '.join(changed) + '; ' if changed else '')
+                      + f'review request {"not confirmed" if err else "NOT recorded"}: {why}')
+                print(next_line(step))
+            sys.exit(1)
+        changed.append(f'requested {BOT} (confirmed)')
+    step = ('the owner reviews and merges it (OpenClaw does not review its own PRs)' if own else
+            "wait for OpenClaw's review (it starts within about 5 minutes); the owner merges")
+    if a.json:
+        print(json.dumps({'pr': number, 'url': pr['url'], 'ready': True, 'requested': requested(pr), 'own': own,
+                          'changed': changed, 'next': step}))
+    else:
+        print(f'PR #{number}: ' + ('; '.join(changed) if changed else 'already ready, and its review requested'))
+        print(next_line(step))
+
+
 def cmd_job(a):
     app = job_app(a.app_flag)
     base = pathlib.Path(app['root']) / DEPLOY / 'base'
@@ -4760,7 +4840,7 @@ def cmd_job(a):
 # command's short help).
 GROUPS = (('start an app', ('new',)),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check')),
-          ('ship an app', ('release', 'job')),
+          ('ship an app', ('pr', 'release', 'job')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade')))
 # Working, but not what a person needs to learn: -V and -h do version's and help's jobs, setup and upgrade
@@ -4902,6 +4982,20 @@ def build_parser():
     p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read the dev pods with kubectl (GitHub only)")
     json_option(p)
+    p = command('pr', cmd_pr, "mark a green PR ready and request OpenClaw's review",
+                "mark a PR ready for review once its checks are green, request OpenClaw's review, and confirm it",
+                'The step of the review routine that can fail silently: `gh pr edit --add-reviewer` exits 0 even\n'
+                'when GitHub records nobody. `pr ready` refuses while checks are running or failed (say which),\n'
+                f'marks a draft ready, requests {BOT} and reads the PR back: if the request did not stick it\n'
+                'says why (the bot is not a collaborator, can only read, or has not accepted yet) and exits 1.\n'
+                "On OpenClaw's own PRs it requests nobody: the owner reviews those. Open the PR with\n"
+                '`gh pr create --draft`; after a push to a reviewed PR, run it again.\n\n'
+                'examples:\n  magehand pr ready          # the PR of this branch\n  magehand pr ready 12\n'
+                '  magehand pr ready 12 --json')
+    psub = p.add_subparsers(dest='pr_action', metavar='ACTION', required=True, parser_class=Parser)
+    q = psub.add_parser('ready', help='ready a green PR and request the review, confirmed')
+    q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     p = command('job', cmd_job, 'add, remove and list scheduled jobs (CronJobs)', "add, remove or list the app's scheduled jobs: CronJobs in its deploy/base that run its image with another command",
                 'A job is the app\'s own image run on a schedule with another command and the Deployment\'s env (its\n'
                 'blocks, keys and settings), in a fresh pod that exits when the command does. `add` writes\n'
