@@ -4823,15 +4823,17 @@ def cmd_pr(a):
                    f'`magehand pr ready {number}` again', recorded=None)
         pr = back
         if not requested(pr):  # the silent failure: say why, from the bot's access to the repo
-            access, _ = bot_access(repo)
+            access, unread = bot_access(repo)
             mine = repo.split('/', 1)[0].lower() == OWNER.lower()
             fix = (f'ask the owner to run `magehand new {repo.split("/", 1)[1]}` (it repairs the repo)' if mine else
                    f"ask {repo.split('/', 1)[0]} to add {BOT} with write")
             why, step = {
                 'missing': (f'{BOT} is not a collaborator on {repo}', fix),
                 'read': (f'{BOT} can only read {repo}', fix),
-                'invited': (f'{BOT} has not accepted its invitation to {repo} yet', 'wait about 5 minutes')}.get(
-                    access, ('GitHub did not record the request, though the bot can write', 'request it on the PR page'))
+                'invited': (f'{BOT} has not accepted its invitation to {repo} yet', 'wait about 5 minutes'),
+                'write': ('GitHub did not record the request, though the bot can write', 'request it on the PR page'),
+                None: (f"could not check {BOT}'s access to {repo} ({unread or 'gh failed'})",
+                       f"ask the owner to check {BOT} has write on {repo} (`magehand doctor` in its checkout)")}[access]
             finish(False, f'review request NOT recorded: {why}; the PR stays as it was',
                    f'{step}, then `magehand pr ready {number}` again', recorded=False)
         changed.append(f'requested {BOT} (confirmed)')

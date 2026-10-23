@@ -2539,7 +2539,7 @@ class PrReady(unittest.TestCase):
             return 0, '', ''
         with mock.patch.object(magehand, 'gh_query', lambda *a: (pr(), None)), \
                 mock.patch.object(magehand, 'gh_cli', gh), \
-                mock.patch.object(magehand, 'bot_access', lambda repo: (access, '')):
+                mock.patch.object(magehand, 'bot_access', lambda repo: (access, 'HTTP 403' if access is None else '')):
             code, out, _ = CommandLine.run_main(self, 'pr', 'ready', '12', *(['--json'] if json_out else []))
         return code, out, writes
 
@@ -2578,7 +2578,7 @@ class PrReady(unittest.TestCase):
                                   ('read', 'can only read', 'magehand new demo'),
                                   ('invited', 'has not accepted', 'wait about 5 minutes'),
                                   ('write', 'though the bot can write', 'request it on the PR page'),
-                                  (None, 'though the bot can write', 'request it on the PR page')):
+                                  (None, "could not check davidlarrimore-bot's access", '`magehand doctor`')):
             code, out, writes = self.run_pr(sticks=False, access=access)
             self.assertEqual(code, 1, access)
             self.assertEqual([w[:2] for w in writes], [('pr', 'edit')], access)  # not marked ready
