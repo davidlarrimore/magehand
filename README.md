@@ -36,6 +36,13 @@ Upgrade with `magehand upgrade` (any command says, at most once a day, when a ne
 COMMAND`) explains one, with examples. `update-agents`, `skill`, `version` and
 `help` are named only on its `also:` line: you rarely need them.
 
+In OpenClaw's VM (the copy the platform installs and pins), `run`, `dev`,
+`bucket`, `login` and `setup` can't work: it has no container runtime, no
+route to OpenBao and no passkey. They exit 1 with why and what does the job
+instead (CI's tests and browser check, or the owner). `doctor` there checks
+only GitHub and the repo, and `app` shows no sign-in line. Nothing OpenClaw
+does needs the sign-in: the platform gives apps their keys.
+
 Every command that leads somewhere ends with one line, `next: ...`: the one
 thing to do next (`next: nothing` when there is nothing), and its `--json`
 has it as `"next"`. Only commands whose output is the result itself (`guide`,
