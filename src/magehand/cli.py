@@ -2808,6 +2808,93 @@ def env_findings(app, container, deployment_file, catalog):
     return found
 
 
+# What the platform lets an app deploy (homelab-apps .github/check-kinds.py; Argo CD's agent-app-bundles project
+# and Kyverno enforce it in the cluster): namespace, quota, limits and network policy come from the platform.
+ALLOWED_KINDS = {
+    ('', 'ConfigMap'), ('', 'Secret'), ('', 'Service'), ('', 'ServiceAccount'), ('', 'PersistentVolumeClaim'),
+    ('apps', 'Deployment'), ('apps', 'StatefulSet'), ('batch', 'Job'), ('batch', 'CronJob'),
+    ('networking.k8s.io', 'Ingress'), ('policy', 'PodDisruptionBudget'), ('autoscaling', 'HorizontalPodAutoscaler'),
+    ('external-secrets.io', 'ExternalSecret'),
+}
+# Ingress middlewares (homelab-apps .github/check-ingress.py; Kyverno enforces the same).
+LAB_AUTH = 'authentik-forward-auth@kubernetescrd'
+STRIP_AUTH = 'kube-system-strip-authentik-headers@kubernetescrd'
+PUBLIC_AUTH = 'authentik-public-forward-auth@kubernetescrd'
+
+
+def render_overlay(local, overlay):
+    """(docs, None) from `kubectl kustomize deploy/<overlay>`, as CI renders it; (None, why) when it can't be
+    rendered on this machine (no kubectl: skipped), or ('failed', message) when kustomize refuses it."""
+    if not shutil.which('kubectl'):
+        return None, 'kubectl is not installed'
+    try:
+        out = subprocess.run(['kubectl', 'kustomize', str(local / overlay)], capture_output=True, text=True,  # nosec B603 B607
+                             timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, 'kubectl kustomize did not answer'
+    if out.returncode != 0:
+        return 'failed', (out.stderr.strip().splitlines() or ['kubectl kustomize failed'])[-1]
+    try:
+        return [d for d in yaml.safe_load_all(out.stdout) if isinstance(d, dict)], None
+    except yaml.YAMLError as error:
+        return 'failed', str(error).splitlines()[0]
+
+
+def check_rendered(root, name):
+    """The rules CI applies to deploy/ rendered by kustomize (build-app.yaml "Render and check deploy/"): each
+    overlay's namespace, the kinds an app may deploy, Ingress hosts and middlewares, and the `app` container the
+    platform pins the commit on. Returns (findings, skipped): skipped names what couldn't be rendered here."""
+    local = deploy_dir(root)
+    if not local or not name or not any((local / 'base').glob('*.y*ml')):
+        return [], []
+    found, skipped = [], []
+    domain = LAB.split('.', 1)[1]
+    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
+        if not (local / overlay / 'kustomization.yaml').is_file():
+            continue  # a missing dev overlay is check_deploy_files' error; prod is optional
+        where = f'{DEPLOY}/{overlay}'
+        docs, why = render_overlay(local, overlay)
+        if docs == 'failed':
+            found.append(finding('error', where, f'kustomize cannot render it: {why}', 'README "How an app is put together"'))
+            continue
+        if docs is None:
+            skipped.append(f'{where}: not rendered ({why}); CI renders and checks it')
+            continue
+        lab, public = f'{namespace}.{LAB}', f'{namespace}.{domain}'
+        for doc in docs:
+            meta = doc.get('metadata') or {}
+            kind, label = doc.get('kind', ''), f'{where}: {doc.get("kind", "?")} {meta.get("name", "?")}'
+            group = str(doc.get('apiVersion', '')).rpartition('/')[0]
+            if meta.get('namespace') not in (None, namespace):
+                found.append(finding('error', label, f'namespace must be {namespace} (found {meta["namespace"]})',
+                                     'README "How an app is put together"'))
+            if (group, kind) not in ALLOWED_KINDS:
+                found.append(finding('error', label, f'{kind} ({group or "core"}) is not allowed in an app',
+                                     'homelab-apps AGENTS.md "Not allowed"'))
+            if kind == 'Ingress':
+                hosts = {r.get('host') for r in (doc.get('spec') or {}).get('rules') or []}
+                middlewares = [m.strip() for m in (meta.get('annotations') or {}).get(
+                    'traefik.ingress.kubernetes.io/router.middlewares', '').split(',') if m.strip()]
+                allowed = {lab, public} if overlay == 'prod' else {lab}
+                see = 'homelab-apps AGENTS.md "Networking and access"'
+                if len(hosts) != 1 or not hosts <= allowed:
+                    found.append(finding('error', label, f'one host per Ingress, one of {", ".join(sorted(allowed))} '
+                                         f'(found {", ".join(sorted(h or "none" for h in hosts)) or "none"})', see))
+                elif hosts == {lab} and LAB_AUTH not in middlewares:
+                    found.append(finding('error', label, f'an internal host needs the middleware {LAB_AUTH}', see))
+                elif hosts == {public} and (not middlewares or middlewares[0] != STRIP_AUTH or LAB_AUTH in middlewares):
+                    found.append(finding('error', label, f'a public host needs {STRIP_AUTH} first (then {PUBLIC_AUTH} '
+                                         f'on signed-in paths), never {LAB_AUTH}', see))
+            if overlay == 'dev' and kind == 'Deployment' and meta.get('name') == name:
+                containers = [c.get('name') for c in ((doc.get('spec') or {}).get('template') or {}).get('spec', {})
+                              .get('containers') or []]
+                if 'app' not in containers:
+                    found.append(finding('error', label, f'needs a container named `app` (it has {containers}): the '
+                                         'platform pins the commit and image on it',
+                                         'homelab-apps AGENTS.md "Apps with their own repo"'))
+    return found, skipped
+
+
 def check_deploy_files(root, name=None):
     """deploy/ holds app.yaml, base/ (the Kustomize base), the dev/ overlay (namespace <app>-dev: Argo CD deploys
     it, and registration and CI need it once base/ exists) and the optional prod/ (namespace <app>, needed for
@@ -2888,6 +2975,86 @@ def line_of(text, index):
 COMMENT_LINE = re.compile(r'^\s*(#|//|/?\*|--)')
 
 
+# A dependency install must come from a lockfile (homelab-apps .github/check-dependencies.py): a floating one
+# can pull a different, possibly malicious, version on every build. (match, what it must also contain, advice)
+LOCKED_INSTALLS = [
+    (re.compile(r'\b(?:python\d*(?:\.\d+)?\s+-m\s+)?pip3?\s+install\b'), re.compile(r'--require-hashes\b'),
+     'pip install needs --require-hashes -r requirements.txt (lock it with pip-compile --generate-hashes)'),
+    (re.compile(r'\buv\s+pip\s+(?:install|sync)\b'), re.compile(r'--require-hashes\b'),
+     'uv pip install/sync needs --require-hashes -r requirements.txt'),
+    (re.compile(r'\buv\s+sync\b'), re.compile(r'--(?:frozen|locked)\b'), 'uv sync needs --frozen or --locked (commit uv.lock)'),
+    (re.compile(r'\bnpm\s+(?:install|i|add)\b'), re.compile(r'(?!)'),
+     'use npm ci (with a committed package-lock.json), not npm install'),
+    (re.compile(r'\byarn(?:\s+install)?\s*(?:$|&&|;|\|)'), re.compile(r'(?!)'),
+     'yarn needs install --frozen-lockfile (v1) or --immutable (berry)'),
+    (re.compile(r'\byarn\s+install\b'), re.compile(r'--(?:frozen-lockfile|immutable)\b'),
+     'yarn install needs --frozen-lockfile (v1) or --immutable (berry)'),
+    (re.compile(r'\byarn\s+add\b'), re.compile(r'(?!)'), 'yarn add changes the lockfile; add dependencies locally'),
+    (re.compile(r'\bpnpm\s+(?:install|i)\b'), re.compile(r'--frozen-lockfile\b'), 'pnpm install needs --frozen-lockfile'),
+    (re.compile(r'\bpnpm\s+add\b'), re.compile(r'(?!)'), 'pnpm add changes the lockfile; add dependencies locally'),
+]
+
+
+def dockerfile_runs(text):
+    """(line number, command) of each RUN instruction, its continuation lines joined."""
+    out, buf, start = [], None, 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip()
+        if buf is None:
+            if not re.match(r'^\s*RUN\s', line, re.I):
+                continue
+            buf, start = re.sub(r'^\s*RUN\s+', '', line, flags=re.I), n
+        elif line.lstrip().startswith('#'):
+            continue
+        else:
+            buf += ' ' + line.strip()
+        if buf.endswith('\\'):
+            buf = buf[:-1]
+            continue
+        out.append((start, buf))
+        buf = None
+    if buf is not None:
+        out.append((start, buf))
+    return out
+
+
+def check_dockerfile(root):
+    """The build's Dockerfile rules (homelab-apps build-app.yaml "Check the Dockerfile follows the rules"): base
+    images pinned by digest, a `test` stage before the final one, dependencies only from a lockfile, and a
+    non-root USER."""
+    path = root / 'Dockerfile'
+    if not path.is_file():
+        return []  # check_code reports it missing
+    text = path.read_text(errors='replace')
+    see = 'homelab-apps AGENTS.md "Your own code (container images)"'
+    found = []
+    froms = [(n, line.split()) for n, line in enumerate(text.splitlines(), 1) if re.match(r'^\s*FROM\s', line, re.I)]
+    stages = {words[-1] for _, words in froms if len(words) >= 4 and words[-2].upper() == 'AS'}
+    for n, words in froms:
+        image = next((w for w in words[1:] if not w.startswith('--')), '')
+        if '@sha256:' not in image and image != 'scratch' and image not in stages:
+            found.append(finding('error', f'Dockerfile:{n}', f"base image '{image}' must be pinned by digest "
+                                 '(image@sha256:...)', see))
+    tests = [n for n, words in froms if len(words) >= 4 and words[-2].upper() == 'AS' and words[-1].lower() == 'test']
+    if not tests:
+        found.append(finding('error', 'Dockerfile', "add a stage named test (FROM ... AS test) that runs the app's "
+                             'tests', see))
+    elif froms and froms[-1][0] in tests:
+        found.append(finding('error', f'Dockerfile:{froms[-1][0]}', 'the test stage must come before the final '
+                             '(runtime) stage', see))
+    for n, command in dockerfile_runs(text):
+        for part in re.split(r'&&|\|\||;', command):  # one locked install doesn't excuse another
+            for match, required, advice in LOCKED_INSTALLS:
+                if match.search(part) and not required.search(part):
+                    found.append(finding('error', f'Dockerfile:{n}', f'{advice}: {part.strip()[:120]}', see))
+                    break
+    users = [line.split()[1] for line in text.splitlines() if len(line.split()) > 1 and line.split()[0].upper() == 'USER']
+    user = users[-1] if users else ''
+    if not user or user == 'root' or user.split(':')[0] == '0':
+        found.append(finding('error', 'Dockerfile', 'the final stage needs USER <non-root uid>, e.g. USER 65532', see))
+    return found
+
+
 def check_code(root, app, catalog=None):
     """Rules for the app's code (the repo checkout); `app` is None before it has a deployment."""
     found = []
@@ -2900,7 +3067,7 @@ def check_code(root, app, catalog=None):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
                                  'homelab-apps AGENTS.md "Apps with their own repo"'))
-    found += check_dotenv(root, app)
+    found += check_dockerfile(root) + check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
         try:
@@ -3137,6 +3304,12 @@ def cmd_check(a):
         sys.exit(0)
     found = (check_manifests(app, catalog) + check_jobs(app, catalog) if app else seeded_name_findings(name, root)) \
         + check_deploy_files(root, name)
+    rendered, skipped = check_rendered(root, name)
+    found += rendered
+    if skipped and os.environ.get('CI'):  # CI must check everything a merge deploys: a skip there is a failure
+        found += [finding('error', s.split(':', 1)[0], s.split(': ', 1)[1].replace('; CI renders and checks it', '')
+                          + ': CI needs kubectl to render deploy/', 'README "How an app is put together"') for s in skipped]
+        skipped = []
     if not manifests_only:
         found += check_code(root, app, catalog) + check_agents_drift(root) + check_merged_branch(root)
     errors = sum(f['level'] == 'error' for f in found)
@@ -3147,13 +3320,15 @@ def cmd_check(a):
         print(json.dumps({'app': name, 'code': None if manifests_only else str(root.resolve()),
                           'deployment': app['where'] if app else None, 'errors': errors,
                           'findings': sorted(found, key=lambda f: (f['level'] != 'error', f['where'])),
-                          'next': step}, indent=1))
+                          'skipped': skipped, 'next': step}, indent=1))
         sys.exit(1 if errors else 0)
     print(f'magehand check {name}: code {"(skipped)" if manifests_only else root.resolve()}, deployment '
           + (app['where'] if app else 'none yet (code rules only)'))
     for f in sorted(found, key=lambda f: (f['level'] != 'error', f['where'])):
         see = f['see'] if f['see'].startswith('homelab-apps') else f"magehand guide {f['see']}"
         print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> {see}")
+    for line in skipped:
+        print(f'skipped {line}')
     print(f'{len(found)} finding(s), {errors} error(s)' if found else 'no findings')
     print(next_line(step))
     sys.exit(1 if errors else 0)

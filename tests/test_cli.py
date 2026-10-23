@@ -1201,16 +1201,58 @@ class CheckManifests(unittest.TestCase):
             self.assertIn(part, errors)
 
 
+# A Dockerfile the build accepts: pinned bases, a test stage before the final one, locked installs, non-root.
+GOOD_DOCKERFILE = (f"FROM python:3.13-slim@sha256:{'a' * 64} AS base\n"
+                   'COPY requirements.txt .\n'
+                   'RUN pip install --no-cache-dir --require-hashes -r requirements.txt\n'
+                   'FROM base AS test\n'
+                   'RUN python -m unittest\n'
+                   'FROM base\n'
+                   'USER 65532\n')
+
+
 class CheckCode(unittest.TestCase):
     def run_check(self, files, env=()):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            for name in ('Dockerfile', 'ui-check.yaml'):
-                (root / name).write_text('x')
+            (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
+            (root / 'ui-check.yaml').write_text('x')
             for name, text in files.items():
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text(text)
             return magehand.check_code(root, check_app(list(env)))
+
+    def test_dockerfile_rules_of_the_build(self):
+        good = GOOD_DOCKERFILE
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+
+            def found(text):
+                (root / 'Dockerfile').write_text(text)
+                return [f['text'] for f in magehand.check_dockerfile(root)]
+            self.assertEqual(found(good), [])
+            self.assertIn("base image 'python:3.13-slim' must be pinned", found(good.replace(f"@sha256:{'a' * 64}", ''))[0])
+            self.assertEqual(found(good.replace('FROM python', 'FROM --platform=$BUILDPLATFORM python')), [])
+            self.assertEqual(found('FROM scratch AS test\nFROM scratch\nUSER 1\n'), [])
+            self.assertIn('add a stage named test', found(good.replace(' AS test', ' AS checks'))[0])
+            self.assertIn('must come before the final', found(good + 'FROM base AS test\n')[0])
+            self.assertIn('needs USER', found(good.replace('USER 65532', 'USER root'))[0])
+            self.assertIn('needs USER', found(good.replace('USER 65532', 'USER 0:0'))[0])
+            self.assertIn('needs USER', found(good.replace('USER 65532\n', ''))[0])
+
+    def test_dependencies_only_from_a_lockfile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for run, why in (('pip install flask', '--require-hashes'), ('npm install', 'npm ci'),
+                             ('uv sync', '--frozen'), ('yarn', 'yarn needs'), ('pnpm add x', 'pnpm add'),
+                             ('npm ci && pip install \\\n  flask', '--require-hashes')):
+                (root / 'Dockerfile').write_text(GOOD_DOCKERFILE.replace('RUN python -m unittest', f'RUN {run}'))
+                texts = [f['text'] for f in magehand.check_dockerfile(root)]
+                self.assertTrue(texts and why in texts[0], (run, texts))
+            for run in ('npm ci', 'uv sync --frozen', 'yarn install --immutable', 'pnpm install --frozen-lockfile',
+                        'python -m pip install --require-hashes -r r.txt', 'apt-get install -y curl'):
+                (root / 'Dockerfile').write_text(GOOD_DOCKERFILE.replace('RUN python -m unittest', f'RUN {run}'))
+                self.assertEqual(magehand.check_dockerfile(root), [], run)
 
     def test_dotenv_holds_no_secrets(self):
         found = self.run_check({'.magehand.env': '# local\nWEB_DIR=./web\nKEY=x\nOPENAI_BASE=sk-abcdefgh1234\n'
@@ -1361,6 +1403,72 @@ class DeployDir(unittest.TestCase):
         self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/dev/kustomization.yaml')])
         self.assertIn('namespace: demo-dev', found[0]['text'])
 
+    def rendered(self, dev, prod=None, failed=None):
+        """check_rendered on a deploy/ whose overlays render to `dev` and `prod` (lists of documents)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp)
+            if prod is not None:
+                (root / 'deploy/prod').mkdir()
+                (root / 'deploy/prod/kustomization.yaml').write_text('namespace: demo\nresources: [../base]\n')
+            answers = {'dev': dev, 'prod': prod}
+            render = lambda local, overlay: ('failed', failed) if failed else (answers[overlay], None)  # noqa: E731
+            with mock.patch.object(magehand, 'render_overlay', render):
+                return magehand.check_rendered(root, 'demo')
+
+    DEV_DEPLOYMENT = {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'demo', 'namespace': 'demo-dev'},
+                      'spec': {'template': {'spec': {'containers': [{'name': 'app'}]}}}}
+
+    @staticmethod
+    def ingress(host, middlewares, namespace='demo-dev'):
+        return {'apiVersion': 'networking.k8s.io/v1', 'kind': 'Ingress',
+                'metadata': {'name': 'web', 'namespace': namespace,
+                             'annotations': {'traefik.ingress.kubernetes.io/router.middlewares': middlewares}},
+                'spec': {'rules': [{'host': host}]}}
+
+    def test_rendered_overlays_follow_ci_rules(self):
+        lab = magehand.LAB_AUTH
+        good = [self.DEV_DEPLOYMENT, self.ingress(f'demo-dev.{magehand.LAB}', lab)]
+        self.assertEqual(self.rendered(good), ([], []))
+        texts = lambda found: [f['text'] for f in found[0]]  # noqa: E731
+        # namespace, kinds, the app container
+        moved = dict(self.DEV_DEPLOYMENT, metadata={'name': 'demo', 'namespace': 'other'})
+        self.assertIn('namespace must be demo-dev', texts(self.rendered([moved]))[0])
+        role = {'apiVersion': 'rbac.authorization.k8s.io/v1', 'kind': 'Role', 'metadata': {'name': 'r'}}
+        self.assertIn('Role (rbac.authorization.k8s.io) is not allowed', texts(self.rendered(good + [role]))[0])
+        unnamed = {**self.DEV_DEPLOYMENT, 'spec': {'template': {'spec': {'containers': [{'name': 'web'}]}}}}
+        self.assertIn('container named `app`', texts(self.rendered([unnamed]))[0])
+        # Ingress: dev only on its lab host, with the forward auth
+        self.assertIn('one host per Ingress', texts(self.rendered([self.ingress('demo.example.com', lab)]))[0])
+        self.assertIn('needs the middleware', texts(self.rendered([self.ingress(f'demo-dev.{magehand.LAB}', '')]))[0])
+        # prod: a public host strips the headers first and never uses the lab's forward auth
+        domain = magehand.LAB.split('.', 1)[1]
+        public_ok = self.ingress(f'demo.{domain}', f'{magehand.STRIP_AUTH},{magehand.PUBLIC_AUTH}', 'demo')
+        self.assertEqual(self.rendered(good, prod=[public_ok]), ([], []))
+        public_bad = self.ingress(f'demo.{domain}', lab, 'demo')
+        self.assertIn('a public host needs', texts(self.rendered(good, prod=[public_bad]))[0])
+
+    def test_render_failure_is_an_error_and_no_kubectl_a_skip(self):
+        found, skipped = self.rendered([], failed='accumulating resources: missing kustomization.yaml')
+        self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/dev')])
+        self.assertIn('kustomize cannot render it', found[0]['text'])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp)
+            self.assertEqual(magehand.check_rendered(root, 'demo'),  # the module's stub: no kubectl
+                             ([], ['deploy/dev: not rendered (kubectl is not installed); CI renders and checks it']))
+
+    def test_a_skip_is_an_error_in_ci(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp)
+            (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
+            argv = ['check', 'demo', '--code', str(root), '--manifests-only', '--json']
+            with mock.patch.object(magehand, 'github_file', lambda *a, **k: ''):
+                local = json.loads(CommandLine.run_main(self, *argv)[1])
+                with mock.patch.dict(os.environ, {'CI': 'true'}):
+                    ci = json.loads(CommandLine.run_main(self, *argv)[1])
+        self.assertEqual(local['skipped'], ['deploy/dev: not rendered (kubectl is not installed); CI renders and checks it'])
+        self.assertEqual(ci['skipped'], [])
+        self.assertIn(('error', 'deploy/dev'), [(f['level'], f['where']) for f in ci['findings']])
+
     def test_overlays_and_their_namespaces(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = deploy_repo(tmp, extra={'deploy/dev/kustomization.yaml': 'namespace: demo-dev\nresources: [../base]\n',
@@ -1489,8 +1597,8 @@ class ModelRule(unittest.TestCase):
     def run_check(self, code, services):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            for name in ('Dockerfile', 'ui-check.yaml'):
-                (root / name).write_text('x')
+            (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
+            (root / 'ui-check.yaml').write_text('x')
             (root / 'app.py').write_text(code)
             return magehand.check_code(root, check_app([{'name': 'M', 'value': 'x'}], services), CATALOG_MODELS)
 
@@ -2374,6 +2482,16 @@ class RepoConformance(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None, None, None])
         self.assertEqual(len(calls), 1)  # only the (mocked, failing) OpenBao health probe was attempted
+
+
+def setUpModule():
+    """No test renders deploy/ with this machine's kubectl (the tests run the same everywhere); the render rules'
+    tests give check_rendered its documents."""
+    patch = mock.patch.object(magehand, 'render_overlay', lambda local, overlay: (None, 'kubectl is not installed'))
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
+    ci = os.environ.pop('CI', None)  # GitHub Actions sets it, and check treats a skip as an error there
+    unittest.addModuleCleanup(lambda: ci is not None and os.environ.update(CI=ci))
 
 
 class CommandLine(unittest.TestCase):
