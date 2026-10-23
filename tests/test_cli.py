@@ -2508,6 +2508,54 @@ def setUpModule():
     unittest.addModuleCleanup(lambda: ci is not None and os.environ.update(CI=ci))
 
 
+class ManagedCopy(unittest.TestCase):
+    """OpenClaw's VM (the managed copy): commands that can't work there say why and what to do instead."""
+
+    run_main = None  # set below, from CommandLine
+
+    def test_commands_that_cannot_work_in_the_vm_say_why(self):
+        with mock.patch.object(magehand, 'install_method', lambda *a: 'managed'), \
+                mock.patch.object(magehand, 'update_notice', lambda: None):
+            for argv, why, step in ((['run', '--', 'true'], 'no container runtime', 'next: `magehand check`, then push'),
+                                    (['dev', 'up'], 'no local blocks here', 'next: `magehand check`, then push'),
+                                    (['bucket', 'ls', 'files'], "can't reach the app's bucket", 'next: ask the owner'),
+                                    (['login'], 'nothing to sign in to', 'next: nothing'),
+                                    (['setup'], 'set up by the platform', 'next: nothing')):
+                code, out, err = self.run_main(*argv)
+                self.assertEqual((code, out), (1, ''), argv)
+                self.assertIn(why, err, argv)
+                self.assertIn(step, err, argv)
+
+    def test_the_same_commands_run_normally_elsewhere(self):
+        ran = []
+        with mock.patch.object(magehand, 'install_method', lambda *a: 'uv'), \
+                mock.patch.object(magehand, 'update_notice', lambda: None), \
+                mock.patch.object(magehand, 'cmd_login', lambda a: ran.append('login')):
+            magehand.build_parser()
+            with mock.patch.dict(magehand.SUBPARSERS['login']._defaults, {'func': lambda a: ran.append('login')}):
+                self.run_main('login')
+        self.assertEqual(ran, ['login'])
+
+    def test_doctor_in_the_vm_checks_only_what_applies(self):
+        names = ('current_repo', 'github_token', 'github_file', 'configured_runtime', 'choose_runtime', 'install_method')
+        saved = {n: getattr(magehand, n) for n in names}
+        magehand.current_repo = lambda *a: None
+        magehand.github_token = lambda: 't'
+        magehand.github_file = lambda *a, **k: 'x'
+        magehand.configured_runtime = lambda: 'none'
+        magehand.choose_runtime = lambda configured, found: None
+        magehand.install_method = lambda *a: 'managed'
+        try:
+            with mock.patch.object(magehand.urllib.request, 'urlopen', lambda *a, **k: self.fail('asked OpenBao')):
+                code, out, _ = self.run_main('doctor', '--json')
+        finally:
+            for n, f in saved.items():
+                setattr(magehand, n, f)
+        report = json.loads(out)
+        self.assertEqual((code, report['ok'], report['next']), (0, True, None))
+        self.assertEqual([c['ok'] for c in report['checks'] if c['check'] == 'OpenBao'], [None])
+
+
 class CommandLine(unittest.TestCase):
     """The conventions in AGENTS.md "CLI conventions"."""
 
@@ -4005,3 +4053,6 @@ class Jobs(unittest.TestCase):
 def yaml_load(text):
     import yaml as pyyaml
     return pyyaml.safe_load(text)
+
+
+ManagedCopy.run_main = CommandLine.run_main

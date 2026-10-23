@@ -645,7 +645,7 @@ def cmd_app(a):
     deployed = registration(name) if app['root'] else app['spec']
     keys = {block: llm_key_state(name, block, deployed)
             for block, svc in app['services'].items() if (svc or {}).get('type') == 'llm'}
-    left = signin_left(soft=True)
+    left = None if install_method() == 'managed' else signin_left(soft=True)
     step = ('merge deploy/ (app.yaml, base/, dev/) to main; the platform then registers the app '
             '(`magehand status` follows it)' if deployed is None else None)
     if a.json:
@@ -668,7 +668,9 @@ def cmd_app(a):
     print(f'{name}  (code: {"davidlarrimore/" + source if source else "homelab-apps apps/" + name + "/image"};'
           f' deployment: {deployment})')
     print(f'  dev:      https://{name}-dev.{LAB}')
-    if left == UNREACHABLE:
+    if install_method() == 'managed':
+        pass  # OpenClaw's VM: no sign-in to report, and nothing it does needs one
+    elif left == UNREACHABLE:
         print(f'  sign-in:  unknown ({OPENBAO} is not reachable)')
     elif left is None:
         print('  sign-in:  not signed in (`magehand login`; run needs it for LLM keys)')
@@ -2529,14 +2531,22 @@ def cmd_doctor(a):
         check('GitHub access', github_file(APPS_REPO, 'catalog.yaml', required=False) is not None)
     except SystemExit:
         check('GitHub access', False, '`gh auth login`')
-    try:
-        reach = urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
-    except (OSError, urllib.error.HTTPError):
-        reach = False
-    check(f'reach {OPENBAO}', reach, NOT_SET_UP)
-    left = signin_left() if reach else None
-    check('signed in to OpenBao' + (f', {minutes(left)} left' if left is not None else ''), left is not None,
-          '`magehand login`')
+    managed = install_method() == 'managed'
+    if managed:  # OpenClaw's VM: no OpenBao and no passkey, and nothing it does needs them
+        note = 'OpenBao and sign-in: not used in OpenClaw\'s VM (the platform gives apps their keys)'
+        results.append({'check': 'OpenBao', 'ok': None, 'hint': note})
+        if not a.json:
+            print(f'--   {note}')
+        left = None
+    else:
+        try:
+            reach = urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
+        except (OSError, urllib.error.HTTPError):
+            reach = False
+        check(f'reach {OPENBAO}', reach, NOT_SET_UP)
+        left = signin_left() if reach else None
+        check('signed in to OpenBao' + (f', {minutes(left)} left' if left is not None else ''), left is not None,
+              '`magehand login`')
     if left is not None and left < SIGNIN_WARN:
         note = f'sign-in has {minutes(left)} left; `magehand login` renews it before a long task'
         results.append({'check': 'sign-in time left', 'ok': None, 'hint': note})
@@ -2579,6 +2589,9 @@ def cmd_doctor(a):
     step = next((r['hint'] for r in results if r['ok'] is False), None)
     if a.json:
         print(json.dumps({'ok': ok, 'checks': results, 'runtime': chosen, 'next': step}, indent=1))
+    elif managed:
+        print('--   container runtime: not used in OpenClaw\'s VM (CI builds and tests the app)')
+        print(next_line(step))
     else:
         print(f'{"ok  " if chosen else "--  "} container runtime: {chosen or "none"}'
               + ('' if chosen else f' (needed only for local postgres/redis blocks and run --container: '
@@ -3648,6 +3661,28 @@ def install_method(prefix=None, base_prefix=None):
     if '/pipx/venvs/' in prefix + '/':
         return 'pipx'
     return 'venv' if prefix != base_prefix else 'unknown'
+
+
+# OpenClaw's VM (the managed copy) has GitHub as the bot and read-only kubectl, but no container runtime, no
+# route to OpenBao and no passkey: these commands can't work there. Each says why and what does the job instead.
+NOT_IN_VM = 'OpenClaw\'s VM has no container runtime and no OpenBao sign-in'
+MANAGED_REFUSALS = {
+    'run': (f"can't run the app here: {NOT_IN_VM}. CI runs its tests (the Dockerfile's test stage) and the "
+            'browser check on every push', '`magehand check`, then push'),
+    'dev': (f"no local blocks here: {NOT_IN_VM}. The app's dev deploy has real ones", '`magehand check`, then push'),
+    'bucket': (f"can't reach the app's bucket here: {NOT_IN_VM} for its keys", 'ask the owner to run it'),
+    'login': ("nothing to sign in to here: only the owner's passkey signs in, and the platform gives the app its "
+              'keys itself', None),
+    'setup': ('this machine is set up by the platform (homelab platform/openclaw/vm/provision.sh)', None),
+}
+
+
+def refuse_if_managed(command):
+    """Exit 1 with why and what to do instead when `command` can't work in the managed copy."""
+    if install_method() == 'managed' and command in MANAGED_REFUSALS:
+        why, step = MANAGED_REFUSALS[command]
+        print(f'magehand: {why}\n{next_line(step)}', file=sys.stderr)  # why first, then what to do
+        sys.exit(1)
 
 
 def update_notice():
@@ -4917,6 +4952,7 @@ def main(argv=None):
         os.environ['MAGEHAND_RUNTIME'] = a.runtime_flag
     if a.command not in ('upgrade', 'version', 'help'):
         update_notice()
+    refuse_if_managed(a.command)
     try:
         a.func(a)
     except KeyboardInterrupt:
