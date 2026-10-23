@@ -160,20 +160,31 @@ def github_dir(repo, path, ref='main'):
 
 
 def github_listing(repo, path, ref='main'):
-    """(names, None) in a directory on main; ([], None) when it doesn't exist (HTTP 404); (None, why) when GitHub
-    couldn't be asked (rate limit, authorization, network), which github_dir() reports as empty."""
-    req = urllib.request.Request(
-        f'https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref)}',
-        headers={'Authorization': f'Bearer {github_token()}', 'Accept': 'application/vnd.github+json',
-                 'User-Agent': 'magehand'})
+    """(names, None) in a directory on main through gh, as the rest of status reads GitHub; ([], None) when it
+    doesn't exist (HTTP 404); (None, why) when it couldn't be read. github_dir() reports both as empty."""
+    code, out, err = gh_probe('api', f'repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref)}')
+    if code != 0:
+        return ([], None) if code is not None and 'HTTP 404' in err else (None, err or 'gh failed')
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310  # fixed https URL
-            got = json.load(resp)
-    except urllib.error.HTTPError as error:
-        return ([], None) if error.code == 404 else (None, f'HTTP {error.code}')
-    except (OSError, ValueError) as error:
-        return None, str(error) or 'GitHub did not answer'
+        got = json.loads(out or '[]')
+    except ValueError:
+        return None, 'unreadable answer from GitHub'
     return (sorted(item['name'] for item in got if isinstance(item, dict)), None) if isinstance(got, list) else ([], None)
+
+
+def registration_lookup(name):
+    """(spec, None) of the app's homelab-apps apps/<name>/app.yaml on main; (None, None) when it isn't registered
+    (HTTP 404); (None, why) when it couldn't be read. registration() exits on that, which status can't afford."""
+    if APPS_DIR:
+        return registration(name), None
+    code, out, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
+                              f'repos/{APPS_REPO}/contents/apps/{name}/app.yaml')
+    if code != 0:
+        return (None, None) if code is not None and 'HTTP 404' in err else (None, err or 'gh failed')
+    try:
+        return yaml.safe_load(out) or {}, None
+    except yaml.YAMLError:
+        return None, f'apps/{name}/app.yaml is not valid YAML'
 
 
 # --- The app ------------------------------------------------------------------
@@ -846,7 +857,7 @@ def prod_stage(tag, ahead, prs):
     """Prod: the latest eligible release, whether its deploy PR merged, and the commits on main since."""
     if not tag:
         return {'stage': 'prod', 'state': 'unknown',
-                'text': "no release yet (the owner's GitHub Release vX.Y.Z deploys to prod)"}
+                'text': "no release yet (the owner's GitHub Release vX.Y.Z deploys to prod)", 'released': False}
     since = f'  ({ahead} commit{"" if ahead == 1 else "s"} on main since {tag})' if ahead else ''
     mine = [p for p in prs or [] if (PROD_TITLE.search(p.get('title') or '') or [None, None])[1] == tag]
     if mine and mine[0].get('state') == 'MERGED':
@@ -1089,6 +1100,7 @@ def lifecycle_stages(repo, name):
                       'invitations need admin)'}
     else:
         repo_stage = {'state': 'ok', 'text': f'set up: private, {BOT} can write, approval ruleset on main'}
+    spec, unregistered_why = registration_lookup(name)
     listings = {path: github_listing(repo, path) for path in (DEPLOY, f'{DEPLOY}/base', f'{DEPLOY}/dev')}
     unread = next((f'{path}: {why}' for path, (_, why) in listings.items() if why), None)
     names = {path: names or [] for path, (names, _) in listings.items()}
@@ -1096,19 +1108,29 @@ def lifecycle_stages(repo, name):
         (f'{DEPLOY}/app.yaml', 'app.yaml' in names[DEPLOY]),
         (f'{DEPLOY}/base/', any(n.endswith(('.yaml', '.yml')) for n in names[f'{DEPLOY}/base'])),
         (f'{DEPLOY}/dev/', 'kustomization.yaml' in names[f'{DEPLOY}/dev'])) if not there]
+    pinned = bool(pinned_source(spec or {}))
     if unread:  # a failed lookup is not a missing file
         config = {'state': 'error', 'text': f'cannot read {DEPLOY}/ on main ({unread})',
                   'next': f'fix the access problem it names, then `magehand status {name}` again'}
-    elif missing:
+    elif not missing:
+        config = {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/)'}
+    elif spec is not None and not pinned:  # an older layout: the deployment is in homelab-apps, not the repo
+        config = {'state': 'unknown', 'text': f'no {DEPLOY}/ on main: the deployment is homelab-apps apps/{name}/'}
+    elif spec is not None:
+        config = {'state': 'failed', 'text': f'missing on main: {", ".join(missing)} (the next deploy reads them)',
+                  'next': 'restore them (`magehand guide search deploy`), `magehand check`, then merge a PR'}
+    else:
         config = {'state': 'pending', 'text': f'not on main yet: {", ".join(missing)}',
                   'next': 'write them (`magehand guide search deploy`), `magehand check`, then merge a PR'}
-    else:
-        config = {'state': 'ok', 'text': f'{DEPLOY}/ on main (app.yaml, base/, dev/)'}
-    spec = registration(name)
-    if spec is None:
-        register = {'state': 'pending', 'text': 'not registered yet: ' + (
-            'the platform registers it within about 5 minutes of the merge' if not missing else
-            f'it registers itself once {DEPLOY}/ is on main'), 'next': None if missing else f'`magehand status {name} --watch`'}
+    if unregistered_why:
+        register = {'state': 'error', 'text': f'cannot read the registration ({unregistered_why})',
+                    'next': f'fix the access problem it names, then `magehand status {name}` again'}
+    elif spec is None:
+        on_main = config['state'] == 'ok'
+        register = {'state': 'pending', 'text': 'not registered yet' + (
+            ': the platform registers it within about 5 minutes of the merge' if on_main else
+            f': it registers itself once {DEPLOY}/ is on main' if config['state'] == 'pending' else ''),
+            'next': f'`magehand status {name} --watch`' if on_main else None}
     else:
         blocks = ', '.join(f'{b} ({(svc or {}).get("type")})' for b, svc in (spec.get('services') or {}).items())
         register = {'state': 'ok', 'text': f'registered; blocks: {blocks or "none"}'}
@@ -1121,22 +1143,24 @@ def status_next(report, failed, done):
     the checkout's."""
     app = report['app']
     watch = f'magehand status {app} --watch'
-    for st in report['stages']:  # the lifecycle comes first: its stages carry their own next step
-        if st['state'] in ('failed', 'pending', 'error') and st.get('next'):
-            return st['next']
-    for st in report['stages']:
-        if st['state'] == 'error':
-            return f'fix the access problem it names, then `magehand status {app}` again'
-        if st['state'] == 'failed':
+    for st in report['stages']:  # a failure anywhere comes before anything that is only waiting
+        if st['state'] in ('failed', 'error'):
+            if st.get('next'):
+                return st['next']
+            if st['state'] == 'error':
+                return f'fix the access problem it names, then `magehand status {app}` again'
             return {'build': f'fix the failed build (its run is linked above), push, then `{watch}`',
                     'deploy': "tell the owner: the platform's dev deploy PR failed",
                     'dev': f'fix what the dev line says, push, then `{watch}`'}.get(st['stage'], 'fix what that line says')
+    for st in report['stages']:  # then the lifecycle's own steps (config to write, an invitation to accept)
+        if st['state'] == 'pending' and st.get('next'):
+            return st['next']
     if report.get('timeout') or not done:
         return f'`{watch}` (waits for the build and the dev deploy)'
     prod = next((st for st in report['stages'] if st['stage'] == 'prod'), None)
     if prod and prod.get('ahead'):
         return f'`magehand release {app} --dry-run`: dev runs commits production does not have yet'
-    if prod and prod['text'].startswith('no release yet'):
+    if prod and prod.get('released') is False:
         return f'when it is ready for production: `magehand release {app} --dry-run`'
     return None
 
@@ -1158,7 +1182,7 @@ def code_repo(app):
 
 
 def status_target(name=None):
-    """(app, OWNER/REPO) for status, without loading the app's Deployment: a new app's checkout has none yet,
+    """(app name, OWNER/REPO) for status, without loading the app's Deployment: a new app's checkout has none yet,
     and status is where it learns what's missing."""
     name = name or current_app()
     root = repo_root(name)
@@ -1170,27 +1194,28 @@ def status_target(name=None):
         source = (spec.get('source') or {}).get('repo')
         if not source:
             die(f'{name} has no code repo (its image is built in homelab-apps), so there is no main to follow')
-    return {'name': name}, f'{OWNER}/{source}'
+    return name, f'{OWNER}/{source}'
 
 
 def cmd_status(a):
-    app, repo = status_target(a.app_flag or a.app)
+    name, repo = status_target(a.app_flag or a.app)
     deadline = time.monotonic() + a.timeout * 60
     last = None
-    lifecycle, polls = lifecycle_stages(repo, app['name']), 0
+    lifecycle, polls = lifecycle_stages(repo, name), 0
     while True:
-        if polls and any(st['state'] != 'ok' for st in lifecycle):
-            lifecycle = lifecycle_stages(repo, app['name'])  # registration or an invitation can land mid-watch
-        report = collect_status(repo, app['name'], cluster=not a.no_cluster)
+        if polls and any(st['state'] == 'pending' for st in lifecycle):
+            lifecycle = lifecycle_stages(repo, name)  # registration or an invitation can land mid-watch
+        report = collect_status(repo, name, cluster=not a.no_cluster)
         report['stages'] = lifecycle + report['stages']
         # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
         states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev')]
-        failed = 'failed' in states or any(st['state'] == 'error' for st in report['stages']) \
-            or any(st['state'] == 'failed' for st in lifecycle)
+        stopped = 'failed' in states or any(st['state'] == 'error' for st in report['stages'])
+        waiting = [st['stage'] for st in report['stages'] if st['state'] == 'pending'
+                   and (st['stage'] in ('build', 'deploy', 'dev') or st in lifecycle)]
         done = all(st == 'ok' for st in states if st != 'unknown') and len(
             [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2 \
             and not any(st['state'] == 'pending' for st in lifecycle)  # an invitation, config or registration
-        if not a.watch or failed or done:
+        if not a.watch or stopped or done:  # a repo-setup problem doesn't stop the watch: the deploy goes on
             break
         if time.monotonic() > deadline:
             report['timeout'] = True
@@ -1201,7 +1226,8 @@ def cmd_status(a):
             last = text
         time.sleep(a.interval)
         polls += 1
-    report['ok'] = done and not failed  # build and the dev deploy both finished for the newest commit
+    failed = stopped or any(st['state'] == 'failed' for st in lifecycle)
+    report['ok'] = done and not failed  # set up, registered, and built and deployed to dev for the newest commit
     report['next'] = status_next(report, failed, done)
     if a.json:
         print(json.dumps(report, indent=1))
@@ -1209,8 +1235,8 @@ def cmd_status(a):
         print(render_status(report))
         print(next_line(report['next']))
         if report.get('timeout'):
-            print(f'magehand: still not deployed to dev after {a.timeout} min; run it again to keep waiting',
-                  file=sys.stderr)
+            print(f'magehand: still waiting after {a.timeout} min for: {", ".join(waiting) or "the dev deploy"}; '
+                  'run it again to keep waiting', file=sys.stderr)
     sys.exit(1 if failed or report.get('timeout') else 0)
 
 
@@ -4821,12 +4847,16 @@ def build_parser():
                 '  magehand app --json')
     app_option(p)
     json_option(p)
-    p = command('status', cmd_status, 'where a merge to main has got to: build, dev, prod', "show an app's build, dev deploy and prod release for its latest main commit",
-                'Reads GitHub through gh and, when kubectl has a context, the dev pods and Argo application (read-only\n'
-                '`kubectl get`; --no-cluster skips it). The dev line says whether the pods run the image the deploy\n'
-                'PR pinned; without kubectl it only says the deploy merged.\n'
-                '--watch waits until build, the dev deploy and (when readable) the pods are done; exit 1 on a\n'
-                'failed stage or a timeout.\n\n'
+    p = command('status', cmd_status, 'where the app is: set up, registered, built, on dev and prod',
+                "show where an app is: its repo's setup, deploy/ on main, registration, then its latest main "
+                "commit's build, dev deploy and prod release",
+                'One line per stage, each ok or saying what blocks it, then `next:`. First the lifecycle, from GitHub:\n'
+                "repo (private, OpenClaw's bot can write, the approval ruleset), config (deploy/ on main) and\n"
+                "register (the platform registered it). Then main's build, dev deploy and prod, and, when kubectl has\n"
+                'a context, the dev pods and Argo application (read-only `kubectl get`; --no-cluster skips it).\n'
+                '--watch waits until the dev deploy (and, when readable, the pods) is done and nothing in the\n'
+                'lifecycle is pending (an invitation, config, registration). Exit 1 on a failed stage, a repo\n'
+                'that is not set up, or a timeout.\n\n'
                 'examples:\n  magehand status\n  magehand status elvis --json\n'
                 '  magehand status --watch            wait for the merge to reach dev')
     app_option(p)
