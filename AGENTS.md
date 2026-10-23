@@ -16,7 +16,8 @@
   bot with write and the approval ruleset, made true on any non-archived repo
   from the template; it never removes anything, edits an existing ruleset or
   changes visibility), `magehand pr ready` (a green PR marked ready and
-  OpenClaw's review requested, then read back) and `magehand release` (a tag
+  OpenClaw's review requested, then read back; as whoever `gh` is signed in
+  as) and `magehand release` (a tag
   and release on an app's repo), both as the owner through `gh`, and
   `magehand bucket cp` / `sync`, which put objects into that app's own
   bucket only (the app of the checkout you are in; `--app` may only name it), on an explicit command, with the keys of the environment

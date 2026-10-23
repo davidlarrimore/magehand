@@ -5,7 +5,8 @@ the MacBook) and by OpenClaw's coding workers. `magehand --help` lists the
 commands; `magehand COMMAND --help` explains each, with examples.
 
 Its writes are `magehand new` (an app's repo on GitHub) and `magehand release` (a tag and release on an
-app's repo), both as the owner.
+app's repo), both as the owner, and `magehand pr ready` (a PR marked ready and its review requested), as
+whoever gh is signed in as.
 
 Private by design: it talks only to GitHub and the private *.lab network,
 never to a public homelab endpoint. Everyday commands assume they can
@@ -811,14 +812,9 @@ def build_stage(runs, head):
 
 
 def failing_checks(rollup):
-    """Names of the failed entries of a PR's statusCheckRollup: CheckRuns (conclusion, name) and
-    StatusContexts (state, context) both appear in it."""
-    names = []
-    for c in rollup or []:
-        if c.get('conclusion') in ('FAILURE', 'CANCELLED', 'TIMED_OUT', 'STARTUP_FAILURE') \
-                or c.get('state') in ('FAILURE', 'ERROR'):
-            names.append(c.get('name') or c.get('context') or '?')
-    return names
+    """Names of the finished entries of a PR's statusCheckRollup that aren't a pass (not_green_checks without
+    the result): CheckRuns (conclusion, name) and StatusContexts (state, context) both appear in it."""
+    return [entry.rsplit(' (', 1)[0] for entry in not_green_checks(rollup)]
 
 
 # A finished check is a pass only with one of these conclusions (GitHub's CheckConclusionState): anything
@@ -834,7 +830,7 @@ def not_green_checks(rollup):
         name = c.get('name') or c.get('context') or '?'
         if c.get('state') in ('FAILURE', 'ERROR'):
             out.append(f'{name} ({c["state"].lower()})')
-        elif c.get('status') == 'COMPLETED' and c.get('conclusion') not in GREEN_CONCLUSIONS:
+        elif (c.get('conclusion') or c.get('status') == 'COMPLETED') and c.get('conclusion') not in GREEN_CONCLUSIONS:
             out.append(f'{name} ({(c.get("conclusion") or "no conclusion").lower()})')
     return out
 
@@ -1291,7 +1287,8 @@ PR_MERGE = re.compile(r'^Merge pull request #(\d+)')
 BREAKING_FOOTER = re.compile(r'^BREAKING[ -]CHANGE:', re.MULTILINE)
 KINDS = (('breaking', 'Breaking changes'), ('feature', 'Features'), ('fix', 'Fixes'), ('other', 'Other changes'))
 BUMP_OF = {'breaking': 'major', 'feature': 'minor', 'fix': 'patch', 'other': 'patch'}
-FAILED_CHECK = ('failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required')
+# A finished run (the REST API's lowercase conclusion) that isn't a pass: the same rule as GREEN_CONCLUSIONS.
+FAILED_CHECK = ('failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale')
 
 
 def classify_change(subject, body='', labels=()):
@@ -2009,8 +2006,8 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     if not private:
         steps.append(f'run:   gh repo edit {repo} --visibility private --accept-visibility-change-consequences')
     if bot == 'invited':
-        steps.append('wait:  OpenClaw accepts the invitation within about 5 minutes; then request its review '
-                     f'again (gh pr edit N --add-reviewer {BOT}) and check it took: gh pr view N --json reviewRequests')
+        steps.append('wait:  OpenClaw accepts the invitation within about 5 minutes; then `magehand pr ready N` '
+                     'on open PRs (it requests the review and confirms it)')
     if ruleset == 'weak':
         steps.append(f"do:    fix the ruleset '{RULESET['name']}' in the repo's Settings > Rules (magehand leaves an "
                      'existing ruleset alone)')
@@ -4786,63 +4783,71 @@ def cmd_pr(a):
     target = [str(a.number)] if a.number else []
     pr, err = gh_query('pr', 'view', *target, '--json', PR_FIELDS)
     if err:
-        die(f'cannot read {"PR #" + str(a.number) if a.number else "the PR for this branch"}: {err} '
-            '(open one with `gh pr create --draft`, or pass its number)')
-    number, repo = pr['number'], '/'.join(pr['url'].split('/')[3:5])
+        die(f'cannot read {"PR #" + str(a.number) if a.number else "the PR for this branch"}: {err}'
+            + (' (open one with `gh pr create --draft`, or pass its number)' if 'no pull requests found' in err
+               else ' (`gh auth status`; is the PR in this repo?)'))
+    number, repo, head = pr['number'], '/'.join(pr['url'].split('/')[3:5]), pr.get('headRefOid')
+    changed = []
+
+    def finish(ok, why, step, recorded=None):
+        """The result: what changed, why it stopped (if it did) and the next step; exit 1 unless ok."""
+        if a.json:
+            print(json.dumps({'pr': number, 'url': pr['url'], 'ok': ok, 'changed': changed,
+                              'requested': requested(pr) if recorded is None else recorded, 'why': why, 'next': step}))
+        else:
+            print(f'PR #{number}: ' + '; '.join(changed + ([why] if why else [])) if changed or why else
+                  f'PR #{number}: nothing to do')
+            print(next_line(step))
+        sys.exit(0 if ok else 1)
+
     if pr['state'] != 'OPEN':
         die(f'PR #{number} is {pr["state"].lower()}: only an open PR can be readied')
-    failing, running = not_green_checks(pr.get('statusCheckRollup')), pending_checks(pr.get('statusCheckRollup'))
-    if failing or running or not pr.get('statusCheckRollup'):
-        why = (f'its checks are not green: {", ".join(failing)}' if failing else
-               f'its checks are still running: {", ".join(running)}' if running else 'no checks have reported yet')
-        step = ('fix them and push, then `magehand pr ready ' + str(number) + '` again' if failing else
-                f'`gh pr checks {number} --watch`, then `magehand pr ready {number}` again')
-        if a.json:
-            print(json.dumps({'pr': number, 'ready': False, 'requested': requested(pr), 'why': why, 'next': step}))
-        else:
-            print(f'PR #{number}: not readied, {why}')
-            print(next_line(step))
-        sys.exit(1)
-    changed = []
-    if pr.get('isDraft'):
-        code, _, err = gh_cli('pr', 'ready', str(number), '-R', repo)
-        if code != 0:
-            die(f'gh could not mark PR #{number} ready: {err}')
-        changed.append('marked ready for review')
+    rollup = pr.get('statusCheckRollup')
+    failing, running = not_green_checks(rollup), pending_checks(rollup)
+    if failing or running or not rollup:
+        finish(False, f'not readied: its checks are not green: {", ".join(failing)}' if failing else
+               f'not readied: its checks are still running: {", ".join(running)}' if running else
+               'not readied: no checks have reported yet',
+               f'fix them and push, then `magehand pr ready {number}` again' if failing else
+               f'`gh pr checks {number} --watch`, then `magehand pr ready {number}` again')
     own = (pr.get('author') or {}).get('login', '').lower() == BOT.lower()  # OpenClaw's own PR: the owner reviews it
+    # The request first, on the draft (OpenClaw ignores drafts), confirmed; only then mark it ready, so a request
+    # that didn't stick never leaves a ready PR without its reviewer.
     if not own and not requested(pr):
         code, _, err = gh_cli('pr', 'edit', str(number), '-R', repo, '--add-reviewer', BOT)
         if code != 0:
-            die(f'gh could not request {BOT} on PR #{number}: {err}')
-        pr, err = gh_query('pr', 'view', str(number), '-R', repo, '--json', PR_FIELDS)
-        if err or not requested(pr):  # the silent failure: say why, from the bot's access to the repo
-            access, _ = (None, None) if err else bot_access(repo)
-            why = (f'could not read the PR back to confirm it ({err})' if err else
-                   {'missing': f'{BOT} is not a collaborator on {repo}',
-                    'read': f'{BOT} can only read {repo}',
-                    'invited': f'{BOT} has not accepted its invitation to {repo} yet'}.get(
-                        access, 'GitHub did not record the request'))
-            step = ('wait about 5 minutes, then `magehand pr ready ' + str(number) + '` again' if access == 'invited'
-                    else f'ask the owner to run `magehand new {repo.split("/", 1)[1]}` (it repairs the repo), then '
-                         f'`magehand pr ready {number}` again')
-            if a.json:
-                print(json.dumps({'pr': number, 'ready': True, 'requested': False, 'changed': changed, 'why': why,
-                                  'next': step}))
-            else:
-                print(f'PR #{number}: ' + (', '.join(changed) + '; ' if changed else '')
-                      + f'review request {"not confirmed" if err else "NOT recorded"}: {why}')
-                print(next_line(step))
-            sys.exit(1)
+            finish(False, f'could not request {BOT}: {err or "gh failed"}', f'`magehand pr ready {number}` again')
+        back, err = gh_query('pr', 'view', str(number), '-R', repo, '--json', PR_FIELDS)
+        if err:
+            finish(False, f'requested {BOT}, but could not read the PR back to confirm it ({err})',
+                   f'`magehand pr ready {number}` again', recorded=None)
+        pr = back
+        if not requested(pr):  # the silent failure: say why, from the bot's access to the repo
+            access, _ = bot_access(repo)
+            mine = repo.split('/', 1)[0].lower() == OWNER.lower()
+            fix = (f'ask the owner to run `magehand new {repo.split("/", 1)[1]}` (it repairs the repo)' if mine else
+                   f"ask {repo.split('/', 1)[0]} to add {BOT} with write")
+            why, step = {
+                'missing': (f'{BOT} is not a collaborator on {repo}', fix),
+                'read': (f'{BOT} can only read {repo}', fix),
+                'invited': (f'{BOT} has not accepted its invitation to {repo} yet', 'wait about 5 minutes')}.get(
+                    access, ('GitHub did not record the request, though the bot can write', 'request it on the PR page'))
+            finish(False, f'review request NOT recorded: {why}; the PR stays as it was',
+                   f'{step}, then `magehand pr ready {number}` again', recorded=False)
         changed.append(f'requested {BOT} (confirmed)')
-    step = ('the owner reviews and merges it (OpenClaw does not review its own PRs)' if own else
-            "wait for OpenClaw's review (it starts within about 5 minutes); the owner merges")
-    if a.json:
-        print(json.dumps({'pr': number, 'url': pr['url'], 'ready': True, 'requested': requested(pr), 'own': own,
-                          'changed': changed, 'next': step}))
-    else:
-        print(f'PR #{number}: ' + ('; '.join(changed) if changed else 'already ready, and its review requested'))
-        print(next_line(step))
-
+    if pr.get('headRefOid') != head:  # a push since the checks were read: those checks are for another commit
+        finish(False, 'a new commit arrived: its checks have not run', f'`gh pr checks {number} --watch`, then '
+               f'`magehand pr ready {number}` again')
+    if pr.get('isDraft'):
+        code, _, err = gh_cli('pr', 'ready', str(number), '-R', repo)
+        if code != 0:
+            finish(False, f'could not mark it ready: {err or "gh failed"}', f'`magehand pr ready {number}` again')
+        changed.append('marked ready for review')
+    if own:
+        finish(True, None if changed else "already ready; OpenClaw's own PR, so no review is requested",
+               'the owner reviews and merges it (OpenClaw does not review its own PRs)')
+    finish(True, None if changed else 'already ready, and its review requested',
+           "wait for OpenClaw's review (it starts within about 5 minutes); the owner merges")
 
 def cmd_job(a):
     app = job_app(a.app_flag)

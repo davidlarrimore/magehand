@@ -1811,7 +1811,7 @@ class New(unittest.TestCase):
         self.assertIn("ruleset 'main: owner approves' added", err.getvalue())
         left = out.getvalue()
         self.assertIn('--visibility private', left)
-        self.assertIn('--add-reviewer davidlarrimore-bot', left)
+        self.assertIn('magehand pr ready N', left)
         self.assertNotIn('write: the code', left)  # not the new-repo steps
 
     def test_a_read_only_or_invited_bot_is_given_write_again(self):
@@ -2521,13 +2521,15 @@ class PrReady(unittest.TestCase):
     GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
 
     def run_pr(self, checks=GREEN, draft=True, author='davidlarrimore', requested_before=False, sticks=True,
-               access='write'):
-        state = {'requested': requested_before}
+               access='write', pushed=False, owner='davidlarrimore', json_out=False):
+        state = {'requested': requested_before, 'reads': 0}
         writes = []
 
         def pr():
-            return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': 'OPEN',
-                    'isDraft': draft, 'headRefOid': 'a' * 40, 'author': {'login': author}, 'statusCheckRollup': checks,
+            state['reads'] += 1
+            head = 'b' * 40 if pushed and state['reads'] > 1 else 'a' * 40
+            return {'number': 12, 'url': f'https://github.com/{owner}/demo/pull/12', 'state': 'OPEN',
+                    'isDraft': draft, 'headRefOid': head, 'author': {'login': author}, 'statusCheckRollup': checks,
                     'reviewRequests': [{'login': magehand.BOT}] if state['requested'] else []}
 
         def gh(*args, **kw):
@@ -2538,7 +2540,7 @@ class PrReady(unittest.TestCase):
         with mock.patch.object(magehand, 'gh_query', lambda *a: (pr(), None)), \
                 mock.patch.object(magehand, 'gh_cli', gh), \
                 mock.patch.object(magehand, 'bot_access', lambda repo: (access, '')):
-            code, out, _ = CommandLine.run_main(self, 'pr', 'ready', '12')
+            code, out, _ = CommandLine.run_main(self, 'pr', 'ready', '12', *(['--json'] if json_out else []))
         return code, out, writes
 
     def test_refuses_until_checks_are_green(self):
@@ -2562,23 +2564,38 @@ class PrReady(unittest.TestCase):
                                {'context': 'policy', 'state': 'SUCCESS'}]
         self.assertEqual(self.run_pr(checks=checks)[0], 0)
 
-    def test_readies_requests_and_confirms(self):
+    def test_requests_confirms_then_readies(self):
+        # the request first, on the draft: a request that didn't stick never leaves a ready PR without its reviewer
         code, out, writes = self.run_pr()
         self.assertEqual(code, 0)
-        self.assertEqual([w[:2] for w in writes], [('pr', 'ready'), ('pr', 'edit')])
-        self.assertIn('--add-reviewer', writes[1])
+        self.assertEqual([w[:2] for w in writes], [('pr', 'edit'), ('pr', 'ready')])
+        self.assertIn('--add-reviewer', writes[0])
         self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
         self.assertIn("wait for OpenClaw's review", out.splitlines()[-1])
 
-    def test_a_request_that_did_not_stick_says_why(self):
+    def test_a_request_that_did_not_stick_says_why_and_leaves_the_draft(self):
         for access, why, step in (('missing', 'is not a collaborator', 'magehand new demo'),
                                   ('read', 'can only read', 'magehand new demo'),
-                                  ('invited', 'has not accepted', 'wait about 5 minutes')):
-            code, out, _ = self.run_pr(sticks=False, access=access)
+                                  ('invited', 'has not accepted', 'wait about 5 minutes'),
+                                  ('write', 'though the bot can write', 'request it on the PR page'),
+                                  (None, 'though the bot can write', 'request it on the PR page')):
+            code, out, writes = self.run_pr(sticks=False, access=access)
             self.assertEqual(code, 1, access)
+            self.assertEqual([w[:2] for w in writes], [('pr', 'edit')], access)  # not marked ready
             self.assertIn('NOT recorded', out)
             self.assertIn(why, out)
             self.assertIn(step, out.splitlines()[-1])
+        # another owner's repo: magehand new can't repair it
+        _, out, _ = self.run_pr(sticks=False, access='missing', owner='someone')
+        self.assertIn(f'ask someone to add {magehand.BOT} with write', out)
+        report = json.loads(self.run_pr(sticks=False, access='missing', json_out=True)[1])
+        self.assertEqual((report['ok'], report['requested'], report['changed']), (False, False, []))
+
+    def test_a_push_after_the_checks_were_read_is_refused(self):
+        code, out, writes = self.run_pr(pushed=True)
+        self.assertEqual(code, 1)
+        self.assertIn('a new commit arrived', out)
+        self.assertNotIn(('pr', 'ready'), [w[:2] for w in writes])
 
     def test_nothing_to_do_and_openclaws_own_prs(self):
         code, out, writes = self.run_pr(draft=False, requested_before=True)
@@ -2587,6 +2604,9 @@ class PrReady(unittest.TestCase):
         code, out, writes = self.run_pr(author=magehand.BOT)
         self.assertEqual([w[:2] for w in writes], [('pr', 'ready')])  # never requests the author's own review
         self.assertIn('the owner reviews', out.splitlines()[-1])
+        code, out, writes = self.run_pr(author=magehand.BOT, draft=False)
+        self.assertEqual((code, writes), (0, []))
+        self.assertIn('no review is requested', out)
 
 
 class ManagedCopy(unittest.TestCase):
