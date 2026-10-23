@@ -1798,6 +1798,256 @@ def ensure_ruleset(repo):
     return 'failed'
 
 
+# --- the scaffold: a deployable app on day one -----------------------------------------
+# `new` writes these into the repo's checkout when they are missing (never over a file that exists), so the
+# first PR can register the app and create its blocks before any feature code. The app is a small Python
+# server (stdlib only) with /healthz, laid out like the platform's other apps; replace it freely.
+
+SCAFFOLD_PYTHON = ('python:3.14-alpine@sha256:'
+                   '9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01')
+
+SCAFFOLD_FILES = {
+    'Dockerfile': """\
+FROM {python} AS base
+WORKDIR /app
+COPY app.py /app/app.py
+
+# The build runs this stage's tests before it builds the image (homelab-apps build-app.yaml).
+FROM base AS test
+COPY tests/ /app/tests/
+RUN python -B -m unittest discover -s tests
+
+FROM base AS runtime
+USER 65532
+CMD ["python", "-B", "/app/app.py"]
+""",
+    '.dockerignore': '.git\n.github\n.venv\n__pycache__\n**/__pycache__\n.env\n.env.*\n',
+    'app.py': '''\
+"""{app}: a starting point written by `magehand new`. Replace it freely; keep /healthz (the pod's probes)."""
+import html
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("PORT", "8000"))
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            return self.reply(200, "text/plain", "ok")
+        if self.path in ("/", "/index.html"):
+            # authentik signs the user in and sets X-authentik-* headers (magehand guide search user)
+            user = html.escape(self.headers.get("X-authentik-name") or "there")
+            return self.reply(200, "text/html; charset=utf-8",
+                              f"<!doctype html><title>{app}</title><h1>{app}</h1><p>Hello, {{user}}.</p>")
+        return self.reply(404, "text/plain", "not found")
+
+    def reply(self, status, kind, body):
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):  # quiet: the pod's log is for the app's own messages
+        pass
+
+
+if __name__ == "__main__":
+    with ThreadingHTTPServer(("0.0.0.0", PORT), Handler) as server:
+        print(f"{app} listening on :{{PORT}}", flush=True)
+        server.serve_forever()
+''',
+    'tests/test_app.py': '''\
+import threading
+import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+import app
+
+
+class App(unittest.TestCase):
+    def setUp(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{{self.server.server_address[1]}}"
+
+    def test_healthz(self):
+        with urllib.request.urlopen(self.url + "/healthz") as reply:
+            self.assertEqual(reply.read(), b"ok")
+
+    def test_home_greets_the_signed_in_user(self):
+        request = urllib.request.Request(self.url + "/", headers={{"X-authentik-name": "Ada"}})
+        with urllib.request.urlopen(request) as reply:
+            self.assertIn(b"Hello, Ada.", reply.read())
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    'ui-check.yaml': """\
+# The browser check CI runs on every PR (homelab-apps .github/ui-check): each page must render, with these
+# elements visible. Add a page for every screen and the main action (magehand guide search ui-check).
+port: 8000
+headers:
+  X-authentik-uid: ui-check
+  X-authentik-name: UI Check
+pages:
+  - name: home
+    path: /
+    visible: [h1]
+    text: [h1]
+""",
+    'deploy/app.yaml': """\
+# The blocks this app asks the platform for (magehand guide catalog): add them here and map their keys in
+# deploy/base/deployment.yaml env. Merging this file with base/ and dev/ registers the app.
+{app_line}services: {{}}
+""",
+    'deploy/base/kustomization.yaml': """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+""",
+    'deploy/base/deployment.yaml': """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {app}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {app}
+  template:
+    metadata:
+      labels:
+        app: {app}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app  # the platform pins the commit and image on the container named app
+          image: ghcr.io/davidlarrimore/homelab-apps/{app}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: SOURCE_COMMIT
+              value: unknown
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 2
+""",
+    'deploy/base/service.yaml': """\
+apiVersion: v1
+kind: Service
+metadata:
+  name: {app}
+spec:
+  selector:
+    app: {app}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+""",
+    'deploy/base/ingress.yaml': """\
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {app}
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: authentik-forward-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {app}-dev.{lab}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {app}
+                port:
+                  name: http
+""",
+    'deploy/dev/kustomization.yaml': """\
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: {app}-dev
+resources:
+  - ../base
+""",
+}
+# The code files belong together: written only into a repo that has no Dockerfile yet (another stack keeps its own).
+SCAFFOLD_CODE = ('Dockerfile', '.dockerignore', 'app.py', 'tests/test_app.py')
+SCAFFOLD_BASE = tuple(f for f in SCAFFOLD_FILES if f.startswith('deploy/base/'))
+
+
+def scaffold(root, app, repo_name):
+    """Write the scaffold's missing files into the checkout at `root` for app `app`: never over a file that
+    exists, the code only when there is no Dockerfile, the Kustomize base only when deploy/base/ has no
+    manifests. Returns the paths written (relative)."""
+    root = pathlib.Path(root)
+    skip = set()
+    if (root / 'Dockerfile').exists():
+        skip.update(SCAFFOLD_CODE)
+    if any((root / 'deploy' / 'base').glob('*.y*ml')):
+        skip.update(SCAFFOLD_BASE)
+    values = {'app': app, 'lab': LAB, 'python': SCAFFOLD_PYTHON,
+              'app_line': f'app: "{app}"  # the repo is {repo_name}; keep this line\n' if app != repo_name else ''}
+    written = []
+    for rel, text in SCAFFOLD_FILES.items():
+        path = root / rel
+        if rel in skip or path.exists():
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text.format(**values))
+        written.append(rel)
+    return written
+
+
 APP_SEED = ('# This repo is {repo}; the app it deploys is named {app} (its hostnames, namespace and image).\n'
             '# Keep `app:` here: without it the platform names the app after the repo.\n'
             'app: "{app}"\n'  # quoted: true, null and 123 are valid names and not YAML strings bare
@@ -1948,17 +2198,35 @@ def cmd_new(a):
         print(f'{dest}: already exists; not cloned (is it {repo}?)', file=sys.stderr)
     elif cloned == 'failed':
         print(f'{repo}: could not clone it; run `gh repo clone {repo} {shell_path(dest)}`', file=sys.stderr)
-    steps = (new_steps(repo, name, app, dest, named, cloned) if created else
-             repair_steps(repo, private, bot, ruleset, cloned, dest, app, named))
+    # The checkout's own files: the scaffold's missing ones, and AGENTS.md's platform rules (local writes only).
+    candidate = checkout_top() if here else dest if cloned == 'cloned' else None
+    # Only into a checkout of this repo (its origin says so): never a directory that merely has the name.
+    work = candidate if candidate and pathlib.Path(candidate).is_dir() and remote_repo(candidate) == name else None
+    wrote = []
+    if work:
+        wrote = scaffold(work, name if unnamed else app, name)
+        current, text, problem = agents_text(pathlib.Path(work) / 'AGENTS.md')
+        if problem:
+            print(f'magehand: AGENTS.md not refreshed: {problem}', file=sys.stderr)
+        elif text != current:
+            (pathlib.Path(work) / 'AGENTS.md').write_text(text)
+            wrote.append('AGENTS.md')
+        if wrote:
+            print(f'{work}: wrote {", ".join(wrote)} (nothing existing was changed but AGENTS.md\'s platform rules)'
+                  if 'AGENTS.md' in wrote else f'{work}: wrote {", ".join(wrote)}', file=sys.stderr)
+    elif cloned == 'exists':
+        print(f'{dest}: not touched (run `magehand new {name}` in its checkout to add the missing files)', file=sys.stderr)
+    steps = (new_steps(repo, name, app, dest, named, cloned, wrote) if created else
+             repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote))
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
                           'ruleset': ruleset, 'app_name': named, 'clone': cloned,
-                          'dir': str(dest) if cloned in ('cloned', 'exists') else None,
+                          'dir': str(dest) if cloned in ('cloned', 'exists') else None, 'wrote': wrote,
                           'next': step_text(steps[0]) if steps else None}, indent=1))
     elif created:
-        print(new_summary(repo, name, app, dest, named, cloned))
+        print(new_summary(repo, name, app, dest, named, cloned, wrote))
     else:
-        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named))
+        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named, wrote))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
 
@@ -1968,7 +2236,7 @@ def step_text(step):
     return step.split(':', 1)[1].strip() if re.match(r'^[a-z]+:\s', step) else step
 
 
-def new_steps(repo, name, app, dest, named, cloned):
+def new_steps(repo, name, app, dest, named, cloned, wrote=()):
     """The steps `new` leaves you after creating a repo, in order."""
     # run: a command to type, write:/edit: work in the repo, do: a decision or action of yours. A program
     # can't change its parent shell's directory, so `cd` is a step even when it cloned.
@@ -1977,18 +2245,22 @@ def new_steps(repo, name, app, dest, named, cloned):
     if named in ('failed', 'differs'):
         steps.append(f'edit:  make the first line of deploy/app.yaml `app: "{app}"` (the repo still names the app '
                      f'{name})')
-    steps += ['write: the code, and deploy/ (app.yaml and base/)   guide: magehand guide search new app',
-              'run:   magehand check          # the platform\'s rules, before you push',
-              'do:    open a PR and merge it  # the platform deploys what is on main']
+    if wrote:  # the scaffold deploys as it is: the first PR registers the app before any feature code
+        steps += ['do:    commit what new wrote, `magehand check`, `gh pr create --draft`, then `magehand pr ready`; merging it registers the app',
+                  'write: the app (app.py is a starting point)   guide: magehand guide search new app']
+    else:
+        steps += ['write: the code, and deploy/ (app.yaml, base/ and dev/)   guide: magehand guide search new app',
+                  'run:   magehand check          # the platform\'s rules, before you push',
+                  'do:    open a PR and merge it  # the platform deploys what is on main']
     return steps
 
 
-def new_summary(repo, name, app, dest, named, cloned):
+def new_summary(repo, name, app, dest, named, cloned, wrote=()):
     """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
     what the platform does by itself afterwards, then the first step as `next:`. Everything already done went
     to stderr as it happened."""
     live = name if named in ('failed', 'differs') else app
-    steps = new_steps(repo, name, app, dest, named, cloned)
+    steps = new_steps(repo, name, app, dest, named, cloned, wrote)
     lines = ['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
     lines += ['', 'Then, by itself (about 5 minutes after deploy/ with base/ is merged to main):',
               f'  - {live} is registered and deployed to https://{live}-dev.{LAB}/',
@@ -1997,7 +2269,7 @@ def new_summary(repo, name, app, dest, named, cloned):
     return '\n'.join(lines)
 
 
-def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None):
+def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=()):
     """The steps `new` on an existing repo leaves you: only what it could not do itself."""
     steps = []
     if named in ('failed', 'differs'):
@@ -2016,12 +2288,14 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
                      f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
     if cloned == 'failed':
         steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
+    if wrote:
+        steps.append('do:    commit what new wrote, `magehand check`, `gh pr create --draft`, then `magehand pr ready`; merging it registers the app')
     return steps
 
 
-def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None):
+def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=()):
     """What `new` on an existing repo leaves for you (its changes went to stderr as it made them)."""
-    steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named)
+    steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote)
     if not steps:
         return (f'{repo}: set up (private, {BOT} can write, the approval ruleset is on main); nothing left for you\n'
                 + next_line(None))
@@ -3554,21 +3828,29 @@ def split_agents(text):
     return (text[:m.start()], text[m.start():]) if m else (text, None)
 
 
-def cmd_agents(a):
-    path = pathlib.Path(a.code) / 'AGENTS.md'
+def agents_text(path):
+    """(current text or None, the text AGENTS.md should have, problem or None): the template's platform rules
+    above "## This app", this repo's own notes from it down."""
     template = github_file(TEMPLATE_REPO, 'AGENTS.md')
     platform, app = split_agents(template)
     if app is None:
-        die(f'{TEMPLATE_REPO} AGENTS.md has no "{APP_HEADING}" heading; tell the owner')
+        return None, None, f'{TEMPLATE_REPO} AGENTS.md has no "{APP_HEADING}" heading; tell the owner'
     current = path.read_text() if path.is_file() else None
     if current is None:
-        new = template
-    else:
-        _, own = split_agents(current)
-        if own is None:
-            die(f'{path} has no "{APP_HEADING}" heading, so magehand can\'t tell the platform rules from this app\'s '
-                f'notes. Put the heading above the app\'s own notes (see {TEMPLATE_REPO}), then run it again')
-        new = platform + own
+        return None, template, None
+    _, own = split_agents(current)
+    if own is None:
+        return current, None, (f'{path} has no "{APP_HEADING}" heading, so magehand can\'t tell the platform rules '
+                               f'from this app\'s notes. Put the heading above the app\'s own notes (see '
+                               f'{TEMPLATE_REPO}), then run it again')
+    return current, platform + own, None
+
+
+def cmd_agents(a):
+    path = pathlib.Path(a.code) / 'AGENTS.md'
+    current, new, problem = agents_text(path)
+    if problem:
+        die(problem)
     changed = new != current
     step = (('`magehand update-agents`' if a.check else f'review the diff (`git diff {path}`) and commit it')
             if changed else None)
@@ -4938,8 +5220,12 @@ def build_parser():
                 'missing ruleset. It never removes anything, edits an existing ruleset or changes visibility\n'
                 '(a public repo gets a warning and the command), leaves an archived repo (a retired app)\n'
                 'alone, clones nothing when run in the repo\'s checkout, and lists only what is left for you.\n\n'
-                'OpenClaw accepts the invitation by itself; the platform registers the app once deploy/ is\n'
-                'on main.\n\n'
+                'In the repo\'s checkout (the clone it makes, or the one you run it in) it writes the files a\n'
+                'deployable app needs that are missing: deploy/ (app.yaml, base/, dev/), ui-check.yaml and, when\n'
+                'there is no Dockerfile yet, a small Python app with /healthz, its tests and a Dockerfile with a\n'
+                'test stage. It never overwrites a file, and it refreshes AGENTS.md\'s platform rules (what\n'
+                '`update-agents` does). Commit them and open a PR: merging it registers the app and creates its\n'
+                'blocks before any feature code. OpenClaw accepts the invitation by itself.\n\n'
                 'The app is named after the repo unless --app-name says otherwise (the repo lab-website\n'
                 'for the app lab: lab-dev.lab.davidlarrimore.com). It clones the repo into ./REPO (--dir\n'
                 'DIR, or --no-clone), then lists what is left for you and what the platform does by itself.\n\n'
