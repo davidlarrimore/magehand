@@ -50,6 +50,13 @@ A new command or option follows the same rules (tests in `CommandLine`):
   failure, 2 usage error (`usage(command, message)` or argparse), 130 Ctrl-C.
 - Mistakes get a suggestion ("did you mean"), and errors say how to fix
   them. Say what changed when state changes.
+- Say what to do next: every command but those in `NO_NEXT` (their output
+  is the result itself) ends its human output with `next_line(step)`, the
+  one thing to do next or `next: nothing`, and puts it in `--json` as
+  `"next"`. A person or an agent should never have to work it out.
+- The root help lists what a person needs to learn; a command they rarely
+  need (`-V` and `-h` cover `version` and `help`) goes in `PLUMBING`, which
+  the root help names on one `also:` line.
 - Prompt only when stdin is a terminal; otherwise fail and name the flag that
   answers the question (as `setup --dns`).
 - Network calls have timeouts; commands are safe to re-run.

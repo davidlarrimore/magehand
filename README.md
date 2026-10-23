@@ -33,7 +33,13 @@ Upgrade with `magehand upgrade` (any command says, at most once a day, when a ne
 ## Commands
 
 `magehand --help` lists them; `magehand COMMAND --help` (or `magehand help
-COMMAND`) explains one, with examples.
+COMMAND`) explains one, with examples. `update-agents`, `skill`, `version` and
+`help` are named only on its `also:` line: you rarely need them.
+
+Every command that leads somewhere ends with one line, `next: ...`: the one
+thing to do next (`next: nothing` when there is nothing), and its `--json`
+has it as `"next"`. Only commands whose output is the result itself (`guide`,
+`run`, `bucket`, `runtime`, `login`, `skill`, `version`, `help`) don't.
 
 **Start an app**
 
