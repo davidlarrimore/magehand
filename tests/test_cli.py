@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -2514,6 +2515,14 @@ def setUpModule():
     unittest.addModuleCleanup(patch.stop)
     ci = os.environ.pop('CI', None)  # GitHub Actions sets it, and check treats a skip as an error there
     unittest.addModuleCleanup(lambda: ci is not None and os.environ.update(CI=ci))
+    # No test writes this machine's Claude Code or Codex config (setup's skill and approvals): both point at a
+    # temporary directory, where Codex is not installed unless a test makes its directory.
+    config = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(config.cleanup)
+    saved = {k: os.environ.get(k) for k in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME')}
+    os.environ.update(CLAUDE_CONFIG_DIR=os.path.join(config.name, 'claude'), CODEX_HOME=os.path.join(config.name, 'codex'))
+    unittest.addModuleCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                                       for k, v in saved.items()])
 
 
 class PrReady(unittest.TestCase):
@@ -2815,6 +2824,138 @@ class ScaffoldCases(unittest.TestCase):
         self.assertIn('review the AGENTS.md diff', magehand.commit_step(['AGENTS.md']))
         self.assertNotIn('registers', magehand.commit_step(['ui-check.yaml']))
         self.assertIn('registers the app', magehand.commit_step(['deploy/app.yaml', 'AGENTS.md']))
+
+
+class Approvals(unittest.TestCase):
+    """setup's pre-approved commands: one list, as Codex rules and a Claude Code hook that agree."""
+
+    def hook(self, command, tool='Bash'):
+        """The installed hook's decision for `command`: (decision, reason) or None, run as Claude Code runs it."""
+        event = json.dumps({'tool_name': tool, 'tool_input': {'command': command}})
+        run = subprocess.run([sys.executable, '-I', str(self.plugin / 'hooks/approve.py')], input=event,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        if not run.stdout.strip():
+            return None
+        out = json.loads(run.stdout)['hookSpecificOutput']
+        self.assertEqual(out['hookEventName'], 'PreToolUse')
+        return out['permissionDecision'], out['permissionDecisionReason']
+
+    def setUp(self):
+        self.claude, self.codex = magehand.claude_dir(), magehand.codex_dir()  # the module's temporary ones
+        self.plugin = self.claude / 'skills' / magehand.APPROVALS_PLUGIN
+        self.addCleanup(lambda: shutil.rmtree(self.claude, ignore_errors=True)
+                        or shutil.rmtree(self.codex, ignore_errors=True))
+
+    def test_the_hook_allows_only_listed_plain_commands_and_refuses_forbidden_ones(self):
+        magehand.install_approvals()
+        for command, decision in (('magehand status --json', 'allow'), ('magehand check', 'allow'),
+                                  ('cd app && magehand check', 'allow'), ('gh pr view 3 --json title', 'allow'),
+                                  ('gh pr view "3"', 'allow'), ('magehand pr ready 7', 'allow'),
+                                  ('magehand status && echo hi', None),  # every part must be on the list
+                                  ('magehand status > out.txt', None), ('FOO=1 magehand status', None),
+                                  ('magehand status $(whoami)', None), ('gh pr view 3 | head', None),
+                                  ('magehand release elvis', None), ('magehand statusx', None),
+                                  ('echo "unterminated', None), ('cd', 'allow'),
+                                  ('gh pr view 3 && gh pr merge 3', 'deny'), ('git push --tags', 'deny'),
+                                  ('gh release create v1.0.0', 'deny'), ('echo $(gh pr merge 3)', None)):
+            found = self.hook(command)
+            self.assertEqual(found and found[0], decision, command)
+        self.assertEqual(self.hook('cd app && magehand check')[1], "magehand: magehand's read-only commands")
+        self.assertEqual(self.hook('gh pr merge 3')[1], 'magehand: the owner merges')
+        self.assertIsNone(self.hook('gh pr merge 3', tool='Read'))
+
+    def test_the_plugin_is_a_hook_on_bash_run_by_this_python(self):
+        magehand.install_approvals()
+        manifest = json.loads((self.plugin / '.claude-plugin/plugin.json').read_text())
+        self.assertEqual(manifest['name'], magehand.APPROVALS_PLUGIN)
+        hooks = json.loads((self.plugin / 'hooks/hooks.json').read_text())['hooks']['PreToolUse']
+        self.assertEqual(hooks[0]['matcher'], 'Bash')
+        self.assertTrue(hooks[0]['hooks'][0]['command'].startswith(sys.executable))
+        self.assertFalse((self.codex / 'rules').exists())  # Codex isn't installed here: no rules for it
+
+    def test_codex_rules_say_the_same_and_a_rejected_file_is_removed(self):
+        self.codex.mkdir(parents=True)
+        with mock.patch.object(magehand, 'codex_rules_problem', lambda path: None):
+            results = magehand.install_approvals()
+        rules = self.codex / 'rules' / magehand.CODEX_RULES
+        self.assertEqual(results[-1], (rules, None))
+        text = rules.read_text()
+        self.assertIn('prefix_rule(pattern = ["gh", "pr", "merge"], decision = "forbidden", '
+                      'justification = "the owner merges")', text)
+        self.assertIn('["magehand", ["status", "app", "check", "doctor", "guide", "version", "help"]]', text)
+        self.assertEqual(text.count('prefix_rule('), len(magehand.APPROVALS))
+        with mock.patch.object(magehand, 'codex_rules_problem', lambda path: 'parse error'):
+            results = magehand.install_approvals()
+        self.assertEqual(results[-1], (rules, 'parse error'))
+        self.assertFalse(rules.exists())  # a file Codex can't load would break Codex: never left behind
+
+    def test_codex_check_reads_the_decision(self):
+        allow = mock.Mock(returncode=0, stdout='{"decision": "allow"}', stderr='')
+        broken = mock.Mock(returncode=1, stdout='', stderr='starlark: bad rule')
+        with mock.patch.object(magehand.shutil, 'which', lambda name: '/usr/bin/codex'):
+            with mock.patch.object(magehand.subprocess, 'run', lambda *a, **k: allow):
+                self.assertIsNone(magehand.codex_rules_problem('x.rules'))
+            with mock.patch.object(magehand.subprocess, 'run', lambda *a, **k: broken):
+                self.assertEqual(magehand.codex_rules_problem('x.rules'), 'starlark: bad rule')
+        with mock.patch.object(magehand.shutil, 'which', lambda name: None):
+            self.assertIsNone(magehand.codex_rules_problem('x.rules'))  # no codex CLI to ask
+
+    def test_skill_install_never_writes_approvals(self):  # OpenClaw's VM runs `skill --install`
+        self.codex.mkdir(parents=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            magehand.main(['skill', '--install'])
+        self.assertFalse(self.plugin.exists())
+        self.assertFalse((self.codex / 'rules').exists())
+
+    def test_undo_removes_them(self):
+        self.codex.mkdir(parents=True)
+        with mock.patch.object(magehand, 'codex_rules_problem', lambda path: None):
+            magehand.install_approvals()
+        with mock.patch.object(magehand, 'RESOLVER', self.claude / 'absent'):
+            code, out, _ = CommandLine.run_main(self, 'setup', '--undo')
+        self.assertEqual(code, 0)
+        self.assertFalse(self.plugin.exists())
+        self.assertFalse((self.codex / 'rules' / magehand.CODEX_RULES).exists())
+        self.assertIn(f'removed {self.plugin}', out)
+
+    def test_refresh_rewrites_what_setup_installed_and_says_when_setup_is_needed(self):
+        with mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'reachable', lambda: True):
+            code, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
+            self.assertEqual(code, 0)
+            self.assertIn('needs setup: the pre-approved commands', out)  # never installed: setup installs them
+            self.assertEqual(out.splitlines()[-1], 'next: `magehand setup`')
+            self.assertFalse(self.plugin.exists())  # refresh installs nothing new
+            magehand.install_approvals()
+            (self.plugin / 'hooks/approve.py').write_text('stale')
+            code, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
+        self.assertIn('refreshed the pre-approved commands', out)
+        self.assertNotEqual((self.plugin / 'hooks/approve.py').read_text(), 'stale')
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
+        with mock.patch.object(magehand, 'github_token', lambda: sys.exit('no token')), \
+                mock.patch.object(magehand, 'reachable', lambda: False):
+            _, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
+        self.assertIn('needs setup: GitHub sign-in', out)
+        self.assertIn('is not reachable', out)
+
+    def test_upgrade_runs_the_new_versions_quiet_setup(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[1:])
+            return mock.Mock(returncode=0, stdout='0.38.0\n', stderr='')
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / 'magehand'
+            exe.write_text('')
+            with mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                    mock.patch.object(magehand, 'installed_version', lambda: '0.38.0'), \
+                    mock.patch.object(magehand, 'latest_version', lambda max_age=0: '0.38.0'), \
+                    mock.patch.object(magehand.sys, 'executable', str(pathlib.Path(tmp) / 'python')), \
+                    mock.patch.object(magehand.subprocess, 'run', run):
+                code, out, _ = CommandLine.run_main(self, 'upgrade')
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [['version'], ['setup', '--refresh']])
 
 
 class ManagedCopy(unittest.TestCase):

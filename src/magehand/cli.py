@@ -3966,12 +3966,19 @@ models its llm block requests; scheduled work is a CronJob that
 """
 
 
+def claude_dir():
+    return pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude')
+
+
+def codex_dir():
+    return pathlib.Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
+
+
 def skill_dirs():
     """Where coding agents on this machine read skills: Claude Code always, Codex if it is installed."""
-    dirs = [pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude') / 'skills']
-    codex = pathlib.Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
-    if codex.is_dir():
-        dirs.append(codex / 'skills')
+    dirs = [claude_dir() / 'skills']
+    if codex_dir().is_dir():
+        dirs.append(codex_dir() / 'skills')
     return dirs
 
 
@@ -3992,6 +3999,169 @@ def cmd_skill(a):
             print(f'installed {path}')
         return
     print(SKILL)
+
+
+# --- pre-approved commands: one list, for Claude Code and Codex ------------------------
+# `setup` installs it (never `skill --install`, which OpenClaw's VM runs): Codex reads every
+# $CODEX_HOME/rules/*.rules, and Claude Code loads a plugin from its skills directory with no install step,
+# whose PreToolUse hook applies the same list. A command the list doesn't name prompts as before; forbidden
+# beats allow in both. Not a boundary (main's ruleset is: only the owner's approval merges), only fewer prompts.
+APPROVALS = (
+    (('magehand', ('status', 'app', 'check', 'doctor', 'guide', 'version', 'help')), 'allow',
+     "magehand's read-only commands"),
+    (('magehand', 'job', 'ls'), 'allow', "lists the app's scheduled jobs"),
+    (('magehand', 'pr', 'ready'), 'allow', "readies a green PR and requests OpenClaw's review (the PR routine)"),
+    (('gh', 'pr', ('view', 'checks', 'list', 'diff', 'status')), 'allow', 'reads PRs'),
+    (('gh', 'run', ('view', 'list', 'watch')), 'allow', 'reads CI runs'),
+    (('gh', 'issue', ('view', 'list')), 'allow', 'reads issues'),
+    (('gh', 'repo', 'view'), 'allow', 'reads a repo'),
+    (('cd',), 'allow', 'changes directory (so `cd app && magehand check` needs no prompt)'),
+    (('gh', 'pr', 'merge'), 'forbidden', 'the owner merges'),
+    (('gh', 'release', ('create', 'edit', 'delete', 'upload')), 'forbidden',
+     'the owner releases (`magehand release`, in a terminal)'),
+    (('gh', 'repo', 'delete'), 'forbidden', 'the owner deletes repos'),
+    (('git', 'push', '--tags'), 'forbidden', 'the owner tags releases'),
+    (('git', 'push', 'origin', '--tags'), 'forbidden', 'the owner tags releases'),
+)
+APPROVALS_PLUGIN = 'magehand-approvals'
+CODEX_RULES = 'magehand.rules'
+GENERATED = 'Written by `magehand setup` from its approvals list; `magehand upgrade` rewrites it. Remove: magehand setup --undo'
+
+# The Claude Code hook: stdlib only (it runs before every Bash call), the list baked in as JSON.
+APPROVE_HOOK = '''\
+# {generated}
+import json
+import re
+import shlex
+import sys
+
+RULES = json.loads({rules!r})
+SEPARATOR = set(';&|')
+
+
+def matches(words, pattern):
+    return len(words) >= len(pattern) and all(w == p or (isinstance(p, list) and w in p)
+                                              for w, p in zip(words, pattern))
+
+
+def decide(command):
+    """('deny', why) when any part is forbidden; ('allow', why) when the command is a chain of plain
+    commands (no redirect, substitution, subshell or assignment) and the list allows every part; else None."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|')
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    parts, current = [], []
+    for token in tokens:
+        if token and set(token) <= SEPARATOR:
+            parts.append(current)
+            current = []
+        else:
+            current.append(token)
+    parts = [part for part in parts + [current] if part]
+    allowed = []
+    for part in parts:
+        hits = [(decision, why) for pattern, decision, why in RULES if matches(part, pattern)]
+        for decision, why in hits:
+            if decision == 'forbidden':
+                return 'deny', why
+        allowed.append(next((why for decision, why in hits if decision == 'allow'), None))
+    plain = not re.search(r'[<>`$(){{}}\\n]|(^|\\s)[A-Za-z_][A-Za-z0-9_]*=', command)
+    if plain and parts and all(allowed):
+        return 'allow', allowed[-1]
+    return None
+
+
+def main():
+    event = json.load(sys.stdin)
+    command = (event.get('tool_input') or {{}}).get('command')
+    found = decide(command) if event.get('tool_name') == 'Bash' and isinstance(command, str) else None
+    if found:
+        print(json.dumps({{'hookSpecificOutput': {{'hookEventName': 'PreToolUse', 'permissionDecision': found[0],
+                                                  'permissionDecisionReason': 'magehand: ' + found[1]}}}}))
+
+
+if __name__ == '__main__':
+    main()
+'''
+
+
+def approval_rules():
+    """APPROVALS as JSON-able lists (alternatives as lists), for both harnesses."""
+    return [[[list(word) if isinstance(word, tuple) else word for word in pattern], decision, why]
+            for pattern, decision, why in APPROVALS]
+
+
+def codex_rules_text():
+    lines = [f'# {GENERATED}']
+    for pattern, decision, why in approval_rules():
+        lines.append(f'prefix_rule(pattern = {json.dumps(pattern)}, decision = "{decision}", '
+                     f'justification = {json.dumps(why)})')
+    return '\n'.join(lines) + '\n'
+
+
+def approvals_installed():
+    return (claude_dir() / 'skills' / APPROVALS_PLUGIN).is_dir() or (codex_dir() / 'rules' / CODEX_RULES).is_file()
+
+
+def codex_rules_problem(path):
+    """Why Codex rejects the rules file at `path`, or None (also None when the codex CLI isn't on PATH)."""
+    if not shutil.which('codex'):
+        return None
+    try:
+        out = subprocess.run(['codex', 'execpolicy', 'check', f'--rules={path}', '--', 'magehand', 'status'],  # nosec B603 B607
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f'codex execpolicy check failed ({error})'
+    try:
+        decision = json.loads(out.stdout).get('decision') if out.returncode == 0 else None
+    except ValueError:
+        decision = None
+    return None if decision == 'allow' else (out.stderr.strip() or out.stdout.strip() or 'codex rejected it')[:300]
+
+
+def install_approvals():
+    """Writes the approvals for Claude Code and (if installed) Codex; returns [(path, problem or None)]."""
+    results = []
+    plugin = claude_dir() / 'skills' / APPROVALS_PLUGIN
+    (plugin / '.claude-plugin').mkdir(parents=True, exist_ok=True)
+    (plugin / 'hooks').mkdir(exist_ok=True)
+    (plugin / '.claude-plugin' / 'plugin.json').write_text(json.dumps({
+        'name': APPROVALS_PLUGIN, 'version': installed_version() or '0.0.0', 'author': {'name': 'magehand'},
+        'license': 'MIT', 'homepage': f'https://github.com/{MAGEHAND_REPO}',
+        'description': "magehand's pre-approved commands: read-only magehand and gh run without a prompt; "
+                       'merges, releases and tag pushes are refused. ' + GENERATED}, indent=2) + '\n')
+    (plugin / 'hooks' / 'approve.py').write_text(APPROVE_HOOK.format(generated=GENERATED,
+                                                                     rules=json.dumps(approval_rules())))
+    command = f'{shlex.quote(sys.executable)} "${{CLAUDE_PLUGIN_ROOT}}/hooks/approve.py"'
+    (plugin / 'hooks' / 'hooks.json').write_text(json.dumps({'hooks': {'PreToolUse': [
+        {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}]}}, indent=2) + '\n')
+    results.append((plugin, None))
+    if codex_dir().is_dir():
+        rules = codex_dir() / 'rules' / CODEX_RULES
+        rules.parent.mkdir(parents=True, exist_ok=True)
+        rules.write_text(codex_rules_text())
+        problem = codex_rules_problem(rules)
+        if problem:  # a rules file Codex can't load would break Codex itself: never leave one behind
+            rules.unlink()
+        results.append((rules, problem))
+    return results
+
+
+def remove_approvals():
+    """Removes what install_approvals wrote; returns the paths removed."""
+    removed = []
+    plugin = claude_dir() / 'skills' / APPROVALS_PLUGIN
+    if plugin.is_dir():
+        shutil.rmtree(plugin)
+        removed.append(plugin)
+    rules = codex_dir() / 'rules' / CODEX_RULES
+    if rules.is_file():
+        rules.unlink()
+        removed.append(rules)
+    return removed
 
 
 # --- setup: once per machine ---------------------------------------------------------
@@ -4035,21 +4205,25 @@ def cmd_setup(a):
         if RESOLVER.exists():
             subprocess.run(['sudo', 'rm', '-f', str(RESOLVER)], check=True)  # nosec B603 B607
             print(f'removed {RESOLVER}')
+        for path in remove_approvals():
+            print(f'removed {path}')
         print(next_line(None))
         return
-    print('1/5 GitHub')
+    if a.refresh:
+        return setup_refresh(host)
+    print('1/6 GitHub')
     try:
         github_token()
         print('    ok')
     except SystemExit:
         die('sign in to GitHub first: `gh auth login`, then run `magehand setup` again')
-    print('2/5 container runtime (only for local postgres/redis blocks and run --container)')
+    print('2/6 container runtime (only for local postgres/redis blocks and run --container)')
     configured = configured_runtime()
     found = detect_runtimes()
     for line in runtime_lines(found, configured, choose_runtime(configured, found)):
         print('  ' + line)
     print(f'    Supported: {SUPPORTED}. Change: magehand runtime docker|podman|none')
-    print(f'3/5 the homelab network (*.{LAB})')
+    print(f'3/6 the homelab network (*.{LAB})')
     if reachable():
         print(f'    ok: {host} -> {lab_address(host)}')
     elif sys.platform != 'darwin':
@@ -4073,16 +4247,43 @@ def cmd_setup(a):
         else:
             die(f'{host} now resolves via {server} but https still fails; is this Mac on a network that reaches it?')
         print(f'    ok: {host} -> {lab_address(host)} (undo: magehand setup --undo)')
-    print('4/5 sign in')
+    print('4/6 sign in')
     if signin_left() is not None:
         print('    ok (already signed in)')
     else:
         cmd_login(None)
-    print('5/5 the homelab-app skill for coding agents (Claude Code, Codex)')
+    print('5/6 the homelab-app skill for coding agents (Claude Code, Codex)')
     for path in install_skill():
         print(f'    ok: {path}')
+    print('6/6 pre-approved commands for Claude Code and Codex (read-only magehand and gh; merges, releases '
+          'and tag pushes refused)')
+    for path, problem in install_approvals():
+        print(f'    not installed: {path}: {problem}' if problem else f'    ok: {path}')
     print('Done: this machine is set up.')
     print(next_line('in an app repo, `magehand status` (or `magehand new REPO` to start one)'))
+
+
+def setup_refresh(host):
+    """`setup --refresh`, which `upgrade` runs from the new version: rewrite the skill and the approvals where
+    setup installed them, check what can break without asking anything, and say whether setup is needed."""
+    if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
+        install_skill()
+        print('refreshed the homelab-app skill')
+    if approvals_installed():
+        failed = [f'{path}: {problem}' for path, problem in install_approvals() if problem]
+        print('refreshed the pre-approved commands' + (f' (not {"; ".join(failed)})' if failed else ''))
+    needs = []
+    try:
+        github_token()
+    except SystemExit:
+        needs.append('GitHub sign-in (`gh auth login`)')
+    if not reachable():
+        needs.append(f'{host} is not reachable')
+    if not approvals_installed():
+        needs.append('the pre-approved commands for Claude Code and Codex')
+    for need in needs:
+        print(f'needs setup: {need}')
+    print(next_line('`magehand setup`' if needs else None))
 
 
 # --- staying current -------------------------------------------------------------
@@ -4208,13 +4409,14 @@ def cmd_upgrade(_a):
         print('upgraded')
         print(next_line('`magehand skill --install`, if you use the skill'))
         return
-    # Its skill text, only where the user installed the skill (magehand setup).
-    if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
-        if subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL).returncode == 0:  # nosec B603
-            print('refreshed the homelab-app skill')
     out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603
-    print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}')
-    print(next_line(None))
+    print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}', flush=True)
+    # The new version's own setup, quietly: it refreshes the skill and the approvals where setup put them, and
+    # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
+    if subprocess.run([str(exe), 'setup', '--refresh']).returncode == 2:  # nosec B603
+        if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
+            subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL)  # nosec B603
+        print(next_line(None))
 
 
 def cmd_version(_a):
@@ -5496,10 +5698,17 @@ def build_parser():
     json_option(p)
     # this machine
     p = command('setup', cmd_setup, 'set this machine up (once)', 'set this machine up once: GitHub, container runtime, *.lab names, '
-                'sign-in, the skill')
+                'sign-in, the skill, pre-approved commands',
+                'Step 6 lets Claude Code and Codex run read-only magehand and gh commands without asking, and\n'
+                'refuses merges, releases and tag pushes: one list, written as a Claude Code plugin\n'
+                f'($CLAUDE_CONFIG_DIR or ~/.claude, skills/{APPROVALS_PLUGIN}/) and a Codex rules file ($CODEX_HOME\n'
+                f'or ~/.codex, rules/{CODEX_RULES}). `magehand upgrade` refreshes them; --undo removes them.\n\n'
+                'examples:\n  magehand setup\n  magehand setup --dns 192.0.2.1\n  magehand setup --undo')
     p.add_argument('--dns', metavar='ADDRESS', help="the homelab's DNS address, if *.lab doesn't resolve "
                    '(else it asks, in a terminal)')
-    p.add_argument('--undo', action='store_true', help='remove the *.lab name resolution setup added')
+    p.add_argument('--undo', action='store_true', help='remove the *.lab name resolution and the pre-approved commands '
+                   'setup added')
+    p.add_argument('--refresh', action='store_true', help=argparse.SUPPRESS)  # upgrade's quiet mode
     p = command('doctor', cmd_doctor, "check this machine, sign-in and this app repo's setup",
                 "check GitHub access, homelab reach, sign-in, the app repo's setup and the container runtime",
                 'In an app repo it also checks that OpenClaw\'s bot can write to it (a pending invitation is\n'
@@ -5511,7 +5720,9 @@ def build_parser():
     json_option(p)
     p = command('skill', cmd_skill, 'print or install the homelab-app skill for coding agents', 'print the homelab-app skill for coding agents, or install it')
     p.add_argument('--install', action='store_true', help='install it for Claude Code (and Codex, if installed)')
-    command('upgrade', cmd_upgrade, 'upgrade magehand and its skill', 'upgrade magehand the way it was installed, and its skill')
+    command('upgrade', cmd_upgrade, 'upgrade magehand, its skill and approvals',
+            'upgrade magehand the way it was installed, then refresh what setup installed (the skill, the '
+            'pre-approved commands)')
     command('version', cmd_version, 'print the version', 'print the version, and whether a newer one exists')
     p = command('help', cmd_help, 'help for magehand or a command', 'show help for magehand or a command')
     p.add_argument('topic', nargs='?', metavar='COMMAND')
