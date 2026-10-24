@@ -892,6 +892,25 @@ def eligible_release(releases):
     return None
 
 
+def prod_running(prod, recorded):
+    """A merged production deploy (`prod`, an ok prod stage) with what the platform's GitHub Deployment for the
+    release's commit says (`recorded`, platform_deployment's answer): running, failed, or still rolling out.
+    Without one, the merge is all there is to show."""
+    if not recorded or prod.get('state') != 'ok':
+        return prod
+    since = prod['text'].split(' deployed', 1)[1]
+    if recorded['state'] == 'success':
+        return {**prod, 'text': f'{prod["tag"]} running (the platform saw every pod Ready, '
+                                f'{clock(recorded["at"])}){since}'}
+    if recorded['state'] == 'failure':
+        return {**prod, 'state': 'failed',
+                'text': f'{prod["tag"]}: {recorded["description"] or "the rollout failed"} (the platform, '
+                        f'{clock(recorded["at"])}){since}'}
+    if recorded['state'] in ('in_progress', 'queued', 'pending'):
+        return {**prod, 'state': 'pending', 'text': f'{prod["tag"]} rolling out{since}'}
+    return prod
+
+
 def prod_stage(tag, ahead, prs):
     """Prod: the latest eligible release, whether its deploy PR merged, and the commits on main since."""
     if not tag:
@@ -1031,14 +1050,47 @@ NO_CLUSTER = re.compile(r'kubectl is not installed|localhost:8080|no configurati
                         r'current-context is not set|context was not found', re.I)
 
 
-def dev_stage(name, deploy, cluster=True):
-    """The running pods for a merged dev deploy, or an unknown stage saying why they weren't read."""
+def platform_deployment(repo, environment, sha, image=None):
+    """The newest GitHub Deployment the platform recorded in the app's repo for `sha` in `environment` (dev or
+    production: its deploy timer writes one per deploy, homelab#403), as {'state', 'description', 'at'}, or
+    None when there is none for that image or it can't be read: callers then do what they did before
+    Deployments existed, so an unreadable one is never a failure. `state` is GitHub's (in_progress, success,
+    failure, inactive, ...)."""
+    found, err = gh_query('api', f'repos/{repo}/deployments?environment={environment}&sha={sha}&per_page=5')
+    if err or not isinstance(found, list):
+        return None
+    mine = [d for d in found if not image or ((d.get('payload') or {}).get('image') or image) == image]
+    if not mine:
+        return None
+    statuses, err = gh_query('api', f'repos/{repo}/deployments/{mine[0]["id"]}/statuses?per_page=1')
+    if err or not isinstance(statuses, list):
+        return None
+    latest = statuses[0] if statuses else {}
+    return {'state': latest.get('state') or 'pending', 'description': latest.get('description') or '',
+            'at': latest.get('created_at') or mine[0].get('created_at')}
+
+
+def dev_stage(name, deploy, cluster=True, repo=None, head=None):
+    """The running pods for a merged dev deploy: the platform's GitHub Deployment for `head` when it says the
+    rollout ended (readable from any machine), else the pods through kubectl, or an unknown stage saying why
+    they weren't read (pending while the platform reports a rollout still in progress)."""
+    recorded = platform_deployment(repo, 'dev', head, deploy['image']) if repo and head else None
+    if recorded and recorded['state'] == 'success':
+        return {'stage': 'dev', 'state': 'ok',
+                'text': f'running {deploy["digest"]} (the platform saw every pod Ready, {clock(recorded["at"])})'}
     unknown = lambda why: {'stage': 'dev', 'state': 'unknown',  # noqa: E731
                            'text': f'config deployed ({deploy["digest"]}); ' + (
                                'its pods are not visible from this machine ('
                                + ('kubectl is not installed' if 'not installed' in why else 'no cluster access')
                                + ': normal on a laptop)' if NO_CLUSTER.search(why) else
                                f'the running pod is not checked ({why})')}
+    if recorded and recorded['state'] == 'failure':  # the pods, when readable, say more and are current
+        unknown = lambda why: {'stage': 'dev', 'state': 'failed',  # noqa: E731
+                               'text': f'{recorded["description"] or "the rollout failed"} (the platform, '
+                                       f'{clock(recorded["at"])})'}
+    elif recorded and recorded['state'] in ('in_progress', 'queued', 'pending'):
+        unknown = lambda why: {'stage': 'dev', 'state': 'pending',  # noqa: E731
+                               'text': f'rolling out {deploy["digest"]} (the platform reports when every pod is Ready)'}
     if not cluster:
         return unknown('--no-cluster')
     pods, err = kubectl_json('pods', '-n', f'{name}-dev')
@@ -1107,9 +1159,13 @@ def collect_status(repo, name, cluster=True, ref='main'):
             ahead = None if err else compare.get('ahead_by')
         prod = (query_error('prod', f'the comparison of {tag} with main', err) if err
                 else prod_stage(tag, ahead, prod_prs))
+        if prod['state'] == 'ok':
+            tagged, err = gh_query('api', f'repos/{repo}/commits/{tag}')
+            if not err:
+                prod = prod_running(prod, platform_deployment(repo, 'production', tagged['sha']))
     stages = [build, deploy, prod]
     if deploy['state'] == 'ok':
-        stages.insert(2, dev_stage(name, deploy, cluster))
+        stages.insert(2, dev_stage(name, deploy, cluster, repo, head))
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
 
