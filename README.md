@@ -32,7 +32,7 @@ pre-approves commands for Claude Code and Codex from one list, so their routine 
 magehand's read-only commands, `magehand pr ready`, and `gh`'s read-only `pr`, `run`, `issue` and `repo` commands.
 `gh pr merge`, `gh release create|edit|delete|upload`, `gh repo delete` and `git push --tags` are refused. Anything
 else prompts as before. For Codex this is a rules file, `rules/magehand.rules` under `$CODEX_HOME` or `~/.codex`,
-which `codex execpolicy check` must accept, or it isn't kept. For Claude Code it is a plugin that loads by itself,
+which `codex execpolicy check` must accept, or it isn't kept (setup then fails and says to update Codex; `doctor` notes it). For Claude Code it is a plugin that loads by itself,
 `skills/magehand-approvals/` under `$CLAUDE_CONFIG_DIR` or `~/.claude`, whose PreToolUse hook applies the same list.
 It allows a chain of plain commands (`cd app && magehand check`) only when every part is on the list, and never one
 with a redirect, `$(…)` or an assignment. `setup --undo` removes them. This is fewer prompts, not a boundary: the

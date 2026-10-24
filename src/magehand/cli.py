@@ -3033,8 +3033,9 @@ def cmd_doctor(a):
         results.append({'check': 'sign-in time left', 'ok': None, 'hint': note})
         if not a.json:
             print(f'--   {note}')
-    if not managed and not approvals_installed():
-        note = ('pre-approved commands for Claude Code and Codex: not installed (`magehand setup` installs them, '
+    missing = [] if managed else approvals_missing()
+    if missing:
+        note = (f'pre-approved commands for {" and ".join(missing)}: not installed (`magehand setup` installs them, '
                 'so routine magehand and gh commands need no prompt)')
         results.append({'check': 'pre-approved commands', 'ok': None, 'hint': note})
         if not a.json:
@@ -4118,7 +4119,21 @@ def codex_rules_text():
 
 
 def approvals_installed():
+    """Whether setup installed the approvals here, for either harness (refresh rewrites them only then)."""
     return (claude_dir() / 'skills' / APPROVALS_PLUGIN).is_dir() or (codex_dir() / 'rules' / CODEX_RULES).is_file()
+
+
+def approvals_missing():
+    """The harnesses on this machine that lack their part of the approvals: Claude Code always applies, Codex
+    when it is installed. Each is checked on its own: a Claude plugin says nothing about Codex's rules."""
+    missing = [] if (claude_dir() / 'skills' / APPROVALS_PLUGIN).is_dir() else ['Claude Code']
+    if codex_dir().is_dir() and not (codex_dir() / 'rules' / CODEX_RULES).is_file():
+        missing.append('Codex')
+    return missing
+
+
+def rejected_rules_step(problem):
+    return f'Codex rejected magehand\'s rules ({problem}): update Codex (`codex --version`), then `magehand setup`'
 
 
 def codex_rules_problem(path):
@@ -4280,8 +4295,12 @@ def cmd_setup(a):
         print(f'    ok: {path}')
     print('6/6 pre-approved commands for Claude Code and Codex (read-only magehand and gh; merges, releases '
           'and tag pushes refused)')
+    rejected = None
     for path, problem in install_approvals():
         print(f'    not installed: {path}: {problem}' if problem else f'    ok: {path}')
+        rejected = rejected or problem
+    if rejected:  # the one step that can fail without stopping setup: say it failed, and how to fix it
+        die('setup is done except for Codex: ' + rejected_rules_step(rejected))
     print('Done: this machine is set up.')
     print(next_line('in an app repo, `magehand status` (or `magehand new REPO` to start one)'))
 
@@ -4292,9 +4311,10 @@ def setup_refresh(host):
     if skill_installed():
         install_skill()
         print('refreshed the homelab-app skill')
+    rejected = None
     if approvals_installed():
-        failed = [f'{path}: {problem}' for path, problem in install_approvals() if problem]
-        print('refreshed the pre-approved commands' + (f' (not {"; ".join(failed)})' if failed else ''))
+        rejected = next((problem for _, problem in install_approvals() if problem), None)
+        print('refreshed the pre-approved commands' + (' (not for Codex: it rejected them)' if rejected else ''))
     needs = []
     try:
         github_token()
@@ -4302,11 +4322,15 @@ def setup_refresh(host):
         needs.append('GitHub sign-in (`gh auth login`)')
     if not reachable():
         needs.append(f'{host} is not reachable')
-    if not approvals_installed():
-        needs.append('the pre-approved commands for Claude Code and Codex')
+    missing = approvals_missing()
+    if rejected:
+        needs.append(rejected_rules_step(rejected))
+    elif missing:
+        needs.append(f'the pre-approved commands for {" and ".join(missing)}')
     for need in needs:
         print(f'needs setup: {need}')
-    print(next_line('`magehand setup`' if needs else None))
+    print(next_line(('update Codex (`codex --version`), then `magehand setup`' if rejected else '`magehand setup`')
+                    if needs else None))
 
 
 # --- staying current -------------------------------------------------------------

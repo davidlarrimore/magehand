@@ -2906,6 +2906,46 @@ class Approvals(unittest.TestCase):
         self.assertEqual(rules.read_text(), text)  # the working file stays
         self.assertEqual(sorted(p.name for p in self.codex.iterdir()), ['rules'])  # no draft left behind
 
+    def test_a_rejected_codex_draft_is_not_reported_as_installed(self):
+        """Claude's plugin installed and Codex's rules rejected: setup, refresh and doctor all say Codex lacks them."""
+        self.codex.mkdir(parents=True)
+        rejected = mock.patch.object(magehand, 'codex_rules_problem', lambda path: 'unknown function prefix_rule')
+        with rejected:
+            magehand.install_approvals()
+        self.assertTrue(self.plugin.is_dir())
+        self.assertEqual(magehand.approvals_missing(), ['Codex'])
+        with rejected, mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'reachable', lambda: True):
+            code, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
+        self.assertEqual(code, 0)
+        self.assertIn('not for Codex', out)
+        self.assertIn('needs setup: Codex rejected magehand\'s rules (unknown function prefix_rule)', out)
+        self.assertEqual(out.splitlines()[-1], 'next: update Codex (`codex --version`), then `magehand setup`')
+        with mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                mock.patch.object(magehand.urllib.request, 'urlopen', mock.Mock(side_effect=OSError())), \
+                mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                mock.patch.object(magehand, 'current_repo', lambda *a: None):
+            _, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+        notes = [r['hint'] for r in json.loads(out)['checks'] if r['check'] == 'pre-approved commands']
+        self.assertEqual(len(notes), 1)
+        self.assertIn('for Codex: not installed', notes[0])
+
+    def test_setup_fails_when_codex_rejects_its_rules(self):
+        self.codex.mkdir(parents=True)
+        setup = Setup()
+        setup.setUp()
+        self.addCleanup(setup.tearDown)
+        magehand.reachable = lambda: True
+        out = io.StringIO()
+        with mock.patch.object(magehand, 'codex_rules_problem', lambda path: 'unknown function prefix_rule'), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as failed:
+            magehand.main(['setup'])
+        self.assertIn('setup is done except for Codex: Codex rejected', str(failed.exception.code))
+        self.assertIn('not installed: ', out.getvalue())
+        self.assertNotIn('Done: this machine is set up.', out.getvalue())
+        self.assertTrue(self.plugin.is_dir())  # Claude Code's part is installed
+
     def test_codex_check_reads_the_decision(self):
         allow = mock.Mock(returncode=0, stdout='{"decision": "allow"}', stderr='')
         broken = mock.Mock(returncode=1, stdout='', stderr='starlark: bad rule')
