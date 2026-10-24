@@ -341,6 +341,13 @@ def remote_repo(root=None):
     return name[:-4] if name.endswith('.git') else name
 
 
+def origin_repo(root):
+    """OWNER/NAME of the GitHub repo that the checkout at `root` has as origin, or None (another host, none)."""
+    url = git_out(['remote', 'get-url', 'origin'], root)
+    m = re.search(r'github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', url or '')
+    return f'{m.group(1)}/{m.group(2)}' if m else None
+
+
 def checkout_top(root=None):
     """The top directory of the git checkout at `root` (default: here), or None outside one."""
     top = git_out(['rev-parse', '--show-toplevel'], root)
@@ -1919,16 +1926,16 @@ resources:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {app}
+  name: "{app}"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: {app}
+      app: "{app}"
   template:
     metadata:
       labels:
-        app: {app}
+        app: "{app}"
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -1982,10 +1989,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {app}
+  name: "{app}"
 spec:
   selector:
-    app: {app}
+    app: "{app}"
   ports:
     - name: http
       port: 80
@@ -1995,7 +2002,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {app}
+  name: "{app}"
   annotations:
     traefik.ingress.kubernetes.io/router.middlewares: authentik-forward-auth@kubernetescrd
 spec:
@@ -2009,18 +2016,19 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {app}
+                name: "{app}"
                 port:
                   name: http
 """,
     'deploy/dev/kustomization.yaml': """\
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: {app}-dev
+namespace: "{app}-dev"
 resources:
   - ../base
 """,
 }
+# Every app-name scalar above is quoted: true, null and 123 are valid app names, and not YAML strings bare.
 # The code files belong together: written only into a repo with no code of its own yet (another stack keeps its own).
 SCAFFOLD_CODE = ('Dockerfile', '.dockerignore', 'app.py', 'tests/test_app.py')
 OWN_CODE = ('Dockerfile', 'app.py', 'main.py', 'tests', 'src', 'package.json', 'pyproject.toml', 'requirements.txt',
@@ -2203,8 +2211,12 @@ def cmd_new(a):
         print(f'{repo}: could not clone it; run `gh repo clone {repo} {shell_path(dest)}`', file=sys.stderr)
     # The checkout's own files: the scaffold's missing ones, and AGENTS.md's platform rules (local writes only).
     candidate = checkout_top() if here else dest if cloned in ('cloned', 'exists') else None
-    # Only into a checkout of this repo (its origin says so): never a directory that merely has the name.
-    work = candidate if candidate and pathlib.Path(candidate).is_dir() and remote_repo(candidate) == name else None
+    # Only into the top of a checkout of this very repo (its origin, owner and name, says so): never a directory
+    # that merely has the name, another owner's repo of that name, or a plain directory inside some checkout.
+    work = candidate if (candidate and pathlib.Path(candidate).is_dir()
+                         and pathlib.Path(checkout_top(candidate) or '/nowhere').resolve()
+                         == pathlib.Path(candidate).resolve()
+                         and (origin_repo(candidate) or '').lower() == repo.lower()) else None
     wrote, pull = [], False
     if work:
         # The app's name: the checkout's own `app:` if it has one, else the one asked for (a failed seed is
@@ -2239,9 +2251,9 @@ def cmd_new(a):
                           'dir': str(work or dest) if work or cloned in ('cloned', 'exists') else None, 'wrote': wrote,
                           'next': step_text(steps[0]) if steps else None}, indent=1))
     elif created:
-        print(new_summary(repo, name, app, dest, named, cloned, wrote))
+        print(new_summary(repo, name, app, dest, named, cloned, wrote, steps))
     else:
-        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named, wrote))
+        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named, wrote, steps))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
 
@@ -2279,12 +2291,12 @@ def new_steps(repo, name, app, dest, named, cloned, wrote=()):
     return steps
 
 
-def new_summary(repo, name, app, dest, named, cloned, wrote=()):
+def new_summary(repo, name, app, dest, named, cloned, wrote=(), steps=None):
     """What `new` leaves for you, in two lists: the steps that are yours (commands first, plainly marked) and
     what the platform does by itself afterwards, then the first step as `next:`. Everything already done went
     to stderr as it happened."""
     live = name if named in ('failed', 'differs') else app
-    steps = new_steps(repo, name, app, dest, named, cloned, wrote)
+    steps = new_steps(repo, name, app, dest, named, cloned, wrote) if steps is None else steps
     lines = ['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
     lines += ['', 'Then, by itself (about 5 minutes after deploy/ with base/ is merged to main):',
               f'  - {live} is registered and deployed to https://{live}-dev.{LAB}/',
@@ -2317,9 +2329,10 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     return steps
 
 
-def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=()):
+def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=(), steps=None):
     """What `new` on an existing repo leaves for you (its changes went to stderr as it made them)."""
-    steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote)
+    if steps is None:
+        steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote)
     if not steps:
         return (f'{repo}: set up (private, {BOT} can write, the approval ruleset is on main); nothing left for you\n'
                 + next_line(None))

@@ -2654,7 +2654,7 @@ class Scaffold(unittest.TestCase):
             magehand.scaffold(tmp, 'lab', 'lab-website')
             root = pathlib.Path(tmp)
             self.assertIn('app: "lab"', (root / 'deploy/app.yaml').read_text())
-            self.assertIn('namespace: lab-dev', (root / 'deploy/dev/kustomization.yaml').read_text())
+            self.assertIn('namespace: "lab-dev"', (root / 'deploy/dev/kustomization.yaml').read_text())
             self.assertIn(f'host: lab-dev.{magehand.LAB}', (root / 'deploy/base/ingress.yaml').read_text())
 
     def checkout(self, tmp, origin):
@@ -2662,11 +2662,9 @@ class Scaffold(unittest.TestCase):
         subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', origin], check=True)
         return pathlib.Path(tmp)
 
-    def run_new_here(self, root, *argv, name='elvis', agents=None):
-        calls = []
-
+    def gh(self, name):
+        """GitHub as `new` sees it for an existing, set-up repo NAME with no deploy/app.yaml on main."""
         def gh(*args, **kw):
-            calls.append(args)
             if args[0] == 'api' and args[-1].endswith('/contents/deploy/app.yaml'):
                 return (0, '', '') if '-X' in args else (1, '', 'gh: Not Found (HTTP 404)')
             if args[:2] == ('api', f'repos/davidlarrimore/{name}') and '.private, .archived' in args:
@@ -2682,7 +2680,10 @@ class Scaffold(unittest.TestCase):
             if args[0] == 'api' and args[1].startswith(f'repos/davidlarrimore/{name}/rules/branches/main'):
                 return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]), ''
             return 0, '', ''
-        with mock.patch.object(magehand, 'gh_cli', gh), \
+        return gh
+
+    def run_new_here(self, root, *argv, name='elvis', agents=None):
+        with mock.patch.object(magehand, 'gh_cli', self.gh(name)), \
                 mock.patch.object(magehand, 'current_repo', lambda *a: f'davidlarrimore/{name}'), \
                 mock.patch.object(magehand, 'checkout_top', lambda *a: root), \
                 mock.patch.object(magehand, 'agents_text', agents or (lambda path: (None, '# rules\n\n## This app\n', None))):
@@ -2703,12 +2704,55 @@ class Scaffold(unittest.TestCase):
             _, report = self.run_new_here(root)
             self.assertEqual(report['wrote'], [])
             self.assertEqual(list(root.iterdir()), [root / '.git'])
+        with tempfile.TemporaryDirectory() as tmp:  # another owner's repo of the same name: nothing written
+            root = self.checkout(tmp, 'https://github.com/example/elvis.git')
+            _, report = self.run_new_here(root)
+            self.assertEqual(report['wrote'], [])
+        with tempfile.TemporaryDirectory() as tmp:  # a plain directory inside the right checkout: not its top
+            top = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            (top / 'elvis').mkdir()
+            with mock.patch.object(magehand, 'gh_cli', self.gh('elvis')), \
+                    mock.patch.object(magehand, 'current_repo', lambda *a: None), \
+                    mock.patch.object(magehand, 'clone_repo', lambda repo, dest: 'exists'):
+                _, out, _ = CommandLine.run_main(self, 'new', 'elvis', '--dir', str(top / 'elvis'), '--json')
+            self.assertEqual(json.loads(out)['wrote'], [])
+            self.assertEqual(list((top / 'elvis').iterdir()), [])
+
+    def test_the_origin_names_owner_and_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for url, expected in (('git@github.com:davidlarrimore/elvis.git', 'davidlarrimore/elvis'),
+                                  ('https://github.com/example/elvis', 'example/elvis'),
+                                  ('https://github.com/example/my.app.git/', 'example/my.app'),
+                                  ('https://gitlab.example.com/x/elvis.git', None)):
+                subprocess.run(['git', 'init', '-q', tmp], check=True)
+                subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)
+                subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', url], check=True)
+                self.assertEqual(magehand.origin_repo(tmp), expected, url)
+
+    def test_names_yaml_would_retype_stay_strings(self):
+        for app in ('null', 'true', '123'):
+            with tempfile.TemporaryDirectory() as tmp:
+                magehand.scaffold(tmp, app, app)
+                for rel in magehand.SCAFFOLD_FILES:
+                    if rel.endswith('.yaml') and rel.startswith('deploy/') and rel != 'deploy/app.yaml':
+                        doc = magehand.yaml.safe_load((pathlib.Path(tmp) / rel).read_text())
+                        if 'metadata' in doc:
+                            self.assertEqual(doc['metadata']['name'], app, rel)
+                        if rel.endswith('deployment.yaml'):
+                            self.assertEqual(doc['spec']['selector']['matchLabels']['app'], app)
+                            self.assertEqual(doc['spec']['template']['metadata']['labels']['app'], app)
+                        if rel.endswith('service.yaml'):
+                            self.assertEqual(doc['spec']['selector']['app'], app)
+                        if rel.endswith('ingress.yaml'):
+                            self.assertEqual(doc['spec']['rules'][0]['http']['paths'][0]['backend']['service']['name'], app)
+                        if rel.endswith('dev/kustomization.yaml'):
+                            self.assertEqual(doc['namespace'], f'{app}-dev')
 
 
 class ScaffoldCases(unittest.TestCase):
     """The cases the local review found: the app's own name, a fresh seed, other code, no template."""
 
-    checkout, run_new_here = Scaffold.checkout, Scaffold.run_new_here
+    checkout, gh, run_new_here = Scaffold.checkout, Scaffold.gh, Scaffold.run_new_here
 
     def test_the_checkouts_own_app_name_wins(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2716,7 +2760,7 @@ class ScaffoldCases(unittest.TestCase):
             (root / 'deploy').mkdir()
             (root / 'deploy/app.yaml').write_text('app: "lab"\nservices: {}\n')
             _, report = self.run_new_here(root, name='lab-website')
-            self.assertIn('namespace: lab-dev', (root / 'deploy/dev/kustomization.yaml').read_text())
+            self.assertIn('namespace: "lab-dev"', (root / 'deploy/dev/kustomization.yaml').read_text())
             self.assertNotIn('deploy/app.yaml', report['wrote'])
 
     def test_a_seed_just_committed_is_pulled_not_rivalled(self):
@@ -2724,9 +2768,20 @@ class ScaffoldCases(unittest.TestCase):
             root = self.checkout(tmp, 'git@github.com:davidlarrimore/lab-website.git')
             _, report = self.run_new_here(root, '--app-name', 'lab', name='lab-website')
             self.assertFalse((root / 'deploy/app.yaml').exists())
-            self.assertIn('namespace: lab-dev', (root / 'deploy/dev/kustomization.yaml').read_text())
+            self.assertIn('namespace: "lab-dev"', (root / 'deploy/dev/kustomization.yaml').read_text())
             self.assertIn('pull', report['next'])
             self.assertEqual(report['dir'], str(root))
+
+    def test_the_pull_step_is_in_the_human_output_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/lab-website.git')
+            with mock.patch.object(magehand, 'gh_cli', self.gh('lab-website')), \
+                    mock.patch.object(magehand, 'current_repo', lambda *a: 'davidlarrimore/lab-website'), \
+                    mock.patch.object(magehand, 'checkout_top', lambda *a: root), \
+                    mock.patch.object(magehand, 'agents_text', lambda path: (None, '# rules\n\n## This app\n', None)):
+                _, out, _ = CommandLine.run_main(self, 'new', 'lab-website', '--app-name', 'lab')
+        self.assertIn('1. run:   git -C', out)
+        self.assertIn('pull', out.splitlines()[-1])
 
     def test_a_repo_with_its_own_code_gets_no_python_scaffold(self):
         with tempfile.TemporaryDirectory() as tmp:
