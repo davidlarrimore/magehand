@@ -2708,6 +2708,10 @@ class Scaffold(unittest.TestCase):
             root = self.checkout(tmp, 'https://github.com/example/elvis.git')
             _, report = self.run_new_here(root)
             self.assertEqual(report['wrote'], [])
+        with tempfile.TemporaryDirectory() as tmp:  # a look-alike host: nothing written
+            root = self.checkout(tmp, 'https://notgithub.com/davidlarrimore/elvis.git')
+            _, report = self.run_new_here(root)
+            self.assertEqual(report['wrote'], [])
         with tempfile.TemporaryDirectory() as tmp:  # a plain directory inside the right checkout: not its top
             top = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
             (top / 'elvis').mkdir()
@@ -2723,7 +2727,13 @@ class Scaffold(unittest.TestCase):
             for url, expected in (('git@github.com:davidlarrimore/elvis.git', 'davidlarrimore/elvis'),
                                   ('https://github.com/example/elvis', 'example/elvis'),
                                   ('https://github.com/example/my.app.git/', 'example/my.app'),
-                                  ('https://gitlab.example.com/x/elvis.git', None)):
+                                  ('ssh://git@github.com/davidlarrimore/elvis.git', 'davidlarrimore/elvis'),
+                                  ('https://gitlab.example.com/x/elvis.git', None),
+                                  ('https://notgithub.com/davidlarrimore/elvis.git', None),
+                                  ('git@notgithub.com:davidlarrimore/elvis.git', None),
+                                  ('https://github.com.example.com/davidlarrimore/elvis.git', None),
+                                  ('https://example.com/github.com/davidlarrimore/elvis.git', None),
+                                  ('/srv/git/github.com/davidlarrimore/elvis.git', None)):
                 subprocess.run(['git', 'init', '-q', tmp], check=True)
                 subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)
                 subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', url], check=True)

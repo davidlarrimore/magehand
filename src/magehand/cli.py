@@ -344,7 +344,9 @@ def remote_repo(root=None):
 def origin_repo(root):
     """OWNER/NAME of the GitHub repo that the checkout at `root` has as origin, or None (another host, none)."""
     url = git_out(['remote', 'get-url', 'origin'], root)
-    m = re.search(r'github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', url or '')
+    # github.com exactly, in each form git accepts: https, ssh:// and scp-style (never a look-alike host or a path)
+    m = re.match(r'(?:https://(?:[^@/]+@)?github\.com/|ssh://git@github\.com(?::22)?/|git@github\.com:)'
+                 r'([\w.-]+)/([\w.-]+?)(?:\.git)?/?$', url or '')
     return f'{m.group(1)}/{m.group(2)}' if m else None
 
 
