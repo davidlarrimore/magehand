@@ -27,8 +27,21 @@ runtime this machine has (only needed for database blocks; see `magehand
 runtime` below), makes sure the homelab's `*.lab`
 names resolve (if they don't, it asks for the homelab's DNS address, your home
 gateway, and points only `*.lab` lookups at it; `magehand setup --undo`
-reverses that), then signs you in and installs the `homelab-app` skill for Claude Code (and Codex). Every other command assumes this is done.
-Upgrade with `magehand upgrade` (any command says, at most once a day, when a new version is out). After upgrading, run `magehand update-agents` in each app repo to bring in the template's current `AGENTS.md` rules.
+reverses that), then signs you in and installs the `homelab-app` skill for Claude Code (and Codex). Last, it
+pre-approves commands for Claude Code and Codex from one list, so their routine commands need no prompt. That covers
+magehand's read-only commands, `magehand pr ready`, and `gh`'s read-only `pr`, `run`, `issue` and `repo` commands.
+`gh pr merge`, `gh release create|edit|delete|upload`, `gh repo delete` and `git push --tags` are refused. Anything
+else prompts as before. For Codex this is a rules file, `rules/magehand.rules` under `$CODEX_HOME` or `~/.codex`,
+which `codex execpolicy check` must accept, or it isn't kept (setup then fails and says to update Codex; `doctor` notes it). For Claude Code it is a plugin that loads by itself,
+`skills/magehand-approvals/` under `$CLAUDE_CONFIG_DIR` or `~/.claude`, whose PreToolUse hook applies the same list.
+It allows a chain of plain commands (`cd app && magehand check`) only when every part is on the list, and never one
+with a redirect, `$(…)` or an assignment. `setup --undo` removes them. This is fewer prompts, not a boundary: the
+ruleset on `main`, where only your approval merges, is the boundary. Every other command assumes setup is done.
+Upgrade with `magehand upgrade` (any command says, at most once a day, when a new version is out): it then runs the
+new version's setup quietly, which refreshes the skill and the pre-approved commands and says if `magehand setup`
+needs you. (An upgrade from 0.37 or earlier is run by the old version, which doesn't do this: run `magehand
+setup` once after it; `magehand doctor` says when the pre-approved commands aren't installed.) In an app repo, `magehand check` says when `AGENTS.md`'s platform rules are out of date; `magehand new
+REPO` or `magehand update-agents` refreshes them.
 
 ## Commands
 
@@ -83,9 +96,9 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 
 | Command | What it does |
 | --- | --- |
-| `magehand setup [--dns ADDRESS] [--undo]` | Once per machine: GitHub, the container runtime, `*.lab` name resolution (the only step that may ask for your password; without a terminal, pass `--dns`), sign-in, the skill |
+| `magehand setup [--dns ADDRESS] [--undo]` | Once per machine: GitHub, the container runtime, `*.lab` name resolution (the only step that may ask for your password; without a terminal, pass `--dns`), sign-in, the skill, and the pre-approved commands for Claude Code and Codex (see above; `--undo` removes them and the name resolution) |
 | `magehand doctor [--json]` | Run it at the start of a session. Checks GitHub access, that `openbao.lab` is reachable and the sign-in; in an app's repo, also that OpenClaw's bot can write to it (a read-only or absent bot fails: `gh pr edit --add-reviewer` then exits 0 and adds nobody; a pending invitation is a note), that the repo is private, and that it has the approval ruleset (an archived repo, a retired app, is not checked), active, covering the default branch and requiring an approval (`magehand new REPO`, run in the checkout, invites the bot and adds a missing ruleset but never changes an existing, weaker one: fix that in Settings > Rules; the ruleset and invitations are only readable by an admin, and anything unreadable is a note, not a failure); shows the container runtime (missing is fine unless the app has database blocks) |
-| `magehand upgrade` | Upgrades magehand the way it was installed (`uv tool upgrade`, `pipx upgrade` or pip in its venv) and refreshes the skill if you installed it. Never automatic: you run it when a command tells you (stderr, at most once a day, never in CI or scripts) that a newer version is out. In OpenClaw's VM it refuses: that copy is pinned in homelab `platform/openclaw/vm/versions.env` |
+| `magehand upgrade` | Upgrades magehand the way it was installed (`uv tool upgrade`, `pipx upgrade` or pip in its venv) then runs the new version's `setup` quietly: it refreshes the skill and the pre-approved commands where setup installed them, and says when `magehand setup` needs you. Never automatic: you run it when a command tells you (stderr, at most once a day, never in CI or scripts) that a newer version is out. In OpenClaw's VM it refuses: that copy is pinned in homelab `platform/openclaw/vm/versions.env` |
 | `magehand skill [--install]` | The `homelab-app` skill, which tells Claude Code and Codex to use `app`, `guide search` and `check` while working on app code. `setup` installs it (`$CLAUDE_CONFIG_DIR` or `~/.claude`, and `$CODEX_HOME` or `~/.codex` if Codex is installed) |
 | `magehand version`, `magehand -V` | The installed version, and whether a newer one exists |
 
