@@ -4101,8 +4101,9 @@ class Status(unittest.TestCase):
         finally:
             magehand.kubectl_json = saved
 
-    def recorded(self, state, image=None, description='', statuses=True, error=None):
-        """A gh_query stub: GitHub's answer for one platform Deployment of HEAD with `state` as its newest status."""
+    def recorded(self, state, image=None, description='', statuses=True, error=None, payload=None):
+        """A gh_query stub: GitHub's answer for one platform Deployment of HEAD with `state` as its newest status
+        (`payload` replaces the platform's)."""
         def query(*args):
             path = args[1]
             if error:
@@ -4112,7 +4113,8 @@ class Status(unittest.TestCase):
                         if statuses else []), None
             if 'deployments?' in path:
                 self.asked = path
-                return [{'id': 3, 'payload': {'image': image or self.IMAGE}, 'created_at': '2026-10-24T09:10:00Z'}], None
+                mine = {'image': image or self.IMAGE, 'application': 'demo-dev'} if payload is None else payload
+                return [{'id': 3, 'payload': mine, 'created_at': '2026-10-24T09:10:00Z'}], None
             return None, 'unexpected ' + path
         return query
 
@@ -4141,6 +4143,29 @@ class Status(unittest.TestCase):
         with mock.patch.object(magehand, 'gh_query', self.recorded('failure')), \
                 mock.patch.object(magehand, 'kubectl_json', pods):
             self.assertEqual(magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD)['state'], 'ok')
+
+    def test_current_pods_win_over_a_recorded_success(self):
+        crashing = lambda *a: (({'items': [self.pod(ready=False, waiting='CrashLoopBackOff')]} if a[0] == 'pods'  # noqa: E731
+                                else self.argo(health='Degraded')), None)
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        with mock.patch.object(magehand, 'gh_query', self.recorded('success')), \
+                mock.patch.object(magehand, 'kubectl_json', crashing):
+            stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD)
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('CrashLoopBackOff', stage['text'])
+        with mock.patch.object(magehand, 'gh_query', self.recorded('success')), \
+                mock.patch.object(magehand, 'kubectl_json', lambda *a: ({'items': []} if a[0] == 'pods' else self.argo(), None)):
+            self.assertEqual(magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD)['state'],
+                             'pending', 'no pods now: not running, whatever was recorded')
+
+    def test_only_the_platforms_own_records_count(self):
+        for payload in ('a string payload', {}, {'image': self.IMAGE}, {'image': self.IMAGE, 'application': 'other-dev'},
+                        {'application': 'demo-dev'}, {'image': 'ghcr.io/example/app@sha256:' + 'b' * 64,
+                                                      'application': 'demo-dev'}):
+            with self.subTest(payload=payload):
+                stage = self.dev(self.recorded('success', payload=payload))
+                self.assertEqual(stage['state'], 'unknown')
+                self.assertIn('not visible from this machine', stage['text'])
 
     def test_dev_without_a_usable_deployment_is_as_before(self):
         for recorded in (self.recorded('success', image='ghcr.io/example/app@sha256:' + 'b' * 64),
@@ -4191,9 +4216,10 @@ class Status(unittest.TestCase):
             for n, v in before.items():
                 setattr(magehand, n, v)
 
-    def status_with(self, deploy_checks=(), fail=None):
+    def status_with(self, deploy_checks=(), fail=None, prod=None):
         """Run `status` through a fake gh: an app whose build and release are fine, a dev deploy PR with
-        `deploy_checks`, and every query whose arguments contain `fail` (a string) failing."""
+        `deploy_checks`, the platform's production Deployment of v1.2.0 in state `prod` (None: none), and every
+        query whose arguments contain `fail` (a string) failing."""
         owner = magehand.OWNER
         run = self.build_run()
 
@@ -4220,6 +4246,12 @@ class Status(unittest.TestCase):
                 return 0, json.dumps([{'tag_name': 'v1.2.0', 'author': {'login': owner}}]), ''
             if '/compare/' in line:
                 return 0, json.dumps({'ahead_by': 2}), ''
+            if line.endswith('/commits/v1.2.0'):
+                return 0, json.dumps({'sha': 'f' * 40}), ''
+            if prod and f'deployments?environment=production&sha={"f" * 40}' in line:
+                return 0, json.dumps([{'id': 4, 'payload': {'application': 'demo-prod', 'image': 'x'}}]), ''
+            if prod and '/deployments/4/statuses' in line:
+                return 0, json.dumps([{'state': prod, 'description': 'it gave up', 'created_at': '2026-10-24T09:15:00Z'}]), ''
             return 1, '', 'unexpected: ' + line
         names = ('status_target', 'gh_probe')
         before = {n: getattr(magehand, n) for n in names}
@@ -4231,6 +4263,16 @@ class Status(unittest.TestCase):
             for n, v in before.items():
                 setattr(magehand, n, v)
         return code, json.loads(out), err
+
+    def test_a_failed_production_rollout_fails_status(self):
+        code, report, _ = self.status_with(prod='failure')
+        prod = report['stages'][-1]
+        self.assertEqual((code, report['ok'], prod['state']), (1, False, 'failed'))
+        self.assertIn('v1.2.0: it gave up', prod['text'])
+        self.assertIn('magehand release demo --dry-run', report['next'])
+        code, report, _ = self.status_with(prod='success')
+        self.assertEqual((code, report['stages'][-1]['state']), (0, 'ok'))
+        self.assertIn('v1.2.0 running', report['stages'][-1]['text'])
 
     def test_a_failed_comparison_is_an_error_not_a_prod_success(self):
         code, report, _ = self.status_with(fail='/compare/')
