@@ -15,7 +15,8 @@
   are `magehand new` (an app's repo on GitHub, and its platform setup: the
   bot with write and the approval ruleset, made true on any non-archived repo
   from the template; it never removes anything, edits an existing ruleset or
-  changes visibility), `magehand pr ready` (a green PR marked ready and
+  changes visibility; and, in the repo's checkout only, the scaffold's missing
+  files and AGENTS.md's platform rules, never overwriting another file), `magehand pr ready` (a green PR marked ready and
   OpenClaw's review requested, then read back; as whoever `gh` is signed in
   as) and `magehand release` (a tag
   and release on an app's repo), both as the owner through `gh`, and

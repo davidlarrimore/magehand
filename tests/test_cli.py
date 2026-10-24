@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2607,6 +2608,213 @@ class PrReady(unittest.TestCase):
         code, out, writes = self.run_pr(author=magehand.BOT, draft=False)
         self.assertEqual((code, writes), (0, []))
         self.assertIn('no review is requested', out)
+
+
+class Scaffold(unittest.TestCase):
+    """`new` writes a deployable app's missing files into the checkout, never over one that exists."""
+
+    def test_writes_a_deployable_app_that_passes_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            written = magehand.scaffold(root, 'demo', 'demo')
+            self.assertEqual(sorted(written), sorted(magehand.SCAFFOLD_FILES))
+            self.assertNotIn('app:', (root / 'deploy/app.yaml').read_text().split('services')[0].split('\n', 2)[-1])
+            argv = ['check', 'demo', '--code', str(root), '--json']
+            with mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                    mock.patch.object(magehand, 'check_agents_drift', lambda root: []), \
+                    mock.patch.object(magehand, 'check_merged_branch', lambda root: []):
+                code, out, _ = CommandLine.run_main(self, *argv)
+            report = json.loads(out)
+            self.assertEqual((code, report['errors']), (0, 0), report['findings'])
+            self.assertEqual([f for f in report['findings'] if f['level'] == 'warning'], [])
+            self.assertIn('deploy/dev', report['skipped'][0])  # rendering is the module's stub here
+
+    def test_the_generated_app_passes_its_own_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            magehand.scaffold(tmp, 'demo', 'demo')
+            # the Dockerfile's test stage runs exactly this, in /app
+            run = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'],
+                                 cwd=tmp, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_never_overwrites_and_keeps_another_stack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'Dockerfile').write_text('FROM node\n')
+            (root / 'deploy/base').mkdir(parents=True)
+            (root / 'deploy/base/web.yaml').write_text('kind: Deployment\n')
+            written = magehand.scaffold(root, 'demo', 'demo')
+            self.assertEqual((root / 'Dockerfile').read_text(), 'FROM node\n')
+            self.assertFalse(set(written) & set(magehand.SCAFFOLD_CODE + magehand.SCAFFOLD_BASE), written)
+            self.assertEqual(sorted(written), ['deploy/app.yaml', 'deploy/dev/kustomization.yaml', 'ui-check.yaml'])
+            self.assertEqual(magehand.scaffold(root, 'demo', 'demo'), [])  # safe to re-run
+
+    def test_an_app_named_unlike_its_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            magehand.scaffold(tmp, 'lab', 'lab-website')
+            root = pathlib.Path(tmp)
+            self.assertIn('app: "lab"', (root / 'deploy/app.yaml').read_text())
+            self.assertIn('namespace: "lab-dev"', (root / 'deploy/dev/kustomization.yaml').read_text())
+            self.assertIn(f'host: lab-dev.{magehand.LAB}', (root / 'deploy/base/ingress.yaml').read_text())
+
+    def checkout(self, tmp, origin):
+        subprocess.run(['git', 'init', '-q', tmp], check=True)
+        subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', origin], check=True)
+        return pathlib.Path(tmp)
+
+    def gh(self, name):
+        """GitHub as `new` sees it for an existing, set-up repo NAME with no deploy/app.yaml on main."""
+        def gh(*args, **kw):
+            if args[0] == 'api' and args[-1].endswith('/contents/deploy/app.yaml'):
+                return (0, '', '') if '-X' in args else (1, '', 'gh: Not Found (HTTP 404)')
+            if args[:2] == ('api', f'repos/davidlarrimore/{name}') and '.private, .archived' in args:
+                return 0, 'true\nfalse\n', ''
+            if args[0] == 'api' and args[1].endswith('/collaborators/davidlarrimore-bot/permission'):
+                return 0, 'write write\n', ''
+            if args[:2] == ('api', f'repos/davidlarrimore/{name}/rulesets'):
+                return 0, json.dumps([{'id': 7, 'name': magehand.RULESET['name']}]), ''
+            if args[:2] == ('api', f'repos/davidlarrimore/{name}/rulesets/7'):
+                return 0, json.dumps(dict(magehand.RULESET, id=7)), ''
+            if args[:2] == ('api', f'repos/davidlarrimore/{name}') and '.default_branch' in args:
+                return 0, 'main\n', ''
+            if args[0] == 'api' and args[1].startswith(f'repos/davidlarrimore/{name}/rules/branches/main'):
+                return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]), ''
+            return 0, '', ''
+        return gh
+
+    def run_new_here(self, root, *argv, name='elvis', agents=None):
+        with mock.patch.object(magehand, 'gh_cli', self.gh(name)), \
+                mock.patch.object(magehand, 'current_repo', lambda *a: f'davidlarrimore/{name}'), \
+                mock.patch.object(magehand, 'checkout_top', lambda *a: root), \
+                mock.patch.object(magehand, 'agents_text', agents or (lambda path: (None, '# rules\n\n## This app\n', None))):
+            code, out, _ = CommandLine.run_main(self, 'new', name, '--json', *argv)
+        return code, json.loads(out)
+
+    def test_new_writes_into_its_own_checkout_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            code, report = self.run_new_here(root)
+            self.assertEqual(code, 0)
+            self.assertIn('Dockerfile', report['wrote'])
+            self.assertIn('AGENTS.md', report['wrote'])
+            self.assertTrue((root / 'deploy/dev/kustomization.yaml').is_file())
+            self.assertIn('commit what new wrote', report['next'])
+        with tempfile.TemporaryDirectory() as tmp:  # a checkout of another repo: nothing written
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/magehand.git')
+            _, report = self.run_new_here(root)
+            self.assertEqual(report['wrote'], [])
+            self.assertEqual(list(root.iterdir()), [root / '.git'])
+        with tempfile.TemporaryDirectory() as tmp:  # another owner's repo of the same name: nothing written
+            root = self.checkout(tmp, 'https://github.com/example/elvis.git')
+            _, report = self.run_new_here(root)
+            self.assertEqual(report['wrote'], [])
+        with tempfile.TemporaryDirectory() as tmp:  # a look-alike host: nothing written
+            root = self.checkout(tmp, 'https://notgithub.com/davidlarrimore/elvis.git')
+            _, report = self.run_new_here(root)
+            self.assertEqual(report['wrote'], [])
+        with tempfile.TemporaryDirectory() as tmp:  # a plain directory inside the right checkout: not its top
+            top = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            (top / 'elvis').mkdir()
+            with mock.patch.object(magehand, 'gh_cli', self.gh('elvis')), \
+                    mock.patch.object(magehand, 'current_repo', lambda *a: None), \
+                    mock.patch.object(magehand, 'clone_repo', lambda repo, dest: 'exists'):
+                _, out, _ = CommandLine.run_main(self, 'new', 'elvis', '--dir', str(top / 'elvis'), '--json')
+            self.assertEqual(json.loads(out)['wrote'], [])
+            self.assertEqual(list((top / 'elvis').iterdir()), [])
+
+    def test_the_origin_names_owner_and_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for url, expected in (('git@github.com:davidlarrimore/elvis.git', 'davidlarrimore/elvis'),
+                                  ('https://github.com/example/elvis', 'example/elvis'),
+                                  ('https://github.com/example/my.app.git/', 'example/my.app'),
+                                  ('ssh://git@github.com/davidlarrimore/elvis.git', 'davidlarrimore/elvis'),
+                                  ('https://gitlab.example.com/x/elvis.git', None),
+                                  ('https://notgithub.com/davidlarrimore/elvis.git', None),
+                                  ('git@notgithub.com:davidlarrimore/elvis.git', None),
+                                  ('https://github.com.example.com/davidlarrimore/elvis.git', None),
+                                  ('https://example.com/github.com/davidlarrimore/elvis.git', None),
+                                  ('/srv/git/github.com/davidlarrimore/elvis.git', None)):
+                subprocess.run(['git', 'init', '-q', tmp], check=True)
+                subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)
+                subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', url], check=True)
+                self.assertEqual(magehand.origin_repo(tmp), expected, url)
+
+    def test_names_yaml_would_retype_stay_strings(self):
+        for app in ('null', 'true', '123'):
+            with tempfile.TemporaryDirectory() as tmp:
+                magehand.scaffold(tmp, app, app)
+                for rel in magehand.SCAFFOLD_FILES:
+                    if rel.endswith('.yaml') and rel.startswith('deploy/') and rel != 'deploy/app.yaml':
+                        doc = magehand.yaml.safe_load((pathlib.Path(tmp) / rel).read_text())
+                        if 'metadata' in doc:
+                            self.assertEqual(doc['metadata']['name'], app, rel)
+                        if rel.endswith('deployment.yaml'):
+                            self.assertEqual(doc['spec']['selector']['matchLabels']['app'], app)
+                            self.assertEqual(doc['spec']['template']['metadata']['labels']['app'], app)
+                        if rel.endswith('service.yaml'):
+                            self.assertEqual(doc['spec']['selector']['app'], app)
+                        if rel.endswith('ingress.yaml'):
+                            self.assertEqual(doc['spec']['rules'][0]['http']['paths'][0]['backend']['service']['name'], app)
+                        if rel.endswith('dev/kustomization.yaml'):
+                            self.assertEqual(doc['namespace'], f'{app}-dev')
+
+
+class ScaffoldCases(unittest.TestCase):
+    """The cases the local review found: the app's own name, a fresh seed, other code, no template."""
+
+    checkout, gh, run_new_here = Scaffold.checkout, Scaffold.gh, Scaffold.run_new_here
+
+    def test_the_checkouts_own_app_name_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/lab-website.git')
+            (root / 'deploy').mkdir()
+            (root / 'deploy/app.yaml').write_text('app: "lab"\nservices: {}\n')
+            _, report = self.run_new_here(root, name='lab-website')
+            self.assertIn('namespace: "lab-dev"', (root / 'deploy/dev/kustomization.yaml').read_text())
+            self.assertNotIn('deploy/app.yaml', report['wrote'])
+
+    def test_a_seed_just_committed_is_pulled_not_rivalled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/lab-website.git')
+            _, report = self.run_new_here(root, '--app-name', 'lab', name='lab-website')
+            self.assertFalse((root / 'deploy/app.yaml').exists())
+            self.assertIn('namespace: "lab-dev"', (root / 'deploy/dev/kustomization.yaml').read_text())
+            self.assertIn('pull', report['next'])
+            self.assertEqual(report['dir'], str(root))
+
+    def test_the_pull_step_is_in_the_human_output_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/lab-website.git')
+            with mock.patch.object(magehand, 'gh_cli', self.gh('lab-website')), \
+                    mock.patch.object(magehand, 'current_repo', lambda *a: 'davidlarrimore/lab-website'), \
+                    mock.patch.object(magehand, 'checkout_top', lambda *a: root), \
+                    mock.patch.object(magehand, 'agents_text', lambda path: (None, '# rules\n\n## This app\n', None)):
+                _, out, _ = CommandLine.run_main(self, 'new', 'lab-website', '--app-name', 'lab')
+        self.assertIn('1. run:   git -C', out)
+        self.assertIn('pull', out.splitlines()[-1])
+
+    def test_a_repo_with_its_own_code_gets_no_python_scaffold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            (root / 'package.json').write_text('{}')
+            _, report = self.run_new_here(root)
+            self.assertFalse(set(report['wrote']) & set(magehand.SCAFFOLD_CODE))
+            self.assertIn('deploy/dev/kustomization.yaml', report['wrote'])
+
+    def test_no_template_still_reports_what_was_written(self):
+        def offline(path):
+            sys.exit('magehand: cannot read davidlarrimore/homelab-app-template/AGENTS.md from GitHub')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            code, report = self.run_new_here(root, agents=offline)
+        self.assertEqual(code, 0)
+        self.assertIn('Dockerfile', report['wrote'])
+        self.assertNotIn('AGENTS.md', report['wrote'])
+
+    def test_the_commit_step_fits_what_was_written(self):
+        self.assertIn('review the AGENTS.md diff', magehand.commit_step(['AGENTS.md']))
+        self.assertNotIn('registers', magehand.commit_step(['ui-check.yaml']))
+        self.assertIn('registers the app', magehand.commit_step(['deploy/app.yaml', 'AGENTS.md']))
 
 
 class ManagedCopy(unittest.TestCase):
