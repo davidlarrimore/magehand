@@ -2858,7 +2858,13 @@ class Approvals(unittest.TestCase):
                                   ('magehand release elvis', None), ('magehand statusx', None),
                                   ('echo "unterminated', None), ('cd', 'allow'),
                                   ('gh pr view 3 && gh pr merge 3', 'deny'), ('git push --tags', 'deny'),
-                                  ('gh release create v1.0.0', 'deny'), ('echo $(gh pr merge 3)', None)):
+                                  ('gh release create v1.0.0', 'deny'), ('echo $(gh pr merge 3)', None),
+                                  # bash sees `x#` as a word: what follows is a command, not a comment
+                                  ('magehand status x#;rm -rf ~', None), ('cd a#; curl x | sh', None),
+                                  ('magehand status # a note', None), ('magehand status \\; echo', None),
+                                  ('magehand status *', None), ('magehand status ~', None),
+                                  ('magehand status\necho hi', None), ('magehand status x#;gh pr merge 3', 'deny'),
+                                  ("gh pr view '3' --json=title", 'allow')):
             found = self.hook(command)
             self.assertEqual(found and found[0], decision, command)
         self.assertEqual(self.hook('cd app && magehand check')[1], "magehand: magehand's read-only commands")
@@ -2871,10 +2877,17 @@ class Approvals(unittest.TestCase):
         self.assertEqual(manifest['name'], magehand.APPROVALS_PLUGIN)
         hooks = json.loads((self.plugin / 'hooks/hooks.json').read_text())['hooks']['PreToolUse']
         self.assertEqual(hooks[0]['matcher'], 'Bash')
-        self.assertTrue(hooks[0]['hooks'][0]['command'].startswith(sys.executable))
+        with mock.patch.object(magehand, 'install_method', lambda: 'venv'):  # a venv may go: python3 from PATH
+            magehand.install_approvals()
+        command = json.loads((self.plugin / 'hooks/hooks.json').read_text())['hooks']['PreToolUse'][0]['hooks'][0]
+        self.assertTrue(command['command'].startswith('/usr/bin/env python3 -I '), command)
+        with mock.patch.object(magehand, 'install_method', lambda: 'uv'):  # uv's tool Python stays put
+            magehand.install_approvals()
+        command = json.loads((self.plugin / 'hooks/hooks.json').read_text())['hooks']['PreToolUse'][0]['hooks'][0]
+        self.assertTrue(command['command'].startswith(f'{sys.executable} -I '), command)
         self.assertFalse((self.codex / 'rules').exists())  # Codex isn't installed here: no rules for it
 
-    def test_codex_rules_say_the_same_and_a_rejected_file_is_removed(self):
+    def test_codex_rules_say_the_same_and_a_rejected_file_never_replaces_a_working_one(self):
         self.codex.mkdir(parents=True)
         with mock.patch.object(magehand, 'codex_rules_problem', lambda path: None):
             results = magehand.install_approvals()
@@ -2885,10 +2898,13 @@ class Approvals(unittest.TestCase):
                       'justification = "the owner merges")', text)
         self.assertIn('["magehand", ["status", "app", "check", "doctor", "guide", "version", "help"]]', text)
         self.assertEqual(text.count('prefix_rule('), len(magehand.APPROVALS))
-        with mock.patch.object(magehand, 'codex_rules_problem', lambda path: 'parse error'):
+        checked = []
+        with mock.patch.object(magehand, 'codex_rules_problem', lambda path: checked.append(path) or 'parse error'):
             results = magehand.install_approvals()
         self.assertEqual(results[-1], (rules, 'parse error'))
-        self.assertFalse(rules.exists())  # a file Codex can't load would break Codex: never left behind
+        self.assertNotEqual(checked[0].parent, rules.parent)  # checked outside rules/, where Codex reads
+        self.assertEqual(rules.read_text(), text)  # the working file stays
+        self.assertEqual(sorted(p.name for p in self.codex.iterdir()), ['rules'])  # no draft left behind
 
     def test_codex_check_reads_the_decision(self):
         allow = mock.Mock(returncode=0, stdout='{"decision": "allow"}', stderr='')
@@ -2956,6 +2972,42 @@ class Approvals(unittest.TestCase):
                 code, out, _ = CommandLine.run_main(self, 'upgrade')
         self.assertEqual(code, 0)
         self.assertEqual(calls, [['version'], ['setup', '--refresh']])
+
+    def upgrade_with_refresh(self, refresh_code):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[1:])
+            return mock.Mock(returncode=refresh_code if cmd[1:] == ['setup', '--refresh'] else 0,
+                             stdout='0.38.0\n', stderr='')
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'magehand').write_text('')
+            with mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                    mock.patch.object(magehand, 'installed_version', lambda: '0.38.0'), \
+                    mock.patch.object(magehand, 'latest_version', lambda max_age=0: '0.38.0'), \
+                    mock.patch.object(magehand.sys, 'executable', str(pathlib.Path(tmp) / 'python')), \
+                    mock.patch.object(magehand.subprocess, 'run', run):
+                code, out, _ = CommandLine.run_main(self, 'upgrade')
+        return code, out, calls
+
+    def test_upgrade_to_a_version_without_refresh_installs_its_skill(self):
+        magehand.install_skill()
+        code, out, calls = self.upgrade_with_refresh(2)
+        self.assertEqual((code, calls[-1], out.splitlines()[-1]), (0, ['skill', '--install'], 'next: nothing'))
+        code, out, calls = self.upgrade_with_refresh(1)  # a refresh that failed: setup is the step
+        self.assertEqual((code, out.splitlines()[-1]), (0, 'next: `magehand setup`'))
+
+    def test_doctor_notes_missing_approvals(self):
+        with mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                mock.patch.object(magehand.urllib.request, 'urlopen', mock.Mock(side_effect=OSError())), \
+                mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                mock.patch.object(magehand, 'current_repo', lambda *a: None):
+            _, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+            self.assertIn('pre-approved commands', [r['check'] for r in json.loads(out)['checks']])
+            magehand.install_approvals()
+            _, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+            self.assertNotIn('pre-approved commands', [r['check'] for r in json.loads(out)['checks']])
 
 
 class ManagedCopy(unittest.TestCase):

@@ -3033,6 +3033,12 @@ def cmd_doctor(a):
         results.append({'check': 'sign-in time left', 'ok': None, 'hint': note})
         if not a.json:
             print(f'--   {note}')
+    if not managed and not approvals_installed():
+        note = ('pre-approved commands for Claude Code and Codex: not installed (`magehand setup` installs them, '
+                'so routine magehand and gh commands need no prompt)')
+        results.append({'check': 'pre-approved commands', 'ok': None, 'hint': note})
+        if not a.json:
+            print(f'--   {note}')
     repo = current_repo()
     state = repo_state(repo) if repo else None
     if state and state['archived']:
@@ -3982,6 +3988,11 @@ def skill_dirs():
     return dirs
 
 
+def skill_installed():
+    """Whether setup installed the skill here (upgrade refreshes it only then)."""
+    return any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs())
+
+
 def install_skill():
     """Writes the skill (refreshed on every run, so an upgrade of magehand updates it); returns the paths."""
     paths = []
@@ -4050,6 +4061,7 @@ def decide(command):
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|')
         lexer.whitespace_split = True
+        lexer.commenters = ''  # bash starts a comment only at a word's start: `x#;rm` is two commands
         tokens = list(lexer)
     except ValueError:
         return None
@@ -4068,7 +4080,10 @@ def decide(command):
             if decision == 'forbidden':
                 return 'deny', why
         allowed.append(next((why for decision, why in hits if decision == 'allow'), None))
-    plain = not re.search(r'[<>`$(){{}}\\n]|(^|\\s)[A-Za-z_][A-Za-z0-9_]*=', command)
+    # Only characters with no meaning to bash beyond words, quotes and the separators: no redirect, substitution,
+    # subshell, glob, comment, escape or newline; and no assignment (`FOO=1 cmd`).
+    plain = (re.fullmatch(r'[A-Za-z0-9_ ./:@%+,=\\x27"&|;-]*', command)
+             and not re.search(r'(^|[\\s;&|])[A-Za-z_][A-Za-z0-9_]*=', command))
     if plain and parts and all(allowed):
         return 'allow', allowed[-1]
     return None
@@ -4135,17 +4150,25 @@ def install_approvals():
                        'merges, releases and tag pushes are refused. ' + GENERATED}, indent=2) + '\n')
     (plugin / 'hooks' / 'approve.py').write_text(APPROVE_HOOK.format(generated=GENERATED,
                                                                      rules=json.dumps(approval_rules())))
-    command = f'{shlex.quote(sys.executable)} "${{CLAUDE_PLUGIN_ROOT}}/hooks/approve.py"'
+    # uv's and pipx's own Python stays put across upgrades; any other (a uvx run, a venv) may not: python3. -I keeps
+    # the user's PYTHONPATH and the project's files out of the hook that decides what runs.
+    python = shlex.quote(sys.executable) if install_method() in ('uv', 'pipx') else '/usr/bin/env python3'
+    command = f'{python} -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/approve.py"'
     (plugin / 'hooks' / 'hooks.json').write_text(json.dumps({'hooks': {'PreToolUse': [
         {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}]}}, indent=2) + '\n')
     results.append((plugin, None))
     if codex_dir().is_dir():
         rules = codex_dir() / 'rules' / CODEX_RULES
         rules.parent.mkdir(parents=True, exist_ok=True)
-        rules.write_text(codex_rules_text())
-        problem = codex_rules_problem(rules)
-        if problem:  # a rules file Codex can't load would break Codex itself: never leave one behind
-            rules.unlink()
+        # Checked outside rules/ (Codex reads every file there), then moved in: a rules file Codex can't load
+        # would break Codex itself, so a rejected one never replaces the file there.
+        draft = codex_dir() / f'{CODEX_RULES}.new'
+        draft.write_text(codex_rules_text())
+        problem = codex_rules_problem(draft)
+        if problem:
+            draft.unlink()
+        else:
+            os.replace(draft, rules)
         results.append((rules, problem))
     return results
 
@@ -4266,7 +4289,7 @@ def cmd_setup(a):
 def setup_refresh(host):
     """`setup --refresh`, which `upgrade` runs from the new version: rewrite the skill and the approvals where
     setup installed them, check what can break without asking anything, and say whether setup is needed."""
-    if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
+    if skill_installed():
         install_skill()
         print('refreshed the homelab-app skill')
     if approvals_installed():
@@ -4413,10 +4436,14 @@ def cmd_upgrade(_a):
     print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}', flush=True)
     # The new version's own setup, quietly: it refreshes the skill and the approvals where setup put them, and
     # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
-    if subprocess.run([str(exe), 'setup', '--refresh']).returncode == 2:  # nosec B603
-        if any((base / SKILL_NAME / 'SKILL.md').is_file() for base in skill_dirs()):
+    code = subprocess.run([str(exe), 'setup', '--refresh']).returncode  # nosec B603
+    if code == 2:
+        if skill_installed():
             subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL)  # nosec B603
         print(next_line(None))
+    elif code != 0:  # its own `next:` may not have been printed
+        print("the new version's quiet setup failed (see above)")
+        print(next_line('`magehand setup`'))
 
 
 def cmd_version(_a):

@@ -39,7 +39,8 @@ with a redirect, `$(…)` or an assignment. `setup --undo` removes them. This is
 ruleset on `main`, where only your approval merges, is the boundary. Every other command assumes setup is done.
 Upgrade with `magehand upgrade` (any command says, at most once a day, when a new version is out): it then runs the
 new version's setup quietly, which refreshes the skill and the pre-approved commands and says if `magehand setup`
-needs you. In an app repo, `magehand check` says when `AGENTS.md`'s platform rules are out of date; `magehand new
+needs you. (An upgrade from 0.37 or earlier is run by the old version, which doesn't do this: run `magehand
+setup` once after it; `magehand doctor` says when the pre-approved commands aren't installed.) In an app repo, `magehand check` says when `AGENTS.md`'s platform rules are out of date; `magehand new
 REPO` or `magehand update-agents` refreshes them.
 
 ## Commands
