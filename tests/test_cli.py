@@ -4991,6 +4991,8 @@ class CheckUI(unittest.TestCase):
         files = {magehand.BUILD_WORKFLOW: BUILD_APP, magehand.UI_SCRIPT: 'print("ui check")\n'}
         for patch in (mock.patch.object(magehand, 'CACHE', pathlib.Path(tmp.name) / 'cache'),
                       mock.patch.object(magehand, 'runtime', lambda: 'docker'),
+                      mock.patch.object(magehand.shutil, 'which', lambda cli: '/usr/bin/' + cli),
+                      mock.patch.object(magehand, 'checkout_app', lambda root: None),  # not a git checkout
                       mock.patch.object(magehand, 'update_notice', lambda: None),
                       mock.patch.object(magehand, 'install_method', lambda *a: 'uv'),
                       mock.patch.object(magehand, 'github_file', lambda repo, path, **k: files[path]),
@@ -5000,19 +5002,25 @@ class CheckUI(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    failing = ()  # engine() commands that fail, by their first two words
+
     def engine(self, *args, check=True, env=None):
         self.calls.append((args, env))
+        if args[:2] in self.failing:
+            return subprocess.CompletedProcess(args, 1, '', 'Error: pull access denied\n')
+        if args[0] == 'cp':  # the Playwright container's /out, copied out as the user
+            out = pathlib.Path(args[2])
+            out.mkdir()
+            if self.result == 'no answer':
+                (out / magehand.UI_NO_ANSWER).write_text('')
+            else:
+                (out / 'report.md').write_text('# Browser check\n\n## ok home\n' if self.result == 0 else
+                                               '# Browser check\n\n## FAIL home\n- overflow\n')
         return subprocess.CompletedProcess(args, 0, 'app log line\n', '')
 
     def fake_run(self, argv, **kwargs):
         self.runs.append(argv)
-        if argv[1] == 'run':  # the Playwright container: report.md into the mounted out dir
-            out = pathlib.Path(argv[argv.index('-v', argv.index('-v') + 2) + 3].split(':')[0])
-            if self.result != 3:
-                (out / 'report.md').write_text('# Browser check\n\n## ok home\n' if self.result == 0 else
-                                               '# Browser check\n\n## FAIL home\n- overflow\n')
-            return subprocess.CompletedProcess(argv, self.result)
-        return subprocess.CompletedProcess(argv, 0)
+        return subprocess.CompletedProcess(argv, 1 if argv[1] == 'run' and self.result else 0)
 
     def check(self, *extra):
         return self.run_main('check', '--ui', '-a', 'demo', '--code', str(self.root), *extra)
@@ -5053,13 +5061,14 @@ class CheckUI(unittest.TestCase):
         code, out, err = self.check('--json')
         report = json.loads(out)
         self.assertEqual((code, report['ok']), (1, False))
-        self.assertIn('`magehand check --ui` again', report['next'])
+        self.assertIn(f'then `magehand check --ui -a demo --code {self.root}`', report['next'])
         self.assertIn('app log line', err)
-        self.assertEqual(self.calls[-2][0], ('rm', '-f', 'magehand-ui-demo-app', 'magehand-ui-demo-postgres'))
+        self.assertEqual(self.calls[-2][0], ('rm', '-f', 'magehand-ui-demo-app', 'magehand-ui-demo-postgres',
+                                             'magehand-ui-demo-browser'))
         self.assertEqual(self.calls[-1][0], ('network', 'rm', 'magehand-ui-demo'))
 
     def test_an_app_that_never_answers_names_the_port(self):
-        self.result = 3
+        self.result = 'no answer'
         code, out, err = self.check()
         self.assertEqual((code, out), (1, ''))
         self.assertIn('did not answer on port 8080', err)
@@ -5084,6 +5093,45 @@ class CheckUI(unittest.TestCase):
             code, _, err = self.check()
         self.assertEqual((code, self.calls), (1, []))
         self.assertIn('build failed', err)
+
+    def test_a_container_that_fails_to_start_says_why_and_cleans_up(self):
+        self.failing = (('run', '-d'),)
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('starting Postgres failed: Error: pull access denied', err)
+        self.assertEqual(self.calls[-1][0], ('network', 'rm', 'magehand-ui-demo'))
+
+    def test_postgres_that_never_gets_ready_stops_the_run(self):
+        self.failing = (('exec', 'magehand-ui-demo-postgres'),)
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('Postgres was not ready within 30s', err)
+        ready = next(a for a, _ in self.calls if a[0] == 'exec')
+        self.assertIn('127.0.0.1', ready)  # over TCP: initdb's temporary server answers only on its socket
+
+    def test_a_runtime_that_is_not_installed_says_so(self):
+        with mock.patch.object(magehand.shutil, 'which', lambda cli: None):
+            code, _, err = self.check()
+        self.assertEqual((code, self.runs), (1, []))
+        self.assertIn('`magehand runtime auto`', err)
+
+    def test_another_app_s_checkout_is_not_checked_under_this_name(self):
+        with mock.patch.object(magehand, 'checkout_app', lambda root: 'other'):
+            code, _, err = self.check()
+        self.assertEqual((code, self.runs), (1, []))
+        self.assertIn("is other's code", err)
+
+    def test_a_bad_port_names_the_field(self):
+        (self.root / 'ui-check.yaml').write_text('port: 80a\n')
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("port: '80a' is not a port number", err)
+
+    def test_a_last_run_that_cannot_be_cleared_says_what_to_remove(self):
+        with mock.patch.object(magehand.shutil, 'rmtree', mock.Mock(side_effect=PermissionError('denied'))):
+            code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('cannot clear the last run', err)
 
     def test_it_is_the_browser_check_only(self):
         code, _, err = self.check('--manifests-only')

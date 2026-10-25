@@ -3881,35 +3881,41 @@ UI_SCRIPT = '.github/ui-check/ui_check.py'
 BUILD_WORKFLOW = '.github/workflows/build-app.yaml'
 UI_PINS = ('PLAYWRIGHT_VERSION', 'AXE_VERSION', 'AXE_SHA256', 'POSTGRES_IMAGE')
 UI_POSTGRES_URL = 'postgresql://ui:ui@ui-postgres:5432/ui'  # the throwaway database, named as CI names it
+UI_CACHE_VOLUME = 'magehand-ui-check-cache'  # pip's wheels and axe-core between runs (a volume: no host file owners)
+UI_NO_ANSWER = 'no-answer'  # the runner's marker in /out: the app never answered
 # Runs in the pinned Playwright image: build-app.yaml's "Browser check" installs and checks, then its script.
-UI_RUNNER = r'''import hashlib, io, os, subprocess, sys, tarfile, time, urllib.error, urllib.request
+UI_RUNNER = r'''import hashlib, os, subprocess, sys, tarfile, time, urllib.error, urllib.request
 e = os.environ
 subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check',
-                '--root-user-action=ignore', 'playwright==' + e['PLAYWRIGHT_VERSION'],
+                '--root-user-action=ignore', '--cache-dir', '/cache/pip', 'playwright==' + e['PLAYWRIGHT_VERSION'],
                 'pyyaml==' + e['PYYAML_VERSION']], check=True)
-tgz = urllib.request.urlopen('https://registry.npmjs.org/axe-core/-/axe-core-%s.tgz' % e['AXE_VERSION'],
-                             timeout=60).read()
-if hashlib.sha256(tgz).hexdigest() != e['AXE_SHA256']:
-    sys.exit('axe-core %s does not match the SHA-256 build-app.yaml pins' % e['AXE_VERSION'])
-with tarfile.open(fileobj=io.BytesIO(tgz)) as t, open('/tmp/axe.min.js', 'wb') as f:
+tgz = '/cache/axe-core-%s.tgz' % e['AXE_VERSION']
+data = open(tgz, 'rb').read() if os.path.isfile(tgz) else b''
+if hashlib.sha256(data).hexdigest() != e['AXE_SHA256']:
+    data = urllib.request.urlopen('https://registry.npmjs.org/axe-core/-/axe-core-%s.tgz' % e['AXE_VERSION'],
+                                  timeout=60).read()
+    if hashlib.sha256(data).hexdigest() != e['AXE_SHA256']:
+        sys.exit('axe-core %s does not match the SHA-256 build-app.yaml pins' % e['AXE_VERSION'])
+    open(tgz, 'wb').write(data)
+with tarfile.open(tgz) as t, open('/tmp/axe.min.js', 'wb') as f:
     f.write(t.extractfile('package/axe.min.js').read())
+os.makedirs('/out', exist_ok=True)
 url = 'http://127.0.0.1:' + e['PORT']
-for _ in range(60):
+deadline = time.monotonic() + 60
+while True:
     try:
-        urllib.request.urlopen(url + '/', timeout=5)
+        urllib.request.urlopen(url + '/', timeout=2)
         break
     except urllib.error.HTTPError:  # it answered
         break
     except OSError:
+        if time.monotonic() > deadline:
+            open('/out/no-answer', 'w').close()
+            sys.exit(1)
         time.sleep(1)
-else:
-    sys.exit(3)
-code = subprocess.run([sys.executable, '/check/ui_check.py', '--app-dir', '/app', '--base-url', url,
-                       '--axe', '/tmp/axe.min.js', '--out', '/out'], stdout=subprocess.DEVNULL).returncode  # magehand prints report.md
-for top, dirs, files in os.walk('/out'):  # the files are yours, not the container's root's
-    for n in [top] + [os.path.join(top, x) for x in files]:
-        os.chown(n, int(e['HOST_UID']), int(e['HOST_GID']))
-sys.exit(code)
+sys.exit(subprocess.run([sys.executable, '/check/ui_check.py', '--app-dir', '/app', '--base-url', url,
+                         '--axe', '/tmp/axe.min.js', '--out', '/out'],
+                        stdout=subprocess.DEVNULL).returncode)  # magehand prints report.md
 '''
 
 
@@ -3938,15 +3944,46 @@ def ui_env(cfg):
     return env
 
 
+def ui_config(path):
+    """ui-check.yaml as a mapping with a valid port, or exit saying which field is wrong."""
+    try:
+        cfg = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as error:
+        die(f'{path} is not valid YAML: {error}')
+    if not isinstance(cfg, dict):
+        die(f'{path}: the top level must be a mapping (port:, env:, pages:)')
+    port = cfg.get('port', 8000)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        die(f'{path}: port: {port!r} is not a port number (the one the app listens on)')
+    if not isinstance(cfg.get('env') or {}, dict):
+        die(f'{path}: env: must be a mapping of NAME: value')
+    return cfg
+
+
+def ui_engine(what, *args, env=None):
+    """engine() for a step of the browser check: exit saying what failed and docker's own words."""
+    result = engine(*args, check=False, env=env)
+    if result.returncode:
+        die(f'{what} failed: {(result.stderr or result.stdout).strip() or "no output"}')
+    return result
+
+
 def cmd_check_ui(a):
     refuse_if_managed('check --ui')
     root = pathlib.Path(a.code).resolve()
-    name = a.app_flag or a.app or current_app(root)
+    asked, own = a.app_flag or a.app, checkout_app(root)
+    if asked and own and asked != own:
+        die(f'{root} is {own}\'s code: checking it as {asked} would report {asked} on code it isn\'t. '
+            f'Run it in {asked}\'s checkout, or as itself (`magehand check --ui`)')
+    name = asked or own
+    if not name:
+        usage('check', 'name the app: magehand check --ui -a APP --code DIR')
+    again = shlex.join(['magehand', 'check', '--ui', '-a', name] + (['--code', a.code] if a.code != '.' else []))
     path = root / 'ui-check.yaml'
     if not path.is_file():
         die(f'{path} is missing, and CI requires it: add it (magehand guide search ui-check; '
             '`web_ui: false` in it if the app has no web UI)')
-    cfg = yaml.safe_load(path.read_text()) or {}
+    cfg = ui_config(path)
     if cfg.get('web_ui') is False:
         step = 'push (CI skips the browser check too)'
         if a.json:
@@ -3958,58 +3995,77 @@ def cmd_check_ui(a):
     cli = runtime()
     if not cli:
         die(no_runtime('check --ui'))
+    if not shutil.which(cli):
+        die(f'container runtime {cli} is configured but not installed: `magehand runtime auto` or install it')
     pins, script, env = ui_pins(), github_file(APPS_REPO, UI_SCRIPT), ui_env(cfg)
-    port = int(cfg.get('port', 8000))
+    port = cfg.get('port', 8000)
     tag = re.sub(r'[^a-z0-9-]', '-', name.lower())
     work = CACHE / 'ui-check' / tag
     out = work / 'out'
-    shutil.rmtree(work, ignore_errors=True)
+    try:
+        shutil.rmtree(work)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        die(f'cannot clear the last run ({error}): remove {shell_path(work)}, then `{again}` again')
     (work / 'check').mkdir(parents=True)
-    out.mkdir()
     (work / 'check' / 'ui_check.py').write_text(script)
     (work / 'check' / 'run.py').write_text(UI_RUNNER)
     image, net = f'magehand/{tag}:ui-check', f'magehand-ui-{tag}'
-    app_box, db_box = f'{net}-app', f'{net}-postgres'
+    app_box, db_box, check_box = f'{net}-app', f'{net}-postgres', f'{net}-browser'
     print(f'magehand: {cli} build -t {image} {shell_path(root)}', file=sys.stderr)
     if subprocess.run([cli, 'build', '-t', image, str(root)], stdout=sys.stderr).returncode:  # nosec B603  # docker/podman
-        die(f'{cli} build failed (CI builds the same Dockerfile): fix it, then `magehand check --ui` again')
-    engine('rm', '-f', app_box, db_box, check=False)
-    engine('network', 'rm', net, check=False)
+        die(f'{cli} build failed (CI builds the same Dockerfile): fix it, then `{again}`')
+
+    def clean():
+        engine('rm', '-f', app_box, db_box, check_box, check=False)
+        engine('network', 'rm', net, check=False)
+
+    clean()
     try:
-        engine('network', 'create', net)
+        ui_engine(f'{cli} network create', 'network', 'create', net)
         if any('ui-postgres' in v for v in env.values()):
             print(f'magehand: a throwaway Postgres ({pins["POSTGRES_IMAGE"].split("@")[0]})', file=sys.stderr)
-            engine('run', '-d', '--name', db_box, '--network', net, '--network-alias', 'ui-postgres',
-                   '-e', 'POSTGRES_USER=ui', '-e', 'POSTGRES_PASSWORD=ui', '-e', 'POSTGRES_DB=ui', pins['POSTGRES_IMAGE'])
+            ui_engine('starting Postgres', 'run', '-d', '--name', db_box, '--network', net, '--network-alias',
+                      'ui-postgres', '-e', 'POSTGRES_USER=ui', '-e', 'POSTGRES_PASSWORD=ui', '-e', 'POSTGRES_DB=ui',
+                      pins['POSTGRES_IMAGE'])
+            # Over TCP: during initdb the image's temporary server answers only on its socket.
             for _ in range(30):
-                if engine('exec', db_box, 'pg_isready', '-U', 'ui', '-q', check=False).returncode == 0:
+                if engine('exec', db_box, 'pg_isready', '-h', '127.0.0.1', '-U', 'ui', '-q', check=False).returncode == 0:
                     break
                 time.sleep(1)
-        # Same restrictions as in the cluster (and in CI).
-        engine('run', '-d', '--name', app_box, '--network', net, *[x for k in env for x in ('-e', k)],
-               '--read-only', '--tmpfs', '/tmp',  # nosec B108  # the container's own tmpfs
-               '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', image, env=env)
+            else:
+                logs = engine('logs', '--tail', '20', db_box, check=False)
+                die('the throwaway Postgres was not ready within 30s:\n' + (logs.stdout + logs.stderr).rstrip())
+        # As CI starts it: the cluster's read-only root and dropped capabilities.
+        ui_engine('starting the app', 'run', '-d', '--name', app_box, '--network', net,
+                  *[x for k in env for x in ('-e', k)], '--read-only', '--tmpfs', '/tmp',  # nosec B108  # the container's own tmpfs
+                  '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', image, env=env)
         print(f'magehand: {UI_SCRIPT} from {APPS_REPO}, Playwright {pins["PLAYWRIGHT_VERSION"]}, '
               f'axe-core {pins["AXE_VERSION"]}', file=sys.stderr)
-        values = {**pins, 'PORT': str(port), 'HOST_UID': str(os.getuid()), 'HOST_GID': str(os.getgid())}
+        values = {**pins, 'PORT': str(port)}
         code = subprocess.run([  # nosec B603  # docker/podman
-            cli, 'run', '--rm', '--network', f'container:{app_box}', '-v', f'{work / "check"}:/check:ro',
-            '-v', f'{root}:/app:ro', '-v', f'{out}:/out', *[x for k, v in values.items() for x in ('-e', f'{k}={v}')],
+            cli, 'run', '--name', check_box, '--network', f'container:{app_box}', '-v', f'{work / "check"}:/check:ro',
+            '-v', f'{root}:/app:ro', '-v', f'{UI_CACHE_VOLUME}:/cache',
+            *[x for k, v in values.items() for x in ('-e', f'{k}={v}')],
             f'mcr.microsoft.com/playwright/python:v{pins["PLAYWRIGHT_VERSION"]}-noble', 'python', '/check/run.py'],
             stdout=sys.stderr).returncode
+        # Copied out, not mounted: the files are then yours, whoever the container's root maps to.
+        engine('cp', f'{check_box}:/out', str(out), check=False)
         report = out / 'report.md'
         if code or not report.is_file():
             logs = engine('logs', '--tail', '50', app_box, check=False)
             print('--- app logs\n' + (logs.stdout + logs.stderr).rstrip(), file=sys.stderr)
-        if not report.is_file():
+        if (out / UI_NO_ANSWER).exists():
             die(f'the app did not answer on port {port} within 60s (its logs are above): is ui-check.yaml\'s '
-                '`port` the one it listens on?' if code == 3 else 'the browser check could not run (see above)')
+                '`port` the one it listens on?')
+        if not report.is_file():
+            die('the browser check could not run (see above)')
     finally:
-        engine('rm', '-f', app_box, db_box, check=False)
-        engine('network', 'rm', net, check=False)
+        clean()
     ok = code == 0
     step = (f'look at the screenshots in {shell_path(out)}, then push' if ok else
-            f'fix what the report lists (screenshots in {shell_path(out)}), then `magehand check --ui` again')
+            f'fix what the report lists (screenshots in {shell_path(out)}), then `{again}`')
     if a.json:
         print(json.dumps({'app': name, 'ok': ok, 'report': str(report), 'screenshots': str(out), 'next': step}, indent=1))
     else:
