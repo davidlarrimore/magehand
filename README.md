@@ -27,7 +27,7 @@ runtime this machine has (only needed for database blocks; see `magehand
 runtime` below), makes sure the homelab's `*.lab`
 names resolve (if they don't, it asks for the homelab's DNS address, your home
 gateway, and points only `*.lab` lookups at it; `magehand setup --undo`
-reverses that; when the names resolve but macOS's Local Network privacy blocks magehand's Python, it says so and which setting to change instead), then signs you in and installs the `homelab-app` skill for Claude Code (and Codex). Last, it
+reverses that; when the names resolve but macOS's Local Network privacy blocks magehand's Python (Homebrew's or uv's: Apple's own is exempt), it reinstalls magehand on Apple's `/usr/bin/python3` with uv and carries on, or, without the Xcode Command Line Tools, names the setting to change), then signs you in and installs the `homelab-app` skill for Claude Code (and Codex). Last, it
 pre-approves commands for Claude Code and Codex from one list, so their routine commands need no prompt. That covers
 magehand's read-only commands, `magehand pr ready`, and `gh`'s read-only `pr`, `run`, `issue` and `repo` commands.
 `gh pr merge`, `gh release create|edit|delete|upload`, `gh repo delete` and `git push --tags` are refused. Anything

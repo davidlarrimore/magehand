@@ -61,11 +61,15 @@ CALLBACK = 'http://localhost:8250/oidc/callback'
 PROXY_PORT = int(os.environ.get('MAGEHAND_PROXY_PORT', '8080'))
 # Block type -> the Secret its chart hands over (platform/building-blocks/*).
 NOT_SET_UP = "this machine isn't set up for the homelab: run `magehand setup`"
-# macOS 15+ Local Network privacy: a program that isn't Apple's gets the permission of the app it runs under
-# (iTerm, Terminal, VS Code), and a refused connection fails as "No route to host", which reads like DNS.
-LOCAL_NETWORK = ("macOS is keeping magehand's Python off your home network (Local Network privacy; Apple's own "
-                 "curl gets through): allow the app you run magehand in (iTerm, Terminal, VS Code...) in System "
-                 "Settings > Privacy & Security > Local Network, then quit and reopen that app")
+# macOS 15+ Local Network privacy: a program that isn't Apple's (Homebrew's or uv's Python) gets the permission
+# of the app it runs under (iTerm, Terminal, VS Code), and a refused connection fails as "No route to host",
+# which reads like DNS. Apple's own programs (its Python among them) are exempt, so setup moves magehand onto it.
+LOCAL_NETWORK = ("macOS's Local Network privacy is keeping magehand's Python off your home network (Apple's own "
+                 "curl gets through)")
+LOCAL_NETWORK_PERMISSION = ('allow the app you run magehand in (iTerm, Terminal, VS Code...) in System Settings > '
+                            'Privacy & Security > Local Network, then quit and reopen that app')
+APPLE_PYTHON = '/usr/bin/python3'  # with the Xcode Command Line Tools; without them it only offers to install them
+APPLE_PREFIXES = ('/usr/bin/', '/System/', '/Library/Developer/CommandLineTools/', '/Applications/Xcode')
 RESOLVER = pathlib.Path('/etc/resolver') / LAB
 SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}',
                'bucket': '{}-connection'}
@@ -445,7 +449,8 @@ def bao(method, path, token=None, body=None, soft=False):
     except OSError as error:
         if soft:  # an optional lookup: the caller reports it as unknown
             return 0, None
-        die(f'cannot reach {OPENBAO}: {LOCAL_NETWORK if local_network_blocked(error) else NOT_SET_UP}')
+        die(f'cannot reach {OPENBAO}: ' + (f'{LOCAL_NETWORK}: {local_network_step()}' if local_network_blocked(error)
+                                            else NOT_SET_UP))
 
 
 TOKEN_CHARS = re.compile(r'^[A-Za-z0-9._~+/=-]+$')  # what an OpenBao token is made of
@@ -3100,7 +3105,7 @@ def cmd_doctor(a):
             reach = False
         except OSError as error:
             reach, blocked = False, local_network_blocked(error)
-        check(f'reach {OPENBAO}', reach, LOCAL_NETWORK if blocked else NOT_SET_UP)
+        check(f'reach {OPENBAO}', reach, f'{LOCAL_NETWORK}: {local_network_step()}' if blocked else NOT_SET_UP)
         left = signin_left() if reach else None
         check('signed in to OpenBao' + (f', {minutes(left)} left' if left is not None else ''), left is not None,
               '`magehand login`')
@@ -4657,6 +4662,37 @@ def local_network_blocked(error=None):
     return curl.returncode == 0
 
 
+def on_apple_python():
+    """Whether this magehand runs on Apple's own Python, which Local Network privacy doesn't apply to."""
+    return os.path.realpath(sys.executable).startswith(APPLE_PREFIXES)
+
+
+def can_move_to_apple_python():
+    """Whether setup can reinstall magehand on Apple's Python: a uv install on another Python, uv on PATH, and the
+    Command Line Tools present (without them /usr/bin/python3 is a stub that opens their installer)."""
+    return (sys.platform == 'darwin' and not on_apple_python() and install_method() == 'uv'
+            and bool(shutil.which('uv')) and os.path.exists(APPLE_PYTHON)
+            and subprocess.run(['xcode-select', '-p'], capture_output=True).returncode == 0)  # nosec B603 B607
+
+
+def local_network_step():
+    """What fixes a Local Network block: setup moving magehand onto Apple's Python, else the permission."""
+    return ("`magehand setup` (it moves magehand onto Apple's Python, which macOS exempts)"
+            if can_move_to_apple_python() else LOCAL_NETWORK_PERMISSION)
+
+
+def move_to_apple_python():
+    """Reinstall magehand on Apple's Python, then run its setup again; exits with that setup's code. Unpinned (the
+    latest): `magehand==X` would pin it and stop `upgrade`. uv records the Python, so upgrades stay on it."""
+    cmd = ['uv', 'tool', 'install', '--reinstall', '--python', APPLE_PYTHON, 'magehand']
+    print(f"    Apple's own Python is exempt: {' '.join(cmd)}", flush=True)
+    if subprocess.run(cmd).returncode != 0:  # nosec B603  # a fixed command
+        die(f"could not reinstall magehand on Apple's Python (see above): {LOCAL_NETWORK_PERMISSION}; "
+            'then `magehand setup` again')
+    exe = pathlib.Path(sys.executable).with_name('magehand')  # the same tool directory, now on Apple's Python
+    sys.exit(subprocess.run([str(exe), 'setup']).returncode)  # nosec B603  # magehand's own executable
+
+
 def sudo_write_resolver(server):
     """/etc/resolver/<lab domain>: macOS asks `server` for *.lab names only."""
     print(f'Pointing *.{LAB} lookups (only those) at {server}; macOS asks for your password once.')
@@ -4696,7 +4732,10 @@ def cmd_setup(a):
     elif sys.platform != 'darwin':
         die(f'{host} is not reachable and only macOS is set up automatically')
     elif local_network_blocked():  # DNS and the network are fine: --dns would change nothing
-        die(f'{host} resolves to {lab_address(host)}, the homelab, but {LOCAL_NETWORK}; then `magehand setup` again')
+        print(f'    {host} resolves to {lab_address(host)}, the homelab, but {LOCAL_NETWORK}.')
+        if not can_move_to_apple_python():
+            die(f'{LOCAL_NETWORK_PERMISSION}; then `magehand setup` again')
+        move_to_apple_python()
     else:
         current = lab_address(host)
         print(f'    {host} resolves to {current or "nothing"} here, which is not the homelab.')
@@ -4752,7 +4791,8 @@ def setup_refresh(host):
     except SystemExit:
         needs.append('GitHub sign-in (`gh auth login`)')
     if not reachable():
-        needs.append(LOCAL_NETWORK if local_network_blocked() else f'{host} is not reachable')
+        needs.append(f'{LOCAL_NETWORK}: {local_network_step()}' if local_network_blocked()
+                     else f'{host} is not reachable')
     missing = approvals_missing()
     if rejected:
         needs.append(rejected_rules_step(rejected))
