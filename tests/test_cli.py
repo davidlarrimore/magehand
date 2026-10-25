@@ -2134,6 +2134,12 @@ class StayingCurrent(unittest.TestCase):
             try:
                 magehand.LATEST_CACHE.write_text(json.dumps({'checked': magehand.time.time(), 'version': '9.9.9'}))
                 self.assertEqual(magehand.latest_version(), '9.9.9')  # no network: the cache is fresh
+                # Offline: the failure is remembered (with the last version known) and retried after an hour
+                magehand.LATEST_CACHE.write_text(json.dumps({'checked': magehand.time.time() - 2 * 86400,
+                                                             'version': '9.9.8'}))
+                with mock.patch.object(magehand.urllib.request, 'urlopen', mock.Mock(side_effect=OSError('offline'))) as net:
+                    self.assertEqual((magehand.latest_version(), magehand.latest_version()), ('9.9.8', '9.9.8'))
+                self.assertEqual(net.call_count, 1)
             finally:
                 magehand.LATEST_CACHE = saved
 
@@ -2154,6 +2160,11 @@ class StayingCurrent(unittest.TestCase):
                 with contextlib.redirect_stderr(stream):
                     magehand.update_notice()
                 self.assertEqual('magehand upgrade' in stream.getvalue(), expect)
+            with mock.patch.dict(os.environ, {'AI_AGENT': 'claude-code'}):  # an agent reads stderr: it is told
+                stream = io.StringIO()
+                with contextlib.redirect_stderr(stream):
+                    magehand.update_notice()
+                self.assertIn('magehand upgrade (tell the user', stream.getvalue())
             magehand.latest_version = lambda: '0.2.0'
             stream = Tty()
             with contextlib.redirect_stderr(stream):
@@ -2502,6 +2513,7 @@ class RepoConformance(unittest.TestCase):
 
 
 REAL_LIFECYCLE = magehand.lifecycle_stages
+REAL_STALE_AGENTS = magehand.stale_agents
 
 
 def setUpModule():
@@ -2514,6 +2526,13 @@ def setUpModule():
     patch = mock.patch.object(magehand, 'lifecycle_stages', lambda repo, name: [])
     patch.start()
     unittest.addModuleCleanup(patch.stop)
+    # doctor reads every app repo's AGENTS.md from GitHub: its own tests call REAL_STALE_AGENTS with gh mocked.
+    patch = mock.patch.object(magehand, 'stale_agents', lambda: (None, 'not read in tests'))
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
+    # A coding agent running the tests (Claude Code, Codex) sets these: the tests run as in a plain shell.
+    agents = {k: os.environ.pop(k) for k in magehand.AGENT_VARS if k in os.environ}
+    unittest.addModuleCleanup(lambda: os.environ.update(agents))
     ci = os.environ.pop('CI', None)  # GitHub Actions sets it, and check treats a skip as an error there
     unittest.addModuleCleanup(lambda: ci is not None and os.environ.update(CI=ci))
     # No test writes this machine's Claude Code or Codex config (setup's skill and approvals): both point at a
@@ -2910,6 +2929,51 @@ class Approvals(unittest.TestCase):
         self.assertTrue(command['command'].startswith(f'{sys.executable} -I '), command)
         self.assertFalse((self.codex / 'rules').exists())  # Codex isn't installed here: no rules for it
 
+    def session(self, version_json, agents='Use magehand.\n'):
+        """The session hook's output when `magehand version --json` prints `version_json` (a fake magehand), for a
+        session started in a checkout whose AGENTS.md is `agents`."""
+        fake = self.claude / 'fake-magehand'
+        fake.parent.mkdir(parents=True, exist_ok=True)
+        fake.write_text(f'import sys\nprint({version_json!r})\nsys.exit(0)\n')
+        repo = self.claude / 'repo'
+        (repo / '.git').mkdir(parents=True, exist_ok=True)
+        (repo / 'src').mkdir(exist_ok=True)
+        (repo / 'AGENTS.md').write_text(agents)
+        script = magehand.SESSION_HOOK.format(generated='x', magehand=json.dumps([sys.executable, str(fake)]))
+        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,
+                             input=json.dumps({'hook_event_name': 'SessionStart', 'cwd': str(repo / 'src')}))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout
+
+    def test_a_new_session_hears_when_magehand_is_out_of_date(self):
+        magehand.install_approvals()
+        hooks = json.loads((self.plugin / 'hooks/hooks.json').read_text())['hooks']
+        start = hooks['SessionStart'][0]
+        self.assertEqual(start['matcher'], 'startup')
+        self.assertTrue(start['hooks'][0]['command'].endswith('-I "${CLAUDE_PLUGIN_ROOT}/hooks/session.py"'))
+        self.assertTrue((self.plugin / 'hooks/session.py').is_file())
+        out = json.loads(self.session('{"version": "0.40.0", "latest": "0.41.0", "newer": true}'))['hookSpecificOutput']
+        self.assertEqual(out['hookEventName'], 'SessionStart')
+        self.assertIn('magehand 0.41.0 is out; this machine has 0.40.0', out['additionalContext'])
+        self.assertIn('`magehand upgrade`', out['additionalContext'])
+        for quiet in ('{"version": "0.41.0", "latest": "0.41.0", "newer": false}', 'not json', '[]'):
+            self.assertEqual(self.session(quiet), '', quiet)  # current, or a magehand that fails: nothing said
+        # A project that doesn't use magehand hears nothing (and runs no magehand at all)
+        self.assertEqual(self.session('{"version": "0.40.0", "latest": "0.41.0", "newer": true}', agents='Use npm.\n'), '')
+
+    def test_version_json_says_whether_to_upgrade(self):
+        with mock.patch.object(magehand, 'installed_version', lambda: '0.40.0'), \
+                mock.patch.object(magehand, 'latest_version', lambda: '0.41.0'), \
+                mock.patch.object(magehand, 'install_method', lambda: 'uv'):
+            _, out, _ = CommandLine.run_main(self, 'version', '--json')
+        self.assertEqual(json.loads(out), {'version': '0.40.0', 'latest': '0.41.0', 'managed': False, 'newer': True,
+                                           'next': '`magehand upgrade`'})
+        with mock.patch.object(magehand, 'installed_version', lambda: '0.40.0'), \
+                mock.patch.object(magehand, 'latest_version', lambda: self.fail('asked GitHub in the VM')), \
+                mock.patch.object(magehand, 'install_method', lambda: 'managed'):
+            _, out, _ = CommandLine.run_main(self, 'version', '--json')
+        self.assertEqual((json.loads(out)['managed'], json.loads(out)['next']), (True, None))
+
     def test_codex_rules_say_the_same_and_a_rejected_file_never_replaces_a_working_one(self):
         self.codex.mkdir(parents=True)
         with mock.patch.object(magehand, 'codex_rules_problem', lambda path: None):
@@ -3071,6 +3135,89 @@ class Approvals(unittest.TestCase):
             magehand.install_approvals()
             _, out, _ = CommandLine.run_main(self, 'doctor', '--json')
             self.assertNotIn('pre-approved commands', [r['check'] for r in json.loads(out)['checks']])
+
+
+class StaleAgents(unittest.TestCase):
+    """doctor lists the owner's app repos whose AGENTS.md platform rules aren't the template's."""
+    TEMPLATE = '# Rules\nuse magehand\n## This app\n'
+
+    def page(self, *nodes, more=None, template=TEMPLATE, owner=True):
+        repos = {'pageInfo': {'hasNextPage': bool(more), 'endCursor': more}, 'nodes': list(nodes)}
+        return {'data': {'template': {'agents': {'text': template}} if template else None,
+                         'repositoryOwner': {'repositories': repos} if owner else None}}
+
+    def node(self, name, text, template=True, archived=False):
+        return {'name': name, 'isArchived': archived, 'agents': None if text is None else {'text': text},
+                'templateRepository': {'nameWithOwner': magehand.TEMPLATE_REPO.upper() if template == 'upper'
+                                       else magehand.TEMPLATE_REPO} if template else None}
+
+    def stale(self, *pages, err=None):
+        calls = []
+
+        def query(*args):
+            calls.append(args)
+            return (None, err) if err else (pages[len(calls) - 1], None)
+        with mock.patch.object(magehand, 'gh_query', query), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: self.fail('a second request')):
+            return REAL_STALE_AGENTS(), calls
+
+    def test_lists_only_template_repos_that_are_behind(self):
+        (stale, err), _ = self.stale(self.page(
+            self.node('current', self.TEMPLATE + 'notes\n'), self.node('behind', '# Rules\nold\n## This app\nnotes\n'),
+            self.node('headless', '# Rules\nuse magehand\n'), self.node('none', None),
+            self.node('cased', '# Rules\nold\n## This app\n', template='upper'),
+            self.node('retired', 'old', archived=True), self.node('homelab', 'other', template=False)))
+        self.assertEqual((stale, err), (['behind', 'headless (has no "## This app" heading)', 'none (no AGENTS.md)',
+                                         'cased'], None))
+
+    def test_reads_every_page(self):
+        (stale, _), calls = self.stale(self.page(self.node('a', self.TEMPLATE), more='c1'),
+                                       self.page(self.node('z', 'old\n## This app\n')))
+        self.assertEqual(stale, ['z'])
+        self.assertEqual((len(calls), calls[1][-2:]), (2, ('-f', 'cursor=c1')))
+
+    def test_nothing_read_is_not_all_current(self):
+        for pages, err, why in (((), 'HTTP 502\nmore detail', 'HTTP 502'),
+                                ((self.page(owner=False),), None, 'cannot list the repos'),
+                                ((self.page(template=None),), None, 'cannot read'),
+                                ((self.page(self.node('homelab', 'x', template=False)),), None, 'no repo made from')):
+            with self.subTest(why=why):
+                (stale, problem), _ = self.stale(*pages, err=err)
+                self.assertIsNone(stale)
+                self.assertTrue(problem.startswith(why) or why in problem, problem)
+
+    def doctor(self, found, *flags):
+        with mock.patch.object(magehand, 'stale_agents', lambda: found), \
+                mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: 'x'), \
+                mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                mock.patch.object(magehand, 'current_repo', lambda *a: None), \
+                mock.patch.object(magehand, 'approvals_missing', lambda: []), \
+                mock.patch.object(magehand, 'signin_left', lambda *a, **k: 3600), \
+                mock.patch.object(magehand, 'configured_runtime', lambda: 'none'), \
+                mock.patch.object(magehand.urllib.request, 'urlopen', lambda *a, **k: mock.Mock(status=200)):
+            return CommandLine.run_main(self, 'doctor', *flags)
+
+    def test_doctor_names_them_and_says_what_to_do_when_nothing_failed(self):
+        code, out, _ = self.doctor((['elvis'], None), '--json')
+        report = json.loads(out)
+        self.assertEqual(code, 0)  # this machine is fine: the repos are a note, not a failure
+        self.assertEqual([c['stale'] for c in report['checks'] if 'stale' in c], [['elvis']])
+        self.assertEqual(report['next'], 'in each checkout: `magehand update-agents`, commit and open a PR (elvis)')
+        code, out, _ = self.doctor((['elvis'], None))
+        self.assertIn('--   AGENTS.md behind the template in 1 app repo(s): elvis', out)
+        self.assertEqual(out.splitlines()[-1], 'next: in each checkout: `magehand update-agents`, commit and open a PR (elvis)')
+
+    def test_doctor_says_whether_it_checked(self):
+        code, out, _ = self.doctor(([], None), '--json')
+        self.assertIn({'check': "app repos' AGENTS.md match the template", 'ok': True, 'hint': ''},
+                      json.loads(out)['checks'])
+        _, out, _ = self.doctor(([], None))
+        self.assertIn("ok   app repos' AGENTS.md match the template", out)
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
+        _, out, _ = self.doctor((None, 'HTTP 502'))
+        self.assertIn("--   app repos' AGENTS.md: not checked (HTTP 502)", out)
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
 
 
 class ManagedCopy(unittest.TestCase):
