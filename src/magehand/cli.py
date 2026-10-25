@@ -5407,8 +5407,9 @@ def job_ls(a, app):
 
 # --- pr ready: the one step of the review routine that can fail silently ---------------------------
 # A write magehand makes as the user, through gh: it marks a green PR ready for review and requests
-# OpenClaw's bot, then reads the PR back, because `gh pr edit --add-reviewer` exits 0 even when GitHub
-# records nobody (a bot that isn't a collaborator: #44).
+# OpenClaw's bot, then reads the PR back, because a request can leave GitHub recording nobody (a bot that
+# isn't a collaborator: #44; `gh pr edit --add-reviewer` even exits 0 then). The request goes through REST:
+# `gh pr edit`'s GraphQL query fails now and then ("Something went wrong while executing your query").
 
 PR_FIELDS = 'number,url,state,isDraft,headRefOid,author,statusCheckRollup,reviewRequests'
 
@@ -5453,13 +5454,14 @@ def cmd_pr(a):
     # The request first, on the draft (OpenClaw ignores drafts), confirmed; only then mark it ready, so a request
     # that didn't stick never leaves a ready PR without its reviewer.
     if not own and not requested(pr):
-        code, _, err = gh_cli('pr', 'edit', str(number), '-R', repo, '--add-reviewer', BOT)
-        if code != 0:
-            finish(False, f'could not request {BOT}: {err or "gh failed"}', f'`magehand pr ready {number}` again')
+        # a refusal (HTTP 422 for a bot that isn't a collaborator) is diagnosed from the read-back like a silent one
+        code, _, sent = gh_cli('api', '-X', 'POST', f'repos/{repo}/pulls/{number}/requested_reviewers',
+                               '-f', f'reviewers[]={BOT}')
         back, err = gh_query('pr', 'view', str(number), '-R', repo, '--json', PR_FIELDS)
         if err:
-            finish(False, f'requested {BOT}, but could not read the PR back to confirm it ({err})',
-                   f'`magehand pr ready {number}` again', recorded=None)
+            finish(False, f'requested {BOT}, but could not read the PR back to confirm it ({err})' if code == 0 else
+                   f'could not request {BOT}: {sent or "gh failed"}', f'`magehand pr ready {number}` again',
+                   recorded=None)
         pr = back
         if not requested(pr):  # the silent failure: say why, from the bot's access to the repo
             access, unread = bot_access(repo)
@@ -5470,7 +5472,9 @@ def cmd_pr(a):
                 'missing': (f'{BOT} is not a collaborator on {repo}', fix),
                 'read': (f'{BOT} can only read {repo}', fix),
                 'invited': (f'{BOT} has not accepted its invitation to {repo} yet', 'wait about 5 minutes'),
-                'write': ('GitHub did not record the request, though the bot can write', 'request it on the PR page'),
+                'write': ('GitHub did not record the request, though the bot can write', 'request it on the PR page')
+                if code == 0 else (f'GitHub refused it, though the bot can write ({sent or "gh failed"})',
+                                   'wait a minute'),
                 None: (f"could not check {BOT}'s access to {repo} ({unread or 'gh failed'})",
                        f"ask the owner to check {BOT} has write on {repo} (`magehand doctor` in its checkout)")}[access]
             finish(False, f'review request NOT recorded: {why}; the PR stays as it was',
