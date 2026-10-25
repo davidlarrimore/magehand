@@ -9,7 +9,11 @@
   configuration. Keep every network call to GitHub and `*.lab`, with one
   scoped exception: `magehand bucket` talks to the S3 endpoint the platform
   hands the app for *its own* bucket (R2 for dev and prod, the local
-  Garage for `--env local`), because that is where the app's data is. The
+  Garage for `--env local`), because that is where the app's data is.
+  `check --ui` runs CI's browser check in containers: the runtime pulls the
+  Playwright and Postgres images build-app.yaml pins, and the Playwright
+  container installs that pinned Playwright and PyYAML from PyPI and
+  axe-core from npm (checked against the pinned SHA-256), as CI does. The
   one cluster call is read-only `kubectl get` (`status`: dev's pods and Argo
   application), skipped without kubectl and by `--no-cluster`. Its writes
   are `magehand new` (an app's repo on GitHub, and its platform setup: the

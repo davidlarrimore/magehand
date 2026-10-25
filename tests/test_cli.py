@@ -1,6 +1,7 @@
 """Unit tests for magehand (no network, no Docker)."""
 import contextlib
 import datetime
+import fcntl
 import http.server
 import io
 import json
@@ -2662,6 +2663,12 @@ class Scaffold(unittest.TestCase):
                                  cwd=tmp, capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
 
+    def test_the_generated_page_names_its_language(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            magehand.scaffold(tmp, 'demo', 'demo')
+            app = (pathlib.Path(tmp) / 'app.py').read_text()
+        self.assertIn("<html lang='en'>", app)  # else the browser check's axe rule html-has-lang fails it
+
     def test_never_overwrites_and_keeps_another_stack(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -3078,6 +3085,7 @@ class ManagedCopy(unittest.TestCase):
                                     (['dev', 'up'], 'no local blocks here', 'next: `magehand check`, then push'),
                                     (['bucket', 'ls', 'files'], "can't reach the app's bucket", 'next: ask the owner'),
                                     (['login'], 'nothing to sign in to', 'next: nothing'),
+                                    (['check', '--ui'], "can't run the browser check", 'next: `magehand check`, then push'),
                                     (['setup'], 'set up by the platform', 'next: nothing')):
                 code, out, err = self.run_main(*argv)
                 self.assertEqual((code, out), (1, ''), argv)
@@ -4941,6 +4949,215 @@ class Jobs(unittest.TestCase):
         code, _, _ = self.add()
         self.assertEqual(code, 1)
         self.assertFalse((self.root / 'deploy/base/job-collect.yaml').exists())
+
+
+BUILD_APP = """jobs:
+  build:
+    steps:
+      - name: Browser check
+        env:
+          PLAYWRIGHT_VERSION: 1.63.0
+          AXE_VERSION: 4.13.0
+          AXE_SHA256: 096912f6e77b4b695fc9304b7be65091db42d98de054da674ae222a11cb33f70
+          POSTGRES_IMAGE: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+        run: |
+          /tmp/ui-venv/bin/pip install --quiet "playwright==$PLAYWRIGHT_VERSION" pyyaml==6.0.3
+"""
+
+
+class CheckUI(unittest.TestCase):
+    """`check --ui` runs homelab-apps' browser check with build-app.yaml's pins, against the image built here."""
+
+    def run_main(self, *argv):
+        """CommandLine.run_main, with a die() message (the SystemExit's text) in stderr."""
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                magehand.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else 1
+                if isinstance(exit_.code, str):
+                    err.write(exit_.code)
+        return code, out.getvalue(), err.getvalue()
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name) / 'demo'
+        self.root.mkdir()
+        (self.root / 'ui-check.yaml').write_text('port: 8080\nenv:\n  DATABASE_URL: ${POSTGRES_URL}\n  MODE: ui\n'
+                                                 'pages:\n  - path: /\n')
+        self.calls, self.runs, self.result = [], [], 0
+        files = {magehand.BUILD_WORKFLOW: BUILD_APP, magehand.UI_SCRIPT: 'print("ui check")\n'}
+        for patch in (mock.patch.object(magehand, 'CACHE', pathlib.Path(tmp.name) / 'cache'),
+                      mock.patch.object(magehand, 'runtime', lambda: 'docker'),
+                      mock.patch.object(magehand.shutil, 'which', lambda cli: '/usr/bin/' + cli),
+                      mock.patch.object(magehand, 'checkout_app', lambda root: None),  # not a git checkout
+                      mock.patch.object(magehand, 'update_notice', lambda: None),
+                      mock.patch.object(magehand, 'install_method', lambda *a: 'uv'),
+                      mock.patch.object(magehand, 'github_file', lambda repo, path, **k: files[path]),
+                      mock.patch.object(magehand, 'engine', self.engine),
+                      mock.patch.object(magehand.subprocess, 'run', self.fake_run),
+                      mock.patch.object(magehand.time, 'sleep', lambda s: None)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    failing = ()  # engine() commands that fail, by their first two words
+
+    def engine(self, *args, check=True, env=None):
+        self.calls.append((args, env))
+        if args[:2] in self.failing:
+            return subprocess.CompletedProcess(args, 1, '', 'Error: pull access denied\n')
+        if args[0] == 'cp':  # the Playwright container's /out, copied out as the user
+            out = pathlib.Path(args[2])
+            out.mkdir()
+            if self.result == 'no answer':
+                (out / magehand.UI_NO_ANSWER).write_text('')
+            else:
+                (out / 'report.md').write_text('# Browser check\n\n## ok home\n' if self.result == 0 else
+                                               '# Browser check\n\n## FAIL home\n- overflow\n')
+        return subprocess.CompletedProcess(args, 0, 'app log line\n', '')
+
+    def fake_run(self, argv, **kwargs):
+        self.runs.append(argv)
+        return subprocess.CompletedProcess(argv, 1 if argv[1] == 'run' and self.result else 0)
+
+    def check(self, *extra):
+        return self.run_main('check', '--ui', '-a', 'demo', '--code', str(self.root), *extra)
+
+    def test_runs_ci_s_script_with_ci_s_pins(self):
+        code, out, _ = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn('## ok home', out)
+        self.assertIn('next: look at the screenshots in', out)
+        build, runner = self.runs
+        self.assertEqual(build[:4], ['docker', 'build', '-t', 'magehand/demo:ui-check'])
+        self.assertIn('mcr.microsoft.com/playwright/python:v1.63.0-noble', runner)
+        self.assertIn('container:magehand-ui-demo-app', runner)
+        for pin in ('AXE_SHA256=096912f6e77b4b695fc9304b7be65091db42d98de054da674ae222a11cb33f70',
+                    'PYYAML_VERSION=6.0.3', 'PORT=8080'):
+            self.assertIn(pin, runner)
+        script = self.root.parent / 'cache/ui-check/demo/check/ui_check.py'
+        self.assertEqual(script.read_text(), 'print("ui check")\n')  # the platform's script, not a copy
+
+    def test_the_app_runs_as_in_the_cluster_with_its_env_out_of_argv(self):
+        self.check()
+        app = next((args, env) for args, env in self.calls if args[:1] == ('run',) and '--read-only' in args)
+        args, env = app
+        for flag in ('--read-only', '--cap-drop', 'no-new-privileges'):
+            self.assertIn(flag, args)
+        self.assertEqual(env, {'DATABASE_URL': magehand.UI_POSTGRES_URL, 'MODE': 'ui'})
+        self.assertNotIn(magehand.UI_POSTGRES_URL, ' '.join(args))
+        db = [args for args, _ in self.calls if args[:1] == ('run',) and 'ui-postgres' in args]
+        self.assertEqual(len(db), 1)  # DATABASE_URL names it, so the throwaway Postgres starts
+
+    def test_no_postgres_when_the_env_does_not_name_it(self):
+        (self.root / 'ui-check.yaml').write_text('pages:\n  - path: /\n')
+        self.check()
+        self.assertFalse([a for a, _ in self.calls if a[:1] == ('run',) and 'ui-postgres' in a])
+
+    def test_a_failure_exits_1_with_the_report_and_cleans_up(self):
+        self.result = 1
+        code, out, err = self.check('--json')
+        report = json.loads(out)
+        self.assertEqual((code, report['ok']), (1, False))
+        self.assertIn(f'then `magehand check --ui -a demo --code {self.root}`', report['next'])
+        self.assertIn('app log line', err)
+        self.assertEqual(self.calls[-2][0], ('rm', '-f', 'magehand-ui-demo-app', 'magehand-ui-demo-postgres',
+                                             'magehand-ui-demo-browser'))
+        self.assertEqual(self.calls[-1][0], ('network', 'rm', 'magehand-ui-demo'))
+
+    def test_an_app_that_never_answers_names_the_port(self):
+        self.result = 'no answer'
+        code, out, err = self.check()
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('did not answer on port 8080', err)
+        self.assertEqual(self.calls[-1][0], ('network', 'rm', 'magehand-ui-demo'))
+
+    def test_no_web_ui_is_nothing_to_check(self):
+        (self.root / 'ui-check.yaml').write_text('web_ui: false\n')
+        code, out, _ = self.check()
+        self.assertEqual((code, self.runs), (0, []))
+        self.assertIn('next: push', out)
+
+    def test_a_missing_ui_check_yaml_says_how_to_add_one(self):
+        (self.root / 'ui-check.yaml').unlink()
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('web_ui: false', err)
+
+    def test_a_failed_build_stops_before_any_container(self):
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1)
+        with mock.patch.object(magehand.subprocess, 'run', run):
+            code, _, err = self.check()
+        self.assertEqual((code, self.calls), (1, []))
+        self.assertIn('build failed', err)
+
+    def test_a_container_that_fails_to_start_says_why_and_cleans_up(self):
+        self.failing = (('run', '-d'),)
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('starting Postgres failed: Error: pull access denied', err)
+        self.assertEqual(self.calls[-1][0], ('network', 'rm', 'magehand-ui-demo'))
+
+    def test_postgres_that_never_gets_ready_stops_the_run(self):
+        self.failing = (('exec', 'magehand-ui-demo-postgres'),)
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('Postgres was not ready within 30s', err)
+        ready = next(a for a, _ in self.calls if a[0] == 'exec')
+        self.assertIn('127.0.0.1', ready)  # over TCP: initdb's temporary server answers only on its socket
+
+    def test_a_runtime_that_is_not_installed_says_so(self):
+        with mock.patch.object(magehand.shutil, 'which', lambda cli: None):
+            code, _, err = self.check()
+        self.assertEqual((code, self.runs), (1, []))
+        self.assertIn('`magehand runtime auto`', err)
+
+    def test_another_app_s_checkout_is_not_checked_under_this_name(self):
+        with mock.patch.object(magehand, 'checkout_app', lambda root: 'other'):
+            code, _, err = self.check()
+        self.assertEqual((code, self.runs), (1, []))
+        self.assertIn("is other's code", err)
+
+    def test_a_bad_port_names_the_field(self):
+        (self.root / 'ui-check.yaml').write_text('port: 80a\n')
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("port: '80a' is not a port number", err)
+
+    def test_a_second_run_for_the_same_app_waits_for_the_first(self):
+        # runs share the cache directory, image tag, network and container names: a second one must not clear them
+        (self.root.parent / 'cache/ui-check').mkdir(parents=True)
+        with open(self.root.parent / 'cache/ui-check/demo.lock', 'w') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)  # the first run, in another worktree
+            code, out, err = self.check()
+            self.assertEqual((code, out, self.calls, self.runs), (1, '', [], []))  # nothing built, removed or run
+            self.assertIn('another `magehand check --ui` for demo is running', err)
+        self.assertEqual(self.check()[0], 0)  # once it has finished
+
+    def test_a_last_run_that_cannot_be_cleared_says_what_to_remove(self):
+        with mock.patch.object(magehand.shutil, 'rmtree', mock.Mock(side_effect=PermissionError('denied'))):
+            code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn('cannot clear the last run', err)
+
+    def test_it_is_the_browser_check_only(self):
+        code, _, err = self.check('--manifests-only')
+        self.assertEqual(code, 2)
+        self.assertIn('--ui runs the browser check only', err)
+
+    def test_an_env_name_that_is_not_a_variable_is_refused(self):
+        with self.assertRaises(SystemExit):
+            magehand.ui_env({'env': {'A B': 'x'}})
+
+    def test_a_workflow_without_the_step_says_to_tell_the_owner(self):
+        with mock.patch.object(magehand, 'github_file', lambda *a, **k: 'jobs: {}\n'), \
+                self.assertRaises(SystemExit) as stop:
+            magehand.ui_pins()
+        self.assertIn('tell the owner', str(stop.exception.code))
 
 
 def yaml_load(text):
