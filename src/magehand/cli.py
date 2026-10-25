@@ -19,6 +19,7 @@ import argparse
 import base64
 import datetime
 import difflib
+import fcntl
 import hashlib
 import mimetypes
 import hmac
@@ -4002,6 +4003,15 @@ def cmd_check_ui(a):
     tag = re.sub(r'[^a-z0-9-]', '-', name.lower())
     work = CACHE / 'ui-check' / tag
     out = work / 'out'
+    # One run per app at a time, from any checkout: runs share this directory, the image tag, the network and
+    # the container names. Held until magehand exits (the kernel drops it then, even on a crash).
+    work.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(work.parent / f'{tag}.lock', 'w')  # held for the whole run
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        die(f'another `magehand check --ui` for {name} is running (perhaps in another worktree): '
+            f'wait for it to finish, then `{again}`')
     try:
         shutil.rmtree(work)
     except FileNotFoundError:

@@ -1,6 +1,7 @@
 """Unit tests for magehand (no network, no Docker)."""
 import contextlib
 import datetime
+import fcntl
 import http.server
 import io
 import json
@@ -5126,6 +5127,16 @@ class CheckUI(unittest.TestCase):
         code, _, err = self.check()
         self.assertEqual(code, 1)
         self.assertIn("port: '80a' is not a port number", err)
+
+    def test_a_second_run_for_the_same_app_waits_for_the_first(self):
+        # runs share the cache directory, image tag, network and container names: a second one must not clear them
+        (self.root.parent / 'cache/ui-check').mkdir(parents=True)
+        with open(self.root.parent / 'cache/ui-check/demo.lock', 'w') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)  # the first run, in another worktree
+            code, out, err = self.check()
+            self.assertEqual((code, out, self.calls, self.runs), (1, '', [], []))  # nothing built, removed or run
+            self.assertIn('another `magehand check --ui` for demo is running', err)
+        self.assertEqual(self.check()[0], 0)  # once it has finished
 
     def test_a_last_run_that_cannot_be_cleared_says_what_to_remove(self):
         with mock.patch.object(magehand.shutil, 'rmtree', mock.Mock(side_effect=PermissionError('denied'))):
