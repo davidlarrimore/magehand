@@ -1,6 +1,7 @@
 """Unit tests for magehand (no network, no Docker)."""
 import contextlib
 import datetime
+import errno
 import fcntl
 import http.server
 import io
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from unittest import mock
@@ -997,11 +999,105 @@ class Doctor(unittest.TestCase):
         self.assertIn('magehand setup', out.getvalue())
 
 
+class LocalNetworkBlocked(unittest.TestCase):
+    """macOS Local Network privacy: "No route to host" for this Python while Apple's curl gets an answer."""
+
+    def blocked(self, error, curl=0, platform='darwin'):
+        def urlopen(*_a, **_k):
+            raise error
+        curls = []
+
+        def run(argv, **_k):
+            curls.append(argv)
+            return subprocess.CompletedProcess(argv, curl, b'', b'')
+        with mock.patch.object(magehand.sys, 'platform', platform), \
+                mock.patch.object(magehand.urllib.request, 'urlopen', urlopen), \
+                mock.patch.object(magehand.subprocess, 'run', run):
+            return magehand.local_network_blocked(), curls
+
+    no_route = urllib.error.URLError(OSError(errno.EHOSTUNREACH, 'No route to host'))
+
+    def test_no_route_here_while_curl_answers(self):
+        found, curls = self.blocked(self.no_route)
+        self.assertTrue(found)
+        self.assertEqual(curls[0][0], '/usr/bin/curl')  # Apple's, which the permission doesn't apply to
+
+    def test_anything_else_is_not_the_permission(self):
+        self.assertFalse(self.blocked(self.no_route, curl=7)[0])  # curl can't reach it either: the network
+        self.assertFalse(self.blocked(urllib.error.URLError(OSError(errno.ECONNREFUSED, 'refused')))[0])
+        self.assertFalse(self.blocked(urllib.error.URLError(socket.gaierror(8, 'nodename nor servname')))[0])
+        self.assertEqual(self.blocked(self.no_route, platform='linux'), (False, []))
+
+
+    def test_apple_s_python_and_when_setup_can_move_onto_it(self):
+        xcode = '/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9'
+        for exe, apple in ((xcode, True), ('/Library/Developer/CommandLineTools/usr/bin/python3', True),
+                           ('/opt/homebrew/Cellar/python@3.14/3.14.0/bin/python3.14', False),
+                           ('/Users/me/.local/share/uv/python/cpython-3.13/bin/python3.13', False)):
+            with mock.patch.object(magehand.os.path, 'realpath', lambda _p, exe=exe: exe):
+                self.assertEqual(magehand.on_apple_python(), apple, exe)
+        brew = '/opt/homebrew/bin/python3.14'
+
+        def can(method='uv', uv='/opt/homebrew/bin/uv', tools=0, exe=brew):
+            with mock.patch.object(magehand.sys, 'platform', 'darwin'), \
+                    mock.patch.object(magehand.os.path, 'realpath', lambda _p: exe), \
+                    mock.patch.object(magehand, 'install_method', lambda *a: method), \
+                    mock.patch.object(magehand.shutil, 'which', lambda _c: uv), \
+                    mock.patch.object(magehand.os.path, 'exists', lambda _p: True), \
+                    mock.patch.object(magehand.subprocess, 'run',
+                                      lambda argv, **k: subprocess.CompletedProcess(argv, tools)):
+                return magehand.can_move_to_apple_python()
+        self.assertTrue(can())
+        self.assertFalse(can(exe=xcode))  # already there
+        self.assertFalse(can(method='pipx'))
+        self.assertFalse(can(uv=None))
+        self.assertFalse(can(tools=2))  # no Command Line Tools: /usr/bin/python3 is only their installer
+
+    def test_the_move_reinstalls_unpinned_on_apple_s_python_then_runs_setup(self):
+        runs = []
+
+        def run(argv, **_k):
+            runs.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+        with mock.patch.object(magehand.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit) as stop:
+            magehand.move_to_apple_python()
+        self.assertEqual(stop.exception.code, 0)
+        self.assertEqual(runs[0], ['uv', 'tool', 'install', '--reinstall', '--python', '/usr/bin/python3', 'magehand'])
+        self.assertEqual(runs[1][1:], ['setup'])
+
+    def test_doctor_names_the_permission(self):
+        def urlopen(*_a, **_k):
+            raise self.no_route
+        with mock.patch.object(magehand.sys, 'platform', 'darwin'), \
+                mock.patch.object(magehand.urllib.request, 'urlopen', urlopen), \
+                mock.patch.object(magehand.subprocess, 'run', lambda argv, **k: subprocess.CompletedProcess(argv, 0)), \
+                mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'saved_token', lambda: None), \
+                mock.patch.object(magehand, 'current_repo', lambda *a: None), \
+                mock.patch.object(magehand, 'configured_runtime', lambda: 'none'), \
+                mock.patch.object(magehand, 'choose_runtime', lambda configured, found: None):
+            reports = []
+            for movable in (False, True):
+                with mock.patch.object(magehand, 'can_move_to_apple_python', lambda movable=movable: movable):
+                    code, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+                reports.append((code, next(c for c in json.loads(out)['checks'] if c['check'].startswith('reach '))))
+        (code, reach), (_, movable) = reports
+        self.assertEqual((code, reach['ok']), (1, False))
+        self.assertIn('Privacy & Security > Local Network', reach['hint'])
+        self.assertIn("`magehand setup` (it moves magehand onto Apple's Python", movable['hint'])
+
+
 class Setup(unittest.TestCase):
     def setUp(self):
         self.names = ('reachable', 'lab_address', 'dns_answer', 'sudo_write_resolver', 'github_token',
-                      'saved_token', 'cmd_login', 'shutil', 'install_skill')
+                      'saved_token', 'cmd_login', 'shutil', 'install_skill', 'local_network_blocked',
+                      'can_move_to_apple_python', 'move_to_apple_python')
         self.saved = {n: getattr(magehand, n) for n in self.names}
+        magehand.local_network_blocked = lambda: False
+        magehand.can_move_to_apple_python = lambda: False
+        self.moved = []
+        magehand.move_to_apple_python = lambda: self.moved.append(1) or sys.exit(0)
         self.skills = []  # never the real ~/.claude
         magehand.install_skill = lambda: self.skills.append(1) or []
         self.saved_platform = magehand.sys.platform
@@ -1040,6 +1136,25 @@ class Setup(unittest.TestCase):
         magehand.dns_answer = lambda server, host: '192.0.2.10'
         self.run_setup(['--dns', '192.0.2.1'])
         self.assertEqual(self.written, ['192.0.2.1'])
+
+    def test_a_local_network_block_is_named_not_blamed_on_dns(self):
+        # the lab resolves and curl reaches it, but macOS refuses this Python: --dns would change nothing
+        magehand.reachable = lambda: False
+        magehand.local_network_blocked = lambda: True
+        magehand.lab_address = lambda _h: '192.0.2.10'
+        with self.assertRaises(SystemExit) as stop:  # not a uv install: the permission is the only fix
+            self.run_setup([])
+        self.assertIn('Privacy & Security > Local Network', str(stop.exception))
+        self.assertNotIn('--dns', str(stop.exception))
+        self.assertEqual((self.written, self.moved), ([], []))
+
+    def test_a_local_network_block_moves_magehand_onto_apple_s_python(self):
+        magehand.reachable = lambda: False
+        magehand.local_network_blocked = lambda: True
+        magehand.can_move_to_apple_python = lambda: True
+        with self.assertRaises(SystemExit):
+            self.run_setup([])
+        self.assertEqual((self.moved, self.written, self.logins), ([1], [], []))  # the moved copy's setup goes on
 
     def test_refuses_a_dns_that_does_not_know_the_lab(self):
         magehand.reachable = lambda: False
