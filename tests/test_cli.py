@@ -2531,7 +2531,7 @@ class PrReady(unittest.TestCase):
     GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
 
     def run_pr(self, checks=GREEN, draft=True, author='davidlarrimore', requested_before=False, sticks=True,
-               access='write', pushed=False, owner='davidlarrimore', json_out=False):
+               access='write', pushed=False, owner='davidlarrimore', json_out=False, refused=None):
         state = {'requested': requested_before, 'reads': 0}
         writes = []
 
@@ -2544,8 +2544,11 @@ class PrReady(unittest.TestCase):
 
         def gh(*args, **kw):
             writes.append(args)
-            if args[:2] == ('pr', 'edit') and sticks:
-                state['requested'] = True
+            if args[:3] == ('api', '-X', 'POST'):
+                if refused:
+                    return 1, '', refused
+                if sticks:
+                    state['requested'] = True
             return 0, '', ''
         with mock.patch.object(magehand, 'gh_query', lambda *a: (pr(), None)), \
                 mock.patch.object(magehand, 'gh_cli', gh), \
@@ -2578,8 +2581,9 @@ class PrReady(unittest.TestCase):
         # the request first, on the draft: a request that didn't stick never leaves a ready PR without its reviewer
         code, out, writes = self.run_pr()
         self.assertEqual(code, 0)
-        self.assertEqual([w[:2] for w in writes], [('pr', 'edit'), ('pr', 'ready')])
-        self.assertIn('--add-reviewer', writes[0])
+        self.assertEqual([w[:2] for w in writes], [('api', '-X'), ('pr', 'ready')])
+        self.assertEqual(writes[0][3:], (f'repos/davidlarrimore/demo/pulls/12/requested_reviewers',
+                                         '-f', f'reviewers[]={magehand.BOT}'))
         self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
         self.assertIn("wait for OpenClaw's review", out.splitlines()[-1])
 
@@ -2591,7 +2595,7 @@ class PrReady(unittest.TestCase):
                                   (None, "could not check davidlarrimore-bot's access", '`magehand doctor`')):
             code, out, writes = self.run_pr(sticks=False, access=access)
             self.assertEqual(code, 1, access)
-            self.assertEqual([w[:2] for w in writes], [('pr', 'edit')], access)  # not marked ready
+            self.assertEqual([w[:2] for w in writes], [('api', '-X')], access)  # not marked ready
             self.assertIn('NOT recorded', out)
             self.assertIn(why, out)
             self.assertIn(step, out.splitlines()[-1])
@@ -2600,6 +2604,18 @@ class PrReady(unittest.TestCase):
         self.assertIn(f'ask someone to add {magehand.BOT} with write', out)
         report = json.loads(self.run_pr(sticks=False, access='missing', json_out=True)[1])
         self.assertEqual((report['ok'], report['requested'], report['changed']), (False, False, []))
+
+    def test_a_refused_request_is_diagnosed_like_a_silent_one(self):
+        # REST refuses a bot that isn't a collaborator (HTTP 422): the read-back says why, as for a silent failure
+        code, out, writes = self.run_pr(refused='gh: Reviews may only be requested from collaborators (HTTP 422)',
+                                        access='missing')
+        self.assertEqual((code, [w[:2] for w in writes]), (1, [('api', '-X')]))
+        self.assertIn('is not a collaborator', out)
+        # a GitHub hiccup with a bot that can write: try again, never "request it on the PR page"
+        code, out, _ = self.run_pr(refused='gh: Something went wrong (HTTP 502)')
+        self.assertEqual(code, 1)
+        self.assertIn('GitHub refused it, though the bot can write (gh: Something went wrong (HTTP 502))', out)
+        self.assertIn('wait a minute, then `magehand pr ready 12` again', out.splitlines()[-1])
 
     def test_a_push_after_the_checks_were_read_is_refused(self):
         code, out, writes = self.run_pr(pushed=True)
