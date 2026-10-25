@@ -3137,11 +3137,28 @@ def cmd_doctor(a):
                     print(f'--   {label}: {note}')
             else:
                 check(label, value, hint)
+    # The owner's other app repos: their AGENTS.md changes only through a PR in each, so doctor lists the ones
+    # behind the template (not a failure of this machine; the managed copy works on whatever repo it was given).
+    stale, unread = (None, None) if managed else stale_agents()
+    agents_step = None
+    if stale:
+        agents_step = (f'in each checkout: `magehand update-agents`, commit and open a PR ({", ".join(stale)})')
+        note = f'AGENTS.md behind the template in {len(stale)} app repo(s): {", ".join(stale)}'
+        results.append({'check': 'app repos\' AGENTS.md', 'ok': None, 'hint': note, 'stale': stale})
+        if not a.json:
+            print(f'--   {note}')
+    elif unread and not managed:
+        note = f"app repos' AGENTS.md: not checked ({unread})"
+        results.append({'check': 'app repos\' AGENTS.md', 'ok': None, 'hint': note})
+        if not a.json:
+            print(f'--   {note}')
+    elif stale == [] and not a.json:
+        print("ok   app repos' AGENTS.md match the template")
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
     # Not a failure without one: only postgres/redis blocks and run --container need it.
-    step = next((r['hint'] for r in results if r['ok'] is False), None)
+    step = next((r['hint'] for r in results if r['ok'] is False), agents_step)
     if a.json:
         print(json.dumps({'ok': ok, 'checks': results, 'runtime': chosen, 'next': step}, indent=1))
     elif managed:
@@ -3836,6 +3853,39 @@ def check_agents_drift(root):
                     'homelab-apps AGENTS.md')]
 
 
+# Every app repo of the owner (made from the template) and its AGENTS.md on the default branch, in one query.
+APP_REPOS_QUERY = """query($owner: String!) { repositoryOwner(login: $owner) { repositories(first: 100, isFork: false,
+  orderBy: {field: NAME, direction: ASC}) { nodes { name isArchived templateRepository { nameWithOwner }
+  agents: object(expression: "HEAD:AGENTS.md") { ... on Blob { text } } } } } }"""
+
+
+def stale_agents():
+    """(['repo (why)', ...] of the owner's app repos whose AGENTS.md platform rules aren't the template's, None),
+    or (None, why) when GitHub can't be asked. Archived repos (retired apps) are left out."""
+    found, err = gh_query('api', 'graphql', '-f', f'query={APP_REPOS_QUERY}', '-f', f'owner={OWNER}')
+    try:
+        template = github_file(TEMPLATE_REPO, 'AGENTS.md', required=False)
+    except SystemExit:
+        template = None
+    platform, app = split_agents(template or '')
+    if err or not template or app is None:
+        return None, err or f'cannot read {TEMPLATE_REPO} AGENTS.md'
+    nodes = (((found.get('data') or {}).get('repositoryOwner') or {}).get('repositories') or {}).get('nodes') or []
+    stale = []
+    for repo in nodes:
+        if (repo.get('templateRepository') or {}).get('nameWithOwner') != TEMPLATE_REPO or repo.get('isArchived'):
+            continue
+        text = (repo.get('agents') or {}).get('text')
+        current, own = split_agents(text or '')
+        if text is None:
+            stale.append(f'{repo["name"]} (no AGENTS.md)')
+        elif own is None:
+            stale.append(f'{repo["name"]} (no "{APP_HEADING}" heading)')
+        elif current != platform:
+            stale.append(repo['name'])
+    return stale, None
+
+
 def check_merged_branch(root):
     """A warning when the checked-out branch already had a pull request merged (squash merges keep other
     hashes, so `git log main..` still lists its commits) and has gone on since: new work on a merged branch
@@ -4207,7 +4257,8 @@ description: Use when writing, changing, reviewing or debugging the code or depl
 The homelab decides how an app gets databases, AI, web search, secrets,
 sign-in and deploys. Don't rely on habits from other platforms or guess:
 ask the platform, with magehand (installed with `uv tool install magehand`).
-Its commands end with `next: ...`: do that next, or say why not.
+Its commands end with `next: ...`: do that next, or say why not. When one
+says a newer magehand is available, tell the user (`magehand upgrade`).
 
 1. Before designing or changing behavior: `magehand app` (in the app's repo).
    It lists the app's blocks, every env var its pod gets and where each comes
@@ -4320,6 +4371,24 @@ APPROVALS = (
 APPROVALS_PLUGIN = 'magehand-approvals'
 CODEX_RULES = 'magehand.rules'
 GENERATED = 'Written by `magehand setup` from its approvals list; `magehand upgrade` rewrites it. Remove: magehand setup --undo'
+
+# The Claude Code session hook: at the start of a session, tells the agent when magehand is out of date (its
+# commands' output isn't a terminal, so the update notice alone may never be seen). Stdlib only; quiet on any error.
+SESSION_HOOK = '''\
+# {generated}
+import json
+import subprocess
+try:
+    out = subprocess.run({magehand} + ['version', '--json'], capture_output=True, text=True, timeout=8)
+    found = json.loads(out.stdout)
+except (OSError, ValueError, subprocess.SubprocessError):
+    found = {{}}
+if isinstance(found, dict) and found.get('newer'):
+    print(json.dumps({{'hookSpecificOutput': {{'hookEventName': 'SessionStart', 'additionalContext': (
+        'magehand ' + str(found.get('latest')) + ' is out; this machine has ' + str(found.get('version')) + '. Tell '
+        'the user before any platform work: `magehand upgrade` updates it, and with it the homelab-app skill and '
+        'the pre-approved commands.')}}}}))
+'''
 
 # The Claude Code hook: stdlib only (it runs before every Bash call), the list baked in as JSON.
 APPROVE_HOOK = '''\
@@ -4444,15 +4513,23 @@ def install_approvals():
         'name': APPROVALS_PLUGIN, 'version': installed_version() or '0.0.0', 'author': {'name': 'magehand'},
         'license': 'MIT', 'homepage': f'https://github.com/{MAGEHAND_REPO}',
         'description': "magehand's pre-approved commands: read-only magehand and gh run without a prompt; "
-                       'merges, releases and tag pushes are refused. ' + GENERATED}, indent=2) + '\n')
+                       'merges, releases and tag pushes are refused. A new session hears when magehand is out of '
+                       'date. ' + GENERATED}, indent=2) + '\n')
     (plugin / 'hooks' / 'approve.py').write_text(APPROVE_HOOK.format(generated=GENERATED,
                                                                      rules=json.dumps(approval_rules())))
     # uv's and pipx's own Python stays put across upgrades; any other (a uvx run, a venv) may not: python3. -I keeps
     # the user's PYTHONPATH and the project's files out of the hook that decides what runs.
     python = shlex.quote(sys.executable) if install_method() in ('uv', 'pipx') else '/usr/bin/env python3'
     command = f'{python} -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/approve.py"'
-    (plugin / 'hooks' / 'hooks.json').write_text(json.dumps({'hooks': {'PreToolUse': [
-        {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}]}}, indent=2) + '\n')
+    # This install's own magehand (uv and pipx keep it put), else the one on PATH.
+    exe = pathlib.Path(sys.executable).with_name('magehand')
+    magehand = [str(exe)] if install_method() in ('uv', 'pipx') and exe.is_file() else ['magehand']
+    (plugin / 'hooks' / 'session.py').write_text(SESSION_HOOK.format(generated=GENERATED, magehand=json.dumps(magehand)))
+    session = f'{python} -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/session.py"'
+    (plugin / 'hooks' / 'hooks.json').write_text(json.dumps({'hooks': {
+        'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}],
+        'SessionStart': [{'matcher': 'startup', 'hooks': [{'type': 'command', 'command': session, 'timeout': 10}]}]}},
+        indent=2) + '\n')
     results.append((plugin, None))
     if codex_dir().is_dir():
         rules = codex_dir() / 'rules' / CODEX_RULES
@@ -4705,14 +4782,26 @@ def refuse_if_managed(command):
         sys.exit(1)
 
 
+# Set by coding agents in the commands they run (Claude Code: AI_AGENT, CLAUDECODE; Codex: CODEX_SANDBOX when it
+# sandboxes one): their output isn't a terminal, but an agent reads stderr and can tell the user.
+AGENT_VARS = ('AI_AGENT', 'CLAUDECODE', 'CODEX_SANDBOX')
+
+
+def run_by_agent():
+    return any(os.environ.get(k) for k in AGENT_VARS)
+
+
 def update_notice():
-    """One line on stderr when a newer magehand exists; quiet in CI, scripts and the managed copy."""
-    if os.environ.get('CI') or os.environ.get('MAGEHAND_NO_UPDATE_CHECK') or not sys.stderr.isatty() \
-            or install_method() == 'managed':
+    """One line on stderr when a newer magehand exists, in a terminal or for a coding agent; quiet in CI, other
+    scripts and the managed copy."""
+    if os.environ.get('CI') or os.environ.get('MAGEHAND_NO_UPDATE_CHECK') \
+            or not (sys.stderr.isatty() or run_by_agent()) or install_method() == 'managed':
         return
     current, latest = installed_version(), latest_version()
     if current and latest and version_tuple(latest) > (version_tuple(current) or ()):
-        print(f'magehand {latest} is available (you have {current}): magehand upgrade', file=sys.stderr)
+        print(f'magehand {latest} is available (you have {current}): magehand upgrade'
+              + (' (tell the user: it updates the skill and pre-approved commands too)' if run_by_agent() else ''),
+              file=sys.stderr)
 
 
 UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'upgrade', 'magehand'], 'pipx': ['pipx', 'upgrade', 'magehand'],
@@ -4754,14 +4843,18 @@ def cmd_upgrade(_a):
         print(next_line('`magehand setup`'))
 
 
-def cmd_version(_a):
-    current = installed_version()
-    print(current or 'unknown (not installed as a package)')
-    if install_method() == 'managed':  # no network call: provisioning runs this on every sync
-        print('pinned by the platform (homelab platform/openclaw/vm/versions.env)')
+def cmd_version(a):
+    current, managed = installed_version(), install_method() == 'managed'
+    latest = None if managed else latest_version()  # managed: no network call, provisioning runs this on every sync
+    newer = bool(current and latest and version_tuple(latest) > (version_tuple(current) or ()))
+    if getattr(a, 'json', False):
+        print(json.dumps({'version': current, 'latest': latest, 'managed': managed, 'newer': newer,
+                          'next': '`magehand upgrade`' if newer else None}))
         return
-    latest = latest_version()
-    if current and latest and version_tuple(latest) > (version_tuple(current) or ()):
+    print(current or 'unknown (not installed as a package)')
+    if managed:
+        print('pinned by the platform (homelab platform/openclaw/vm/versions.env)')
+    elif newer:
         print(f'{latest} is available: magehand upgrade')
     else:
         print('upgrade: magehand upgrade')
@@ -6065,7 +6158,8 @@ def build_parser():
     command('upgrade', cmd_upgrade, 'upgrade magehand, its skill and approvals',
             'upgrade magehand the way it was installed, then refresh what setup installed (the skill, the '
             'pre-approved commands)')
-    command('version', cmd_version, 'print the version', 'print the version, and whether a newer one exists')
+    p = command('version', cmd_version, 'print the version', 'print the version, and whether a newer one exists')
+    json_option(p)
     p = command('help', cmd_help, 'help for magehand or a command', 'show help for magehand or a command')
     p.add_argument('topic', nargs='?', metavar='COMMAND')
     ROOT[:] = [root]
