@@ -19,6 +19,7 @@ import argparse
 import base64
 import datetime
 import difflib
+import errno
 import fcntl
 import hashlib
 import mimetypes
@@ -60,6 +61,11 @@ CALLBACK = 'http://localhost:8250/oidc/callback'
 PROXY_PORT = int(os.environ.get('MAGEHAND_PROXY_PORT', '8080'))
 # Block type -> the Secret its chart hands over (platform/building-blocks/*).
 NOT_SET_UP = "this machine isn't set up for the homelab: run `magehand setup`"
+# macOS 15+ Local Network privacy: a program that isn't Apple's gets the permission of the app it runs under
+# (iTerm, Terminal, VS Code), and a refused connection fails as "No route to host", which reads like DNS.
+LOCAL_NETWORK = ("macOS is keeping magehand's Python off your home network (Local Network privacy; Apple's own "
+                 "curl gets through): allow the app you run magehand in (iTerm, Terminal, VS Code...) in System "
+                 "Settings > Privacy & Security > Local Network, then quit and reopen that app")
 RESOLVER = pathlib.Path('/etc/resolver') / LAB
 SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}',
                'bucket': '{}-connection'}
@@ -436,10 +442,10 @@ def bao(method, path, token=None, body=None, soft=False):
             return resp.status, (json.loads(raw) if raw.strip() else {})
     except urllib.error.HTTPError as error:
         return error.code, None
-    except OSError:
+    except OSError as error:
         if soft:  # an optional lookup: the caller reports it as unknown
             return 0, None
-        die(f'cannot reach {OPENBAO}: {NOT_SET_UP}')
+        die(f'cannot reach {OPENBAO}: {LOCAL_NETWORK if local_network_blocked(error) else NOT_SET_UP}')
 
 
 TOKEN_CHARS = re.compile(r'^[A-Za-z0-9._~+/=-]+$')  # what an OpenBao token is made of
@@ -3087,11 +3093,14 @@ def cmd_doctor(a):
             print(f'--   {note}')
         left = None
     else:
+        blocked = False
         try:
             reach = urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
-        except (OSError, urllib.error.HTTPError):
+        except urllib.error.HTTPError:
             reach = False
-        check(f'reach {OPENBAO}', reach, NOT_SET_UP)
+        except OSError as error:
+            reach, blocked = False, local_network_blocked(error)
+        check(f'reach {OPENBAO}', reach, LOCAL_NETWORK if blocked else NOT_SET_UP)
         left = signin_left() if reach else None
         check('signed in to OpenBao' + (f', {minutes(left)} left' if left is not None else ''), left is not None,
               '`magehand login`')
@@ -4627,6 +4636,27 @@ def reachable():
         return False
 
 
+def local_network_blocked(error=None):
+    """Whether macOS Local Network privacy keeps this Python off the homelab: a Mac, "No route to host" from
+    here (`error`, the failed request's, or a new request's), and Apple's own curl (exempt from the permission)
+    gets an answer from the same URL."""
+    if sys.platform != 'darwin':
+        return False
+    if error is None:
+        try:
+            urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5)  # nosec B310
+            return False
+        except urllib.error.HTTPError:  # it answered
+            return False
+        except OSError as failed:
+            error = failed
+    if getattr(getattr(error, 'reason', error), 'errno', None) != errno.EHOSTUNREACH:  # urlopen wraps it
+        return False
+    curl = subprocess.run(['/usr/bin/curl', '-sS', '-o', '/dev/null', '--max-time', '5',  # nosec B603
+                           f'{OPENBAO}/v1/sys/health'], capture_output=True)
+    return curl.returncode == 0
+
+
 def sudo_write_resolver(server):
     """/etc/resolver/<lab domain>: macOS asks `server` for *.lab names only."""
     print(f'Pointing *.{LAB} lookups (only those) at {server}; macOS asks for your password once.')
@@ -4665,6 +4695,8 @@ def cmd_setup(a):
         print(f'    ok: {host} -> {lab_address(host)}')
     elif sys.platform != 'darwin':
         die(f'{host} is not reachable and only macOS is set up automatically')
+    elif local_network_blocked():  # DNS and the network are fine: --dns would change nothing
+        die(f'{host} resolves to {lab_address(host)}, the homelab, but {LOCAL_NETWORK}; then `magehand setup` again')
     else:
         current = lab_address(host)
         print(f'    {host} resolves to {current or "nothing"} here, which is not the homelab.')
@@ -4720,7 +4752,7 @@ def setup_refresh(host):
     except SystemExit:
         needs.append('GitHub sign-in (`gh auth login`)')
     if not reachable():
-        needs.append(f'{host} is not reachable')
+        needs.append(LOCAL_NETWORK if local_network_blocked() else f'{host} is not reachable')
     missing = approvals_missing()
     if rejected:
         needs.append(rejected_rules_step(rejected))
