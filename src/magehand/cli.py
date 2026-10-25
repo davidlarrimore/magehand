@@ -3147,13 +3147,13 @@ def cmd_doctor(a):
         results.append({'check': 'app repos\' AGENTS.md', 'ok': None, 'hint': note, 'stale': stale})
         if not a.json:
             print(f'--   {note}')
-    elif unread and not managed:
+    elif unread:
         note = f"app repos' AGENTS.md: not checked ({unread})"
         results.append({'check': 'app repos\' AGENTS.md', 'ok': None, 'hint': note})
         if not a.json:
             print(f'--   {note}')
-    elif stale == [] and not a.json:
-        print("ok   app repos' AGENTS.md match the template")
+    elif stale == []:
+        check("app repos' AGENTS.md match the template", True)
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
@@ -3845,44 +3845,66 @@ def check_agents_drift(root):
     platform, app = split_agents(template or '')
     if not template or app is None:
         return []
-    current, own = split_agents(path.read_text())
-    if own is not None and current == platform:
+    why = agents_behind(path.read_text(), platform)
+    if not why:
         return []
-    why = ('has no "## This app" heading' if own is None else 'the platform rules above "## This app" are out of date')
     return [finding('warning', 'AGENTS.md', f'{why}: run `magehand update-agents` and commit the diff',
                     'homelab-apps AGENTS.md')]
 
 
-# Every app repo of the owner (made from the template) and its AGENTS.md on the default branch, in one query.
-APP_REPOS_QUERY = """query($owner: String!) { repositoryOwner(login: $owner) { repositories(first: 100, isFork: false,
-  orderBy: {field: NAME, direction: ASC}) { nodes { name isArchived templateRepository { nameWithOwner }
-  agents: object(expression: "HEAD:AGENTS.md") { ... on Blob { text } } } } } }"""
+def agents_behind(text, platform):
+    """Why an AGENTS.md (None: there is none) isn't up to date with the template's platform rules, or None."""
+    if text is None:
+        return 'no AGENTS.md'
+    current, own = split_agents(text)
+    if own is None:
+        return f'has no "{APP_HEADING}" heading'
+    return None if current == platform else f'the platform rules above "{APP_HEADING}" are out of date'
 
 
-def stale_agents():
-    """(['repo (why)', ...] of the owner's app repos whose AGENTS.md platform rules aren't the template's, None),
-    or (None, why) when GitHub can't be asked. Archived repos (retired apps) are left out."""
-    found, err = gh_query('api', 'graphql', '-f', f'query={APP_REPOS_QUERY}', '-f', f'owner={OWNER}')
-    try:
-        template = github_file(TEMPLATE_REPO, 'AGENTS.md', required=False)
-    except SystemExit:
-        template = None
-    platform, app = split_agents(template or '')
-    if err or not template or app is None:
-        return None, err or f'cannot read {TEMPLATE_REPO} AGENTS.md'
-    nodes = (((found.get('data') or {}).get('repositoryOwner') or {}).get('repositories') or {}).get('nodes') or []
+# Every repo the owner owns, with its template and its AGENTS.md on the default branch, and the template's own
+# AGENTS.md, a page at a time: one query per 100 repos.
+APP_REPOS_QUERY = """query($owner: String!, $template: String!, $cursor: String) {
+  template: repository(owner: $owner, name: $template) { agents: object(expression: "HEAD:AGENTS.md") { ... on Blob { text } } }
+  repositoryOwner(login: $owner) { repositories(first: 100, after: $cursor, isFork: false, ownerAffiliations: [OWNER],
+    orderBy: {field: NAME, direction: ASC}) { pageInfo { hasNextPage endCursor } nodes { name isArchived
+    templateRepository { nameWithOwner } agents: object(expression: "HEAD:AGENTS.md") { ... on Blob { text } } } } } }"""
+
+
+def stale_agents(max_pages=10):
+    """(['repo (why)', ...] of the owner's app repos (made from the template, not archived) whose AGENTS.md isn't
+    up to date with the template's platform rules, None), or (None, why) when they couldn't all be read."""
+    platform, nodes, cursor = None, [], None
+    for _ in range(max_pages):
+        args = ['api', 'graphql', '-f', f'query={APP_REPOS_QUERY}', '-f', f'owner={OWNER}',
+                '-f', f'template={TEMPLATE_REPO.split("/", 1)[1]}'] + (['-f', f'cursor={cursor}'] if cursor else [])
+        found, err = gh_query(*args)
+        if err:
+            return None, (err.strip().splitlines() or ['gh failed'])[0]
+        data = (found or {}).get('data') or {}
+        if platform is None:
+            text = ((data.get('template') or {}).get('agents') or {}).get('text')
+            platform, app = split_agents(text or '')
+            if not text or app is None:
+                return None, f'cannot read {TEMPLATE_REPO} AGENTS.md (or it has no "{APP_HEADING}" heading)'
+        repos = (data.get('repositoryOwner') or {}).get('repositories')
+        if repos is None:
+            return None, f'cannot list the repos of {OWNER}'
+        nodes += repos.get('nodes') or []
+        cursor = (repos.get('pageInfo') or {}).get('endCursor')
+        if not (repos.get('pageInfo') or {}).get('hasNextPage'):
+            break
+    else:
+        return None, f'more than {100 * max_pages} repos'
+    apps = [r for r in nodes if ((r.get('templateRepository') or {}).get('nameWithOwner') or '').lower()
+            == TEMPLATE_REPO.lower() and not r.get('isArchived')]
+    if not apps:
+        return None, f'no repo made from {TEMPLATE_REPO}'
     stale = []
-    for repo in nodes:
-        if (repo.get('templateRepository') or {}).get('nameWithOwner') != TEMPLATE_REPO or repo.get('isArchived'):
-            continue
-        text = (repo.get('agents') or {}).get('text')
-        current, own = split_agents(text or '')
-        if text is None:
-            stale.append(f'{repo["name"]} (no AGENTS.md)')
-        elif own is None:
-            stale.append(f'{repo["name"]} (no "{APP_HEADING}" heading)')
-        elif current != platform:
-            stale.append(repo['name'])
+    for repo in apps:
+        why = agents_behind((repo.get('agents') or {}).get('text'), platform)
+        if why:
+            stale.append(repo['name'] if why.startswith('the platform rules') else f'{repo["name"]} ({why})')
     return stale, None
 
 
@@ -4377,7 +4399,25 @@ GENERATED = 'Written by `magehand setup` from its approvals list; `magehand upgr
 SESSION_HOOK = '''\
 # {generated}
 import json
+import pathlib
 import subprocess
+import sys
+
+
+def uses_magehand(cwd):
+    """True in a checkout whose AGENTS.md or CLAUDE.md names magehand (app repos and the platform's)."""
+    for d in [cwd, *cwd.parents]:
+        if (d / '.git').exists():
+            return any('magehand' in (d / n).read_text(errors='replace') for n in ('AGENTS.md', 'CLAUDE.md')
+                       if (d / n).is_file())
+    return False
+
+
+try:
+    if not uses_magehand(pathlib.Path(json.load(sys.stdin).get('cwd') or '.')):
+        sys.exit(0)
+except (OSError, ValueError, AttributeError):
+    sys.exit(0)
 try:
     out = subprocess.run({magehand} + ['version', '--json'], capture_output=True, text=True, timeout=8)
     found = json.loads(out.stdout)
@@ -4723,10 +4763,11 @@ def latest_version(max_age=86400):
     """The newest released version (cached for a day); None when GitHub can't be asked."""
     try:
         cached = json.loads(LATEST_CACHE.read_text())
-        if time.time() - cached['checked'] < max_age:
+        # A failed lookup (offline) is retried after an hour, not on every command and session start.
+        if time.time() - cached['checked'] < (min(max_age, 3600) if cached.get('failed') else max_age):
             return cached['version']
     except (OSError, ValueError, KeyError, TypeError):
-        pass
+        cached = {}
     headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'magehand'}
     token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
     if token:
@@ -4736,7 +4777,13 @@ def latest_version(max_age=86400):
         with urllib.request.urlopen(req, timeout=3) as resp:  # nosec B310  # fixed https URL
             latest = newest_tag([t.get('name', '') for t in json.load(resp) if isinstance(t, dict)])
     except (OSError, ValueError):
-        return None
+        latest = cached.get('version') if isinstance(cached, dict) else None
+        try:
+            LATEST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            LATEST_CACHE.write_text(json.dumps({'checked': time.time(), 'version': latest, 'failed': True}))
+        except OSError:
+            pass
+        return latest
     try:
         LATEST_CACHE.parent.mkdir(parents=True, exist_ok=True)
         LATEST_CACHE.write_text(json.dumps({'checked': time.time(), 'version': latest}))
@@ -4791,14 +4838,21 @@ def run_by_agent():
     return any(os.environ.get(k) for k in AGENT_VARS)
 
 
+def newer_available():
+    """(installed, latest, whether latest is newer): latest is None when GitHub can't be asked."""
+    current, latest = installed_version(), latest_version()
+    now, then = version_tuple(current), version_tuple(latest)
+    return current, latest, bool(now and then and then > now)
+
+
 def update_notice():
     """One line on stderr when a newer magehand exists, in a terminal or for a coding agent; quiet in CI, other
     scripts and the managed copy."""
     if os.environ.get('CI') or os.environ.get('MAGEHAND_NO_UPDATE_CHECK') \
             or not (sys.stderr.isatty() or run_by_agent()) or install_method() == 'managed':
         return
-    current, latest = installed_version(), latest_version()
-    if current and latest and version_tuple(latest) > (version_tuple(current) or ()):
+    current, latest, newer = newer_available()
+    if newer:
         print(f'magehand {latest} is available (you have {current}): magehand upgrade'
               + (' (tell the user: it updates the skill and pre-approved commands too)' if run_by_agent() else ''),
               file=sys.stderr)
@@ -4844,9 +4898,8 @@ def cmd_upgrade(_a):
 
 
 def cmd_version(a):
-    current, managed = installed_version(), install_method() == 'managed'
-    latest = None if managed else latest_version()  # managed: no network call, provisioning runs this on every sync
-    newer = bool(current and latest and version_tuple(latest) > (version_tuple(current) or ()))
+    managed = install_method() == 'managed'  # no network call there: provisioning runs this on every sync
+    current, latest, newer = (installed_version(), None, False) if managed else newer_available()
     if getattr(a, 'json', False):
         print(json.dumps({'version': current, 'latest': latest, 'managed': managed, 'newer': newer,
                           'next': '`magehand upgrade`' if newer else None}))

@@ -2134,6 +2134,12 @@ class StayingCurrent(unittest.TestCase):
             try:
                 magehand.LATEST_CACHE.write_text(json.dumps({'checked': magehand.time.time(), 'version': '9.9.9'}))
                 self.assertEqual(magehand.latest_version(), '9.9.9')  # no network: the cache is fresh
+                # Offline: the failure is remembered (with the last version known) and retried after an hour
+                magehand.LATEST_CACHE.write_text(json.dumps({'checked': magehand.time.time() - 2 * 86400,
+                                                             'version': '9.9.8'}))
+                with mock.patch.object(magehand.urllib.request, 'urlopen', mock.Mock(side_effect=OSError('offline'))) as net:
+                    self.assertEqual((magehand.latest_version(), magehand.latest_version()), ('9.9.8', '9.9.8'))
+                self.assertEqual(net.call_count, 1)
             finally:
                 magehand.LATEST_CACHE = saved
 
@@ -2923,13 +2929,19 @@ class Approvals(unittest.TestCase):
         self.assertTrue(command['command'].startswith(f'{sys.executable} -I '), command)
         self.assertFalse((self.codex / 'rules').exists())  # Codex isn't installed here: no rules for it
 
-    def session(self, version_json):
-        """The installed session hook's output when `magehand version --json` prints `version_json` (a fake magehand)."""
+    def session(self, version_json, agents='Use magehand.\n'):
+        """The session hook's output when `magehand version --json` prints `version_json` (a fake magehand), for a
+        session started in a checkout whose AGENTS.md is `agents`."""
         fake = self.claude / 'fake-magehand'
         fake.parent.mkdir(parents=True, exist_ok=True)
         fake.write_text(f'import sys\nprint({version_json!r})\nsys.exit(0)\n')
+        repo = self.claude / 'repo'
+        (repo / '.git').mkdir(parents=True, exist_ok=True)
+        (repo / 'src').mkdir(exist_ok=True)
+        (repo / 'AGENTS.md').write_text(agents)
         script = magehand.SESSION_HOOK.format(generated='x', magehand=json.dumps([sys.executable, str(fake)]))
-        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30)
+        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,
+                             input=json.dumps({'hook_event_name': 'SessionStart', 'cwd': str(repo / 'src')}))
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout
 
@@ -2946,6 +2958,8 @@ class Approvals(unittest.TestCase):
         self.assertIn('`magehand upgrade`', out['additionalContext'])
         for quiet in ('{"version": "0.41.0", "latest": "0.41.0", "newer": false}', 'not json', '[]'):
             self.assertEqual(self.session(quiet), '', quiet)  # current, or a magehand that fails: nothing said
+        # A project that doesn't use magehand hears nothing (and runs no magehand at all)
+        self.assertEqual(self.session('{"version": "0.40.0", "latest": "0.41.0", "newer": true}', agents='Use npm.\n'), '')
 
     def test_version_json_says_whether_to_upgrade(self):
         with mock.patch.object(magehand, 'installed_version', lambda: '0.40.0'), \
@@ -3127,32 +3141,53 @@ class StaleAgents(unittest.TestCase):
     """doctor lists the owner's app repos whose AGENTS.md platform rules aren't the template's."""
     TEMPLATE = '# Rules\nuse magehand\n## This app\n'
 
-    def repos(self, *nodes):
-        return {'data': {'repositoryOwner': {'repositories': {'nodes': list(nodes)}}}}
+    def page(self, *nodes, more=None, template=TEMPLATE, owner=True):
+        repos = {'pageInfo': {'hasNextPage': bool(more), 'endCursor': more}, 'nodes': list(nodes)}
+        return {'data': {'template': {'agents': {'text': template}} if template else None,
+                         'repositoryOwner': {'repositories': repos} if owner else None}}
 
     def node(self, name, text, template=True, archived=False):
         return {'name': name, 'isArchived': archived, 'agents': None if text is None else {'text': text},
-                'templateRepository': {'nameWithOwner': magehand.TEMPLATE_REPO} if template else None}
+                'templateRepository': {'nameWithOwner': magehand.TEMPLATE_REPO.upper() if template == 'upper'
+                                       else magehand.TEMPLATE_REPO} if template else None}
 
-    def stale(self, found, err=None, template=TEMPLATE):
-        with mock.patch.object(magehand, 'gh_query', lambda *a: (found, err)), \
-                mock.patch.object(magehand, 'github_file', lambda *a, **k: template):
-            return REAL_STALE_AGENTS()
+    def stale(self, *pages, err=None):
+        calls = []
+
+        def query(*args):
+            calls.append(args)
+            return (None, err) if err else (pages[len(calls) - 1], None)
+        with mock.patch.object(magehand, 'gh_query', query), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: self.fail('a second request')):
+            return REAL_STALE_AGENTS(), calls
 
     def test_lists_only_template_repos_that_are_behind(self):
-        found = self.repos(self.node('current', self.TEMPLATE + 'notes\n'),
-                           self.node('behind', '# Rules\nold\n## This app\nnotes\n'),
-                           self.node('headless', '# Rules\nuse magehand\n'), self.node('none', None),
-                           self.node('retired', 'old', archived=True), self.node('homelab', 'other', template=False))
-        self.assertEqual(self.stale(found), (['behind', 'headless (no "## This app" heading)', 'none (no AGENTS.md)'],
-                                             None))
+        (stale, err), _ = self.stale(self.page(
+            self.node('current', self.TEMPLATE + 'notes\n'), self.node('behind', '# Rules\nold\n## This app\nnotes\n'),
+            self.node('headless', '# Rules\nuse magehand\n'), self.node('none', None),
+            self.node('cased', '# Rules\nold\n## This app\n', template='upper'),
+            self.node('retired', 'old', archived=True), self.node('homelab', 'other', template=False)))
+        self.assertEqual((stale, err), (['behind', 'headless (has no "## This app" heading)', 'none (no AGENTS.md)',
+                                         'cased'], None))
 
-    def test_github_unreadable_is_not_an_empty_list(self):
-        self.assertEqual(self.stale(None, 'HTTP 502'), (None, 'HTTP 502'))
-        self.assertEqual(self.stale(self.repos(), template=None)[0], None)
+    def test_reads_every_page(self):
+        (stale, _), calls = self.stale(self.page(self.node('a', self.TEMPLATE), more='c1'),
+                                       self.page(self.node('z', 'old\n## This app\n')))
+        self.assertEqual(stale, ['z'])
+        self.assertEqual((len(calls), calls[1][-2:]), (2, ('-f', 'cursor=c1')))
 
-    def test_doctor_names_them_and_says_what_to_do_when_nothing_failed(self):
-        with mock.patch.object(magehand, 'stale_agents', lambda: (['elvis'], None)), \
+    def test_nothing_read_is_not_all_current(self):
+        for pages, err, why in (((), 'HTTP 502\nmore detail', 'HTTP 502'),
+                                ((self.page(owner=False),), None, 'cannot list the repos'),
+                                ((self.page(template=None),), None, 'cannot read'),
+                                ((self.page(self.node('homelab', 'x', template=False)),), None, 'no repo made from')):
+            with self.subTest(why=why):
+                (stale, problem), _ = self.stale(*pages, err=err)
+                self.assertIsNone(stale)
+                self.assertTrue(problem.startswith(why) or why in problem, problem)
+
+    def doctor(self, found, *flags):
+        with mock.patch.object(magehand, 'stale_agents', lambda: found), \
                 mock.patch.object(magehand, 'github_token', lambda: 't'), \
                 mock.patch.object(magehand, 'github_file', lambda *a, **k: 'x'), \
                 mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
@@ -3161,11 +3196,28 @@ class StaleAgents(unittest.TestCase):
                 mock.patch.object(magehand, 'signin_left', lambda *a, **k: 3600), \
                 mock.patch.object(magehand, 'configured_runtime', lambda: 'none'), \
                 mock.patch.object(magehand.urllib.request, 'urlopen', lambda *a, **k: mock.Mock(status=200)):
-            code, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+            return CommandLine.run_main(self, 'doctor', *flags)
+
+    def test_doctor_names_them_and_says_what_to_do_when_nothing_failed(self):
+        code, out, _ = self.doctor((['elvis'], None), '--json')
         report = json.loads(out)
         self.assertEqual(code, 0)  # this machine is fine: the repos are a note, not a failure
         self.assertEqual([c['stale'] for c in report['checks'] if 'stale' in c], [['elvis']])
         self.assertEqual(report['next'], 'in each checkout: `magehand update-agents`, commit and open a PR (elvis)')
+        code, out, _ = self.doctor((['elvis'], None))
+        self.assertIn('--   AGENTS.md behind the template in 1 app repo(s): elvis', out)
+        self.assertEqual(out.splitlines()[-1], 'next: in each checkout: `magehand update-agents`, commit and open a PR (elvis)')
+
+    def test_doctor_says_whether_it_checked(self):
+        code, out, _ = self.doctor(([], None), '--json')
+        self.assertIn({'check': "app repos' AGENTS.md match the template", 'ok': True, 'hint': ''},
+                      json.loads(out)['checks'])
+        _, out, _ = self.doctor(([], None))
+        self.assertIn("ok   app repos' AGENTS.md match the template", out)
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
+        _, out, _ = self.doctor((None, 'HTTP 502'))
+        self.assertIn("--   app repos' AGENTS.md: not checked (HTTP 502)", out)
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
 
 
 class ManagedCopy(unittest.TestCase):
