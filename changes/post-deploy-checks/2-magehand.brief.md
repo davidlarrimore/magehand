@@ -1,5 +1,0 @@
-# Slice B — magehand CLI
-
-Issue davidlarrimore/homelab#395, owner-approved rung 1 only. Implement `magehand check` validation of app `deploy/checks.yaml`, and guide section explaining declarative dev-only post-deploy checks. `magehand status` must display the `homelab/post-deploy` commit status on the deployed app commit. The schema must match the platform implementation in `/home/node/.openclaw/workspace/homelab-post-deploy/platform/openclaw/tools/homelab` and the platform brief/report; coordinate on exact keys. Validate methods only GET/HEAD, absolute safe path, expected status, optional body substring or JSON key, no arbitrary URL/code/headers/POST. Missing file may be optional for legacy apps; malformed file is error. Ensure `magehand new` scaffolding does not overwrite template `deploy/checks.yaml` and handles it cleanly.
-
-Read AGENTS.md and CLAUDE.md. May edit `src/magehand/cli.py`, `tests/test_cli.py`, README/docs only; no `.github/workflows/`, release, network change or production checks. Run `python3 -m unittest discover -s tests` and relevant CLI checks. Write report at `changes/post-deploy-checks/2-magehand.report.md`; no commit/push/PR.
