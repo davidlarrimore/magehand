@@ -1059,7 +1059,83 @@ def argo_problem(application):
 
 # kubectl's answers when this machine has no cluster to ask (a laptop): not a problem, so said plainly.
 NO_CLUSTER = re.compile(r'kubectl is not installed|localhost:8080|no configuration has been provided|'
-                        r'current-context is not set|context was not found', re.I)
+                        r'current-context is not set|context was not found|kubectl has no context', re.I)
+# Where dev's job runs can be read when neither kubectl nor the platform's status issue has them.
+RUNS_ELSEWHERE = ("for dev's job runs, ask OpenClaw on Telegram (it reads dev), or run `magehand job ls` where kubectl "
+                  'reaches the cluster; failed and missed runs alert the owner either way')
+# The platform's copy of what only the cluster knows (homelab `homelab app publish-status`, every 5 minutes):
+# one bot-owned issue per app repo, its JSON (kubectl's CronJobs, Jobs and Pods, trimmed) in an HTML comment.
+PLATFORM_STATUS_TITLE = 'Platform status'
+PLATFORM_STATUS_MARK = 'homelab-platform-status'
+PLATFORM_STATUS_STALE = 2 * 3600  # it is rewritten at least hourly: older than this, the publisher has stopped
+# What job ls reads of each published item (job_rows, job_runs) and the type each must have when present.
+PLATFORM_STATUS_ITEM = {
+    'kind': str, 'metadata': {'name': str, 'ownerReferences': [{'kind': str, 'name': str}]},
+    'spec': {'schedule': str, 'timeZone': str, 'suspend': bool},
+    'status': {'lastScheduleTime': str, 'lastSuccessfulTime': str, 'active': list, 'startTime': str,
+               'completionTime': str, 'succeeded': int,
+               'conditions': [{'type': str, 'status': str, 'lastTransitionTime': str}]}}
+
+
+def shaped(value, shape):
+    """True when `value` fits `shape`: a type, a dict of key: shape (an absent or null key fits), or a
+    one-item list [shape] for a list of those."""
+    if isinstance(shape, dict):
+        return isinstance(value, dict) and all(value.get(k) is None or shaped(value[k], s) for k, s in shape.items())
+    if isinstance(shape, list):
+        return isinstance(value, list) and all(shaped(v, shape[0]) for v in value)
+    return isinstance(value, shape)
+
+
+def platform_status(repo):
+    """(the published status {'as_of', 'envs': {env: items}}, None) from the app repo's Platform status issue,
+    or (None, why not). Read through gh, as the rest of magehand reads GitHub."""
+    code, out, err = gh_probe('api', f'repos/{repo}/issues?state=all&creator={BOT}&per_page=100')
+    if code != 0:
+        return None, f'cannot read {repo}\'s issues ({err or "gh failed"})'
+    try:
+        issue = next((i for i in json.loads(out) if i.get('title') == PLATFORM_STATUS_TITLE and not i.get('pull_request')), None)
+    except ValueError:
+        return None, 'gh returned something that is not JSON'
+    if not issue:
+        return None, f'the platform has not published {repo}\'s status yet'
+    m = re.search(rf'<!-- {PLATFORM_STATUS_MARK}\n(.*?)\n-->', issue.get('body') or '', re.S)
+    try:
+        data = json.loads(m.group(1)) if m else None
+    except ValueError:
+        data = None
+    unreadable = f'{repo}#{issue.get("number")} is not a status this magehand reads (`magehand upgrade`?)'
+    if not isinstance(data, dict) or data.get('schema') != 1:
+        return None, unreadable
+    # Schema 1 as publish-status writes it: a timestamp, and dev's items, each named and shaped as job ls reads
+    # them (an empty list is a dev with no jobs; a missing one is no status at all, never an empty dev).
+    envs = data.get('envs')
+    if seconds_between(data.get('as_of'), data.get('as_of')) is None or not isinstance(envs, dict) or 'dev' not in envs \
+            or not all(shaped(items, [PLATFORM_STATUS_ITEM]) and all(
+                isinstance(i.get('kind'), str) and isinstance((i.get('metadata') or {}).get('name'), str)
+                for i in items) for items in envs.values()):
+        return None, unreadable
+    return data, None
+
+
+def no_cluster(why):
+    """Plain words for a kubectl failure that means this machine has no cluster to ask (NO_CLUSTER), else None."""
+    if not why or not NO_CLUSTER.search(why):
+        return None
+    return 'no cluster access configured on this machine (' + (
+        'kubectl is not installed' if 'not installed' in why else 'kubectl has no cluster context') + ')'
+
+
+def cluster_access():
+    """None when kubectl has a current context, else why not. Reads kubectl's config only: no network call."""
+    if not shutil.which('kubectl'):
+        return 'kubectl is not installed'
+    try:
+        out = subprocess.run(['kubectl', 'config', 'current-context'], capture_output=True, text=True,  # nosec B603 B607
+                             timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return 'kubectl did not answer'
+    return None if out.returncode == 0 and (out.stdout or '').strip() else 'kubectl has no context'
 
 
 def platform_deployment(repo, environment, sha, application, image=None):
@@ -3168,6 +3244,17 @@ def cmd_doctor(a):
             print(f'--   {note}')
     elif stale == []:
         check("app repos' AGENTS.md match the template", True)
+    # Cluster access is a note, never a failure: only `job ls` and status's per-pod detail use it, and a laptop
+    # normally has none (dev's state is in GitHub Deployments; OpenClaw reads the cluster).
+    # Only no answer at all means a context: a probe that failed is unknown, not reassurance.
+    probe = cluster_access()
+    absent = no_cluster(probe)
+    note = ('cluster access: kubectl has a context' if probe is None else
+            f'cluster access: none, {absent.split("(", 1)[1].rstrip(")")}: `magehand job ls` and status\'s pod detail '
+            "can't read dev here (normal on a laptop; OpenClaw can)" if absent else f'cluster access: not checked ({probe})')
+    results.append({'check': 'cluster access', 'ok': None, 'hint': note})
+    if not a.json:
+        print(f'--   {note}')
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
@@ -5949,25 +6036,44 @@ def job_rm(a, app, base):
 def job_ls(a, app):
     namespace = f'{app["name"]}-dev'
     cluster, why = (None, '--no-cluster') if a.no_cluster else kubectl_json('cronjobs,jobs', '-n', namespace)
+    absent = no_cluster(why)  # a laptop: the platform's published copy instead, else say where the runs are
+    source, as_of = 'cluster', None
+    if absent:
+        repo = origin_repo(app['root'])
+        published, missing = platform_status(repo) if repo else (None, 'this checkout has no GitHub origin')
+        if published:
+            cluster, source, as_of = {'items': published['envs']['dev']}, 'platform', published['as_of']
+        else:
+            absent = f'{absent}; {missing}'
     rows = job_rows(local_jobs(app), cluster)
     failed = [run['job'] for row in rows for run in ((row['dev'] or {}).get('runs') or [])[:1] if run['state'] == 'failed']
+    stale = bool(as_of) and (seconds_between(as_of, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())) or 0) > PLATFORM_STATUS_STALE
+    logs = (f'`kubectl -n {namespace} logs job/{failed[0]}`' if source == 'cluster' else
+            'ask OpenClaw on Telegram for its logs (this machine has no cluster access)') if failed else None
     step = ('`magehand job add NAME --schedule CRON -- COMMAND`' if not rows else
-            f'read why its last run failed: `kubectl -n {namespace} logs job/{failed[0]}`' if failed else None)
+            f'read why its last run failed: {logs}' if failed else
+            "the platform's status is over 2 hours old: tell the owner (OpenClaw's publish-status timer stopped?)"
+            if stale else RUNS_ELSEWHERE if cluster is None and absent else None)
     if a.json:
-        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows,
+        print(json.dumps({'app': app['name'], 'namespace': namespace,
+                          'cluster': f'published by the platform as of {as_of}' if source == 'platform' else
+                          absent or why or 'read', 'source': source, 'as_of': as_of, 'stale': stale, 'jobs': rows,
                           'next': step}, indent=1))
         return
     if not rows:
         print(f'{app["name"]} has no jobs')
         print(next_line(step))
         return
+    if source == 'platform':
+        print(f"dev as the platform published it at {clock(as_of)} (this machine has no cluster access)"
+              + (': OVER 2 HOURS OLD' if stale else ''))
     for row in rows:
         where = row['file'] or 'in dev only: not in this checkout\'s deploy/ (removed on this branch?)'
         command = shlex.join(map(str, row['command'])) if row['command'] else '-'
         print(f'{row["name"]}: {row["schedule"]} ({row["timezone"]}), {command} [{where}]')
         dev = row['dev']
         if cluster is None:
-            print(f'  dev: not checked ({why})')
+            print(f'  dev: not checked ({absent or why})')
         elif dev is None:
             print('  dev: not deployed yet (it deploys when merged)')
         else:
@@ -5976,7 +6082,7 @@ def job_ls(a, app):
             for run in dev['runs']:
                 took = f', {run["seconds"]}s' if run['seconds'] is not None else ''
                 print(f'    {STATUS_MARK[run["state"]]} {run["job"]} {when(run["started"])}{took}')
-            if dev['runs']:
+            if dev['runs'] and source == 'cluster':
                 print(f'  logs: kubectl -n {namespace} logs job/{dev["runs"][0]["job"]}')
     print(next_line(step))
 
