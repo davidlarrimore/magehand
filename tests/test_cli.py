@@ -1536,7 +1536,9 @@ class DeployDir(unittest.TestCase):
                 (root / 'deploy/prod/kustomization.yaml').write_text('namespace: demo\nresources: [../base]\n')
             answers = {'dev': dev, 'prod': prod}
             render = lambda local, overlay: ('failed', failed) if failed else (answers[overlay], None)  # noqa: E731
-            with mock.patch.object(magehand, 'render_overlay', render):
+            with mock.patch.object(magehand, 'render_overlay', render), \
+                    mock.patch.object(magehand, 'check_admission', lambda name, rendered: ([], [])), \
+                    mock.patch.object(magehand, 'check_schemas', lambda rendered: ([], [])):
                 return magehand.check_rendered(root, 'demo')
 
     DEV_DEPLOYMENT = {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'demo', 'namespace': 'demo-dev'},
@@ -1600,6 +1602,109 @@ class DeployDir(unittest.TestCase):
         self.assertEqual(local['skipped'], ['deploy/dev: not rendered (kubectl is not installed); CI renders and checks it'])
         self.assertEqual(ci['skipped'], [])
         self.assertIn(('error', 'deploy/dev'), [(f['level'], f['where']) for f in ci['findings']])
+
+    KYVERNO_FAIL = ('Applying 4 policy rule(s) to 2 resource(s)...\n\n'
+                    'policy require-non-root -> resource demo-dev/Deployment/demo failed:\n'
+                    '1. autogen-run-as-non-root: validation error: Running as root is not allowed. rule '
+                    'autogen-run-as-non-root failed at path /spec/template/spec/securityContext/runAsNonRoot/\n\n'
+                    'pass: 7, fail: 1, warn: 0, error: 0, skip: 2\n')
+
+    def cluster_rules(self, kyverno='', kubeconform='', tools=('kyverno', 'kubeconform'), policies=('pods.yaml',),
+                      kustomize=0):
+        """check_admission and check_schemas on one rendered dev overlay, with the tools answering as given."""
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if argv[:2] == ['kubectl', 'kustomize']:
+                applied = pathlib.Path(argv[2])
+                self.kustomization = json.loads((applied / 'kustomization.yaml').read_text())
+                return subprocess.CompletedProcess(argv, kustomize, (applied / 'app.yaml').read_text(),
+                                                   'Error: bad image' if kustomize else '')
+            output = kyverno if argv[0].endswith('kyverno') else kubeconform
+            failed = 'fail: 0, warn: 0, error: 0' not in output if argv[0].endswith('kyverno') else bool(output)
+            return subprocess.CompletedProcess(argv, int(failed), output, '')
+        files = {f'{magehand.POLICY_DIR}/{n}': 'kind: ClusterPolicy\n' for n in policies}
+        with mock.patch.object(magehand.subprocess, 'run', run), \
+                mock.patch.object(magehand.shutil, 'which', lambda t: f'/usr/local/bin/{t}' if t in tools else None), \
+                mock.patch.object(magehand, 'github_dir', lambda repo, path, **k: [n.rsplit('/', 1)[1] for n in files]), \
+                mock.patch.object(magehand, 'github_file', lambda repo, path, **k: files[path]):
+            rendered = [('dev', [self.DEV_DEPLOYMENT])]
+            admission, schemas = magehand.check_admission('demo', rendered), magehand.check_schemas(rendered)
+        return admission, schemas, calls
+
+    def test_the_cluster_s_admission_policies_run_as_ci_runs_them(self):
+        ok = 'Applying 4 policy rule(s) to 2 resource(s)...\n\npass: 8, fail: 0, warn: 0, error: 0, skip: 2\n'
+        admission, _, calls = self.cluster_rules(kyverno=ok)
+        self.assertEqual(admission, ([], []))
+        apply = calls[1][0]
+        self.assertEqual((apply[1], apply[3]), ('apply', '--resource'))
+        self.assertTrue(apply[2].endswith('/policies'))
+        # as Argo CD applies it: the app's image pinned by a digest, and the Application's tracking id
+        self.assertEqual(self.kustomization['images'], [{'name': 'ghcr.io/davidlarrimore/homelab-apps/demo',
+                                                         'digest': magehand.POLICY_DIGEST}])
+        self.assertEqual(self.kustomization['commonAnnotations'],
+                         {'argocd.argoproj.io/tracking-id': 'demo-dev:policy-check'})
+
+    def test_a_refusal_names_the_policy_the_resource_and_why(self):
+        (found, skipped), _, _ = self.cluster_rules(kyverno=self.KYVERNO_FAIL)
+        self.assertEqual(skipped, [])
+        self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/dev')])
+        self.assertIn('the cluster would refuse it: require-non-root on demo: autogen-run-as-non-root: validation '
+                      'error: Running as root is not allowed', found[0]['text'])
+        self.assertIn('"Every workload must"', found[0]['see'])
+
+    def test_kyverno_output_without_a_summary_is_an_error(self):
+        (found, _), _, _ = self.cluster_rules(kyverno='Error: failed to load policies\n')
+        self.assertIn('Kyverno gave no result: Error: failed to load policies', found[0]['text'])
+
+    def test_a_render_kustomize_cannot_pin_is_an_error(self):
+        (found, _), _, _ = self.cluster_rules(kustomize=1)
+        self.assertIn('cannot prepare it for the admission policies: Error: bad image', found[0]['text'])
+
+    def test_missing_tools_and_policies_are_skips_with_how_to_install(self):
+        admission, schemas, calls = self.cluster_rules(tools=())
+        self.assertEqual((admission[0], schemas[0], calls), ([], [], []))
+        self.assertIn('kyverno is not installed: `brew install kyverno`', admission[1][0])
+        self.assertIn('kubeconform is not installed: `brew install kubeconform`', schemas[1][0])
+        admission, _, _ = self.cluster_rules(policies=())
+        self.assertIn('cannot read davidlarrimore/homelab-apps .github/kyverno/policies', admission[1][0])
+
+    def test_schemas_as_ci_checks_them(self):
+        _, schemas, calls = self.cluster_rules(kyverno='pass: 1, fail: 0, warn: 0, error: 0')
+        self.assertEqual(schemas, ([], []))
+        argv, kw = next((argv, kw) for argv, kw in calls if argv[0].endswith('kubeconform'))
+        self.assertEqual(argv[1:5], ['-strict', '-summary', '-schema-location', 'default'])
+        self.assertIn('datreeio/CRDs-catalog', argv[6])
+        self.assertIn('kind: Deployment', kw['input'])  # the render, on stdin
+        bad = ('stdin - Deployment demo is invalid: problem validating schema. Check JSON formatting: '
+               "jsonschema: '/spec/template/spec/containers/0' does not validate: additionalProperties 'imagePullPolicyy' "
+               'not allowed\nSummary: 1 resource found parsing stdin - Valid: 0, Invalid: 1, Errors: 0, Skipped: 0\n')
+        _, (found, _), _ = self.cluster_rules(kubeconform=bad)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]['text'].startswith('Deployment demo is invalid'))
+        self.assertIn("'imagePullPolicyy' not allowed", found[0]['text'])
+        offline = ('stdin - Deployment demo failed validation: could not find schema for Deployment\n'
+                   'Summary: 1 resource found parsing stdin - Valid: 0, Invalid: 0, Errors: 1, Skipped: 0\n')
+        _, (found, skipped), _ = self.cluster_rules(kubeconform=offline)
+        self.assertEqual(found, [])
+        self.assertIn('schemas not checked (cannot download them here)', skipped[0])
+
+    def test_strict_makes_every_skip_an_error_and_ci_only_the_render(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp)
+            (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
+            argv = ['check', 'demo', '--code', str(root), '--manifests-only', '--json']
+            missing = [magehand.tool_missing('kyverno', 'admission policies')]
+            with mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                    mock.patch.object(magehand, 'check_rendered', lambda root, name: ([], list(missing))):
+                with mock.patch.dict(os.environ, {'CI': 'true'}):
+                    ci = json.loads(CommandLine.run_main(self, *argv)[1])
+                    strict = CommandLine.run_main(self, *argv, '--strict')
+        self.assertEqual((ci['skipped'], ci['errors']), (missing, 0))  # CI today: kyverno runs in its own step
+        code, out = strict[0], json.loads(strict[1])
+        self.assertEqual((code, out['skipped'], out['errors']), (1, [], 1))
+        self.assertIn("--strict runs every rule CI's checks run", out['findings'][0]['text'])
 
     def test_overlays_and_their_namespaces(self):
         with tempfile.TemporaryDirectory() as tmp:

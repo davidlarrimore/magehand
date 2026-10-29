@@ -3419,6 +3419,12 @@ ALLOWED_KINDS = {
 LAB_AUTH = 'authentik-forward-auth@kubernetescrd'
 STRIP_AUTH = 'kube-system-strip-authentik-headers@kubernetescrd'
 PUBLIC_AUTH = 'authentik-public-forward-auth@kubernetescrd'
+# The cluster's admission policies, as homelab-apps keeps a copy for CI (the homelab's sync-catalog.py --apps).
+POLICY_DIR = '.github/kyverno/policies'
+POLICY_DIGEST = 'sha256:' + '0' * 64  # any digest passes the same rules: Argo CD applies the pinned one
+# kubeconform's schemas: Kubernetes' own, and the CRD catalog for ExternalSecret (as build-app.yaml runs it).
+CRD_SCHEMAS = 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+TOOL_INSTALL = {'kyverno': '`brew install kyverno`', 'kubeconform': '`brew install kubeconform`'}
 
 
 def render_overlay(local, overlay):
@@ -3446,7 +3452,7 @@ def check_rendered(root, name):
     local = deploy_dir(root)
     if not local or not name or not any((local / 'base').glob('*.y*ml')):
         return [], []
-    found, skipped = [], []
+    found, skipped, rendered = [], [], []
     domain = LAB.split('.', 1)[1]
     for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
         where = f'{DEPLOY}/{overlay}'
@@ -3466,6 +3472,7 @@ def check_rendered(root, name):
         if docs is None:
             skipped.append(f'{where}: not rendered ({why}); CI renders and checks it')
             continue
+        rendered.append((overlay, docs))
         lab, public = f'{namespace}.{LAB}', f'{namespace}.{domain}'
         for doc in docs:
             meta = doc.get('metadata') or {}
@@ -3498,6 +3505,105 @@ def check_rendered(root, name):
                     found.append(finding('error', label, f'needs a container named `app` (it has {containers}): the '
                                          'platform pins the commit and image on it',
                                          'homelab-apps AGENTS.md "Apps with their own repo"'))
+    if rendered:
+        more, missed = check_admission(name, rendered)
+        found, skipped = found + more, skipped + missed
+        more, missed = check_schemas(rendered)
+        found, skipped = found + more, skipped + missed
+    return found, skipped
+
+
+def tool_missing(tool, what):
+    """The `skipped` line for a check whose tool isn't installed here."""
+    return f'{DEPLOY}: {what} not checked ({tool} is not installed: {TOOL_INSTALL[tool]}); CI checks them'
+
+
+def check_admission(name, rendered):
+    """The cluster's admission policies (Kyverno) on each rendered overlay, as homelab-apps CI runs them: the
+    render made to look as Argo CD applies it (the app's own image pinned by a digest, and the Application's
+    tracking id, which the production policies match on). (findings, skipped)."""
+    kyverno = shutil.which('kyverno')
+    if not kyverno:
+        return [], [tool_missing('kyverno', 'admission policies')]
+    names = [n for n in github_dir(APPS_REPO, POLICY_DIR) if n.endswith(('.yaml', '.yml'))]
+    if not names:
+        return [], [f'{DEPLOY}: admission policies not checked (cannot read {APPS_REPO} {POLICY_DIR}); CI checks them']
+    found, see = [], 'homelab-apps AGENTS.md "Every workload must"'
+    with tempfile.TemporaryDirectory() as tmp:
+        policies = pathlib.Path(tmp) / 'policies'
+        policies.mkdir()
+        for n in names:
+            (policies / n).write_text(github_file(APPS_REPO, f'{POLICY_DIR}/{n}'))
+        for overlay, docs in rendered:
+            where, env = f'{DEPLOY}/{overlay}', 'prod' if overlay == 'prod' else 'dev'
+            kdir = pathlib.Path(tmp) / overlay
+            kdir.mkdir()
+            (kdir / 'app.yaml').write_text(yaml.safe_dump_all(docs, sort_keys=False))
+            (kdir / 'kustomization.yaml').write_text(json.dumps({
+                'resources': ['app.yaml'],
+                'images': [{'name': f'ghcr.io/davidlarrimore/homelab-apps/{name}', 'digest': POLICY_DIGEST}],
+                'commonAnnotations': {'argocd.argoproj.io/tracking-id': f'{name}-{env}:policy-check'}}))
+            applied = subprocess.run(['kubectl', 'kustomize', str(kdir)], capture_output=True, text=True,  # nosec B603 B607
+                                     timeout=60)
+            if applied.returncode:
+                found.append(finding('error', where, 'cannot prepare it for the admission policies: '
+                                     + (applied.stderr.strip().splitlines() or ['kubectl kustomize failed'])[-1], see))
+                continue
+            (kdir / 'applied.yaml').write_text(applied.stdout)
+            out = subprocess.run([kyverno, 'apply', str(policies), '--resource', str(kdir / 'applied.yaml')],  # nosec B603
+                                 capture_output=True, text=True, timeout=120)
+            text = out.stdout + out.stderr
+            m = re.search(r'pass: (\d+), fail: (\d+), warn: \d+, error: (\d+)', text)
+            if not m:
+                found.append(finding('error', where, 'Kyverno gave no result: '
+                                     + (text.strip().splitlines() or ['no output'])[-1], see))
+            elif int(m.group(2)) or int(m.group(3)):
+                found += [finding('error', where, f'the cluster would refuse it: {refusal}', see)
+                          for refusal in policy_refusals(text)]
+    return found, []
+
+
+def policy_refusals(text):
+    """Each refusal in `kyverno apply`'s output ("policy P -> resource R failed:" and its numbered reasons),
+    one string each; the output's own lines when it has none in that shape."""
+    refusals, current = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        head = re.match(r'policy (\S+) -> resource (\S+) (?:failed|error)', line)
+        if head:
+            current = [f'{head.group(1)} on {head.group(2).strip("/").rsplit("/", 1)[-1]}']
+            refusals.append(current)
+        elif current is not None and re.match(r'\d+\. ', line):
+            current.append(re.sub(r'^\d+\.\s*', '', line))
+        elif not line:
+            current = None
+    if refusals:
+        return [': '.join([r[0], '; '.join(r[1:])]) if len(r) > 1 else r[0] for r in refusals]
+    lines = [line for line in text.strip().splitlines() if line.strip() and not line.startswith('Applying')]
+    return ['\n          '.join(lines[-15:]) or 'Kyverno reported a failure']
+
+
+def check_schemas(rendered):
+    """Each rendered overlay against the Kubernetes and CRD schemas (kubeconform -strict, as CI runs it): an
+    unknown or misspelled field fails here instead of at deploy. (findings, skipped)."""
+    kubeconform = shutil.which('kubeconform')
+    if not kubeconform:
+        return [], [tool_missing('kubeconform', 'schemas')]
+    found, skipped, see = [], [], 'README "How an app is put together"'
+    for overlay, docs in rendered:
+        where = f'{DEPLOY}/{overlay}'
+        out = subprocess.run([kubeconform, '-strict', '-summary', '-schema-location', 'default',  # nosec B603
+                              '-schema-location', CRD_SCHEMAS], input=yaml.safe_dump_all(docs, sort_keys=False),
+                             capture_output=True, text=True, timeout=120)
+        if out.returncode == 0:
+            continue
+        lines = [line.strip() for line in (out.stdout + out.stderr).splitlines()
+                 if line.strip() and not line.startswith('Summary:')]
+        if lines and all(re.search(r'failed downloading schema|could not find schema', line) for line in lines):
+            skipped.append(f'{where}: schemas not checked (cannot download them here); CI checks them')
+            continue
+        found += [finding('error', where, re.sub(r'^stdin - ', '', line), see) for line in lines] or \
+            [finding('error', where, f'kubeconform failed (exit {out.returncode})', see)]
     return found, skipped
 
 
@@ -4174,8 +4280,8 @@ def cmd_check_ui(a):
 def cmd_check(a):
     global APPS_DIR
     if a.ui:
-        if a.manifests_only or a.apps_dir:
-            usage('check', '--ui runs the browser check only: leave out --manifests-only and --apps-dir')
+        if a.manifests_only or a.apps_dir or a.strict:
+            usage('check', '--ui runs the browser check only: leave out --manifests-only, --apps-dir and --strict')
         cmd_check_ui(a)
     manifests_only = a.manifests_only
     if a.apps_dir:
@@ -4201,10 +4307,16 @@ def cmd_check(a):
         + check_deploy_files(root, name)
     rendered, skipped = check_rendered(root, name)
     found += rendered
-    if skipped and os.environ.get('CI'):  # CI must check everything a merge deploys: a skip there is a failure
-        found += [finding('error', s.split(':', 1)[0], s.split(': ', 1)[1].replace('; CI renders and checks it', '')
-                          + ': CI needs kubectl to render deploy/', 'README "How an app is put together"') for s in skipped]
-        skipped = []
+    # CI must check everything a merge deploys: there a render that was skipped is a failure, and with --strict
+    # (CI, once it installs kyverno and kubeconform) so is any rule that couldn't run.
+    hard = skipped if a.strict else [s for s in skipped if ': not rendered (' in s] if os.environ.get('CI') else []
+    for s in hard:
+        where, why = s.split(': ', 1)
+        found.append(finding('error', where, why.replace('; CI renders and checks it', ': CI needs kubectl to render '
+                                                         'deploy/').replace('; CI checks them', ': --strict runs every '
+                                                                            "rule CI's checks run"),
+                             'README "How an app is put together"'))
+    skipped = [s for s in skipped if s not in hard]
     if not manifests_only:
         found += check_code(root, app, catalog) + check_agents_drift(root) + check_merged_branch(root)
     errors = sum(f['level'] == 'error' for f in found)
@@ -6148,7 +6260,9 @@ def build_parser():
     q.add_argument('--json', action='store_true', help='print JSON')
     p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
                 'Run it before every push; CI runs the same check. Each finding names the guide section\n'
-                'that explains it. Exit status 1 when there are errors; fix warnings or explain them in the PR.\n\n'
+                'that explains it. Exit status 1 when there are errors; fix warnings or explain them in the PR.\n'
+                "deploy/ is rendered with kubectl and run through the cluster's admission policies (kyverno) and\n"
+                'schemas (kubeconform); a rule whose tool is missing here is skipped with a note (--strict: an error).\n\n'
                 'examples:\n  magehand check                          in an app repo\n'
                 '  magehand check --json\n'
                 '  magehand check --ui                     CI\'s browser check, here (about a minute)\n'
@@ -6157,6 +6271,8 @@ def build_parser():
     p.add_argument('--code', default='.', metavar='DIR', help="the app's code (default: .)")
     p.add_argument('--apps-dir', metavar='DIR', help='read this homelab-apps checkout instead of GitHub (CI)')
     p.add_argument('--manifests-only', action='store_true', help='check the deployment only, not the code')
+    p.add_argument('--strict', action='store_true',
+                   help="a rule that can't run here (kubectl, kyverno or kubeconform missing) is an error (CI)")
     p.add_argument('--ui', action='store_true',
                    help="run CI's browser check here instead (builds the image; needs a container runtime)")
     json_option(p)
