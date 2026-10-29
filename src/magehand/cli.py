@@ -3748,7 +3748,7 @@ def parse_post_checks(text):
                 raise ValueError('checks.yaml requires unique string keys')
             return super().construct_mapping(node, deep=deep)
     try:
-        doc = yaml.load(text, Loader=Loader)
+        doc = yaml.load(text, Loader=Loader)  # nosec B506  # Loader subclasses SafeLoader and rejects aliases/duplicate keys
     except (yaml.YAMLError, RecursionError, ValueError, TypeError):
         raise ValueError('invalid checks.yaml YAML') from None
     if not isinstance(doc, dict) or set(doc) != {'version', 'checks'} or type(doc['version']) is not int \
