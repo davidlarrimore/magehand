@@ -1087,8 +1087,15 @@ def platform_status(repo):
         data = json.loads(m.group(1)) if m else None
     except ValueError:
         data = None
+    unreadable = f'{repo}#{issue.get("number")} is not a status this magehand reads (`magehand upgrade`?)'
     if not isinstance(data, dict) or data.get('schema') != 1:
-        return None, f'{repo}#{issue.get("number")} is not a status this magehand reads (`magehand upgrade`?)'
+        return None, unreadable
+    # Schema 1 as publish-status writes it: a timestamp, and dev's items as a list of objects (an empty list is
+    # a dev with no jobs; a missing one is no status at all, never an empty dev).
+    envs = data.get('envs')
+    if seconds_between(data.get('as_of'), data.get('as_of')) is None or not isinstance(envs, dict) or 'dev' not in envs \
+            or not all(isinstance(items, list) and all(isinstance(i, dict) for i in items) for items in envs.values()):
+        return None, unreadable
     return data, None
 
 
@@ -3220,9 +3227,12 @@ def cmd_doctor(a):
         check("app repos' AGENTS.md match the template", True)
     # Cluster access is a note, never a failure: only `job ls` and status's per-pod detail use it, and a laptop
     # normally has none (dev's state is in GitHub Deployments; OpenClaw reads the cluster).
-    absent = no_cluster(cluster_access() or '')
-    note = (f'cluster access: none, {absent.split("(", 1)[1].rstrip(")")}: `magehand job ls` and status\'s pod detail '
-            "can't read dev here (normal on a laptop; OpenClaw can)" if absent else 'cluster access: kubectl has a context')
+    # Only no answer at all means a context: a probe that failed is unknown, not reassurance.
+    probe = cluster_access()
+    absent = no_cluster(probe)
+    note = ('cluster access: kubectl has a context' if probe is None else
+            f'cluster access: none, {absent.split("(", 1)[1].rstrip(")")}: `magehand job ls` and status\'s pod detail '
+            "can't read dev here (normal on a laptop; OpenClaw can)" if absent else f'cluster access: not checked ({probe})')
     results.append({'check': 'cluster access', 'ok': None, 'hint': note})
     if not a.json:
         print(f'--   {note}')
@@ -6013,7 +6023,7 @@ def job_ls(a, app):
         repo = origin_repo(app['root'])
         published, missing = platform_status(repo) if repo else (None, 'this checkout has no GitHub origin')
         if published:
-            cluster, source, as_of = {'items': (published.get('envs') or {}).get('dev') or []}, 'platform', published.get('as_of')
+            cluster, source, as_of = {'items': published['envs']['dev']}, 'platform', published['as_of']
         else:
             absent = f'{absent}; {missing}'
     rows = job_rows(local_jobs(app), cluster)

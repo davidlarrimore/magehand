@@ -3411,6 +3411,24 @@ class Approvals(unittest.TestCase):
             _, out, _ = CommandLine.run_main(self, 'doctor', '--json')
             self.assertNotIn('pre-approved commands', [r['check'] for r in json.loads(out)['checks']])
 
+    def test_doctor_notes_cluster_access_only_when_kubectl_says_so(self):
+        notes = {}
+        for probe in (None, 'kubectl has no context', 'kubectl did not answer'):
+            with mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                    mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                    mock.patch.object(magehand.urllib.request, 'urlopen', mock.Mock(side_effect=OSError())), \
+                    mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                    mock.patch.object(magehand, 'current_repo', lambda *a: None), \
+                    mock.patch.object(magehand, 'cluster_access', lambda probe=probe: probe):
+                code, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+            found = [r for r in json.loads(out)['checks'] if r['check'] == 'cluster access']
+            self.assertEqual(found[0]['ok'], None)  # a note, never a failure
+            notes[probe] = found[0]['hint']
+        self.assertEqual(notes[None], 'cluster access: kubectl has a context')
+        self.assertIn('cluster access: none, kubectl has no cluster context', notes['kubectl has no context'])
+        # a probe that failed is unknown, not a context
+        self.assertEqual(notes['kubectl did not answer'], 'cluster access: not checked (kubectl did not answer)')
+
 
 class StaleAgents(unittest.TestCase):
     """doctor lists the owner's app repos whose AGENTS.md platform rules aren't the template's."""
@@ -5371,6 +5389,17 @@ class Jobs(unittest.TestCase):
                  (0, '[]', '', "the platform has not published davidlarrimore/demo's status yet"),
                  (0, json.dumps([{'number': 5, 'title': 'Platform status', 'body': 'edited by hand'}]), '',
                   'davidlarrimore/demo#5 is not a status this magehand reads'))
+        # schema 1 but incomplete or the wrong shape: unreadable, never an empty dev
+        good = {'schema': 1, 'as_of': '2026-10-28T06:20:00Z', 'envs': {'dev': []}}
+        for broken in ({'schema': 1}, {**good, 'as_of': None}, {**good, 'as_of': 'yesterday'}, {**good, 'envs': []},
+                       {**good, 'envs': {}}, {**good, 'envs': {'dev': 'x'}}, {**good, 'envs': {'dev': ['x']}},
+                       {**good, 'envs': {'dev': [], 'prod': None}}):
+            body = f'<!-- homelab-platform-status\n{json.dumps(broken)}\n-->'
+            cases += ((0, json.dumps([{'number': 5, 'title': 'Platform status', 'body': body}]), '',
+                       'davidlarrimore/demo#5 is not a status this magehand reads'),)
+        with mock.patch.object(magehand, 'gh_probe', lambda *a: (0, json.dumps([{
+                'number': 5, 'title': 'Platform status', 'body': f'<!-- homelab-platform-status\n{json.dumps(good)}\n-->'}]), '')):
+            self.assertEqual(magehand.platform_status('davidlarrimore/demo'), (good, None))  # an empty dev is a status
         for code, out, err, why in cases:
             with mock.patch.object(magehand, 'gh_probe', lambda *a, r=(code, out, err): r):
                 data, reason = magehand.platform_status('davidlarrimore/demo')
