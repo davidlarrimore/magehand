@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -5312,20 +5313,69 @@ class Jobs(unittest.TestCase):
         self.add()
         refused = 'The connection to the server localhost:8080 was refused - did you specify the right host or port?'
         for why, said in ((refused, 'kubectl has no cluster context'), ('kubectl is not installed', 'kubectl is not installed')):
-            with mock.patch.object(magehand, 'kubectl_json', lambda *a, why=why: (None, why)):
+            with mock.patch.object(magehand, 'kubectl_json', lambda *a, why=why: (None, why)), \
+                    mock.patch.object(magehand, 'origin_repo', lambda root: 'davidlarrimore/demo'), \
+                    mock.patch.object(magehand, 'platform_status', lambda repo: (None, 'not published yet')):
                 code, out, _ = self.run_main('job', 'ls')
                 data = json.loads(self.run_main('job', 'ls', '--json')[1])
             self.assertEqual(code, 0)
-            self.assertIn(f'dev: not checked (no cluster access configured on this machine ({said}))', out)
+            self.assertIn(f'dev: not checked (no cluster access configured on this machine ({said}); not published yet)', out)
             self.assertNotIn('localhost:8080', out)
             self.assertIn('ask OpenClaw on Telegram', out.splitlines()[-1])
-            self.assertEqual(data['cluster'], f'no cluster access configured on this machine ({said})')
+            self.assertEqual(data['cluster'], f'no cluster access configured on this machine ({said}); not published yet')
             self.assertIn('ask OpenClaw on Telegram', data['next'])
         # any other kubectl failure is shown as kubectl said it
         with mock.patch.object(magehand, 'kubectl_json', lambda *a: (None, 'Forbidden: cronjobs is forbidden')):
             out = self.run_main('job', 'ls')[1]
         self.assertIn('dev: not checked (Forbidden: cronjobs is forbidden)', out)
         self.assertEqual(out.splitlines()[-1], 'next: nothing')
+
+    def published(self, as_of):
+        """An app repo's Platform status issue as homelab publish-status writes it."""
+        items = [{'kind': 'CronJob', 'metadata': {'name': 'collect'}, 'spec': {'schedule': '15 6 * * *'},
+                  'status': {'lastScheduleTime': '2026-10-28T06:15:00Z', 'lastSuccessfulTime': '2026-10-27T06:15:20Z',
+                             'active': []}},
+                 {'kind': 'Job', 'metadata': {'name': 'collect-9', 'ownerReferences': [{'kind': 'CronJob', 'name': 'collect'}]},
+                  'status': {'startTime': '2026-10-28T06:15:00Z', 'failed': 2, 'conditions': [
+                      {'type': 'Failed', 'status': 'True', 'lastTransitionTime': '2026-10-28T06:16:00Z'}]}}]
+        data = json.dumps({'schema': 1, 'app': 'demo', 'as_of': as_of, 'envs': {'dev': items}})
+        return [{'number': 4, 'title': 'Something else', 'body': ''},
+                {'number': 5, 'title': 'Platform status', 'body': f'summary\n<!-- homelab-platform-status\n{data}\n-->\n'}]
+
+    def test_ls_without_cluster_access_reads_the_platform_s_published_status(self):
+        self.add()
+        now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        for as_of, stale in ((now, False), ('2026-01-01T00:00:00Z', True)):
+            calls = []
+
+            def gh(*args, as_of=as_of):
+                calls.append(args)
+                return 0, json.dumps(self.published(as_of)), ''
+            with mock.patch.object(magehand, 'kubectl_json', lambda *a: (None, 'kubectl has no context')), \
+                    mock.patch.object(magehand, 'origin_repo', lambda root: 'davidlarrimore/demo'), \
+                    mock.patch.object(magehand, 'gh_probe', gh):
+                code, out, _ = self.run_main('job', 'ls')
+                data = json.loads(self.run_main('job', 'ls', '--json')[1])
+            self.assertEqual(code, 0)
+            self.assertEqual(calls[0], ('api', f'repos/davidlarrimore/demo/issues?state=all&creator={magehand.BOT}&per_page=100'))
+            self.assertIn(f'dev as the platform published it at {as_of[11:16]}Z', out)
+            self.assertEqual('OVER 2 HOURS OLD' in out, stale)
+            self.assertIn('✗ collect-9 2026-10-28 06:15Z, 60s', out)
+            self.assertNotIn('kubectl -n demo-dev logs', out)  # no cluster here: logs come from OpenClaw
+            self.assertEqual((data['source'], data['as_of'], data['stale']), ('platform', as_of, stale))
+            self.assertEqual(data['jobs'][0]['dev']['runs'][0]['state'], 'failed')
+            self.assertIn('ask OpenClaw on Telegram for its logs', data['next'])
+
+    def test_platform_status_says_why_it_has_none(self):
+        cases = ((1, '', 'HTTP 404', "cannot read davidlarrimore/demo's issues (HTTP 404)"),
+                 (0, '[]', '', "the platform has not published davidlarrimore/demo's status yet"),
+                 (0, json.dumps([{'number': 5, 'title': 'Platform status', 'body': 'edited by hand'}]), '',
+                  'davidlarrimore/demo#5 is not a status this magehand reads'))
+        for code, out, err, why in cases:
+            with mock.patch.object(magehand, 'gh_probe', lambda *a, r=(code, out, err): r):
+                data, reason = magehand.platform_status('davidlarrimore/demo')
+            self.assertIsNone(data)
+            self.assertIn(why, reason)
 
     def test_cluster_access_reads_only_kubectl_s_config(self):
         runs = []
