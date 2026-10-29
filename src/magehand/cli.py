@@ -3407,15 +3407,15 @@ def env_findings(app, container, deployment_file, catalog):
     return found
 
 
-# What the platform lets an app deploy (homelab-apps .github/check-kinds.py; Argo CD's agent-app-bundles project
-# and Kyverno enforce it in the cluster): namespace, quota, limits and network policy come from the platform.
+# What the platform lets an app deploy (the only copy of this list: app CI runs `check --strict`; Argo CD's
+# agent-app-bundles project and Kyverno enforce it in the cluster): namespace, quota, limits and network policy come from the platform.
 ALLOWED_KINDS = {
     ('', 'ConfigMap'), ('', 'Secret'), ('', 'Service'), ('', 'ServiceAccount'), ('', 'PersistentVolumeClaim'),
     ('apps', 'Deployment'), ('apps', 'StatefulSet'), ('batch', 'Job'), ('batch', 'CronJob'),
     ('networking.k8s.io', 'Ingress'), ('policy', 'PodDisruptionBudget'), ('autoscaling', 'HorizontalPodAutoscaler'),
     ('external-secrets.io', 'ExternalSecret'),
 }
-# Ingress middlewares (homelab-apps .github/check-ingress.py; Kyverno enforces the same).
+# Ingress middlewares (Kyverno enforces the same in the cluster).
 LAB_AUTH = 'authentik-forward-auth@kubernetescrd'
 STRIP_AUTH = 'kube-system-strip-authentik-headers@kubernetescrd'
 PUBLIC_AUTH = 'authentik-public-forward-auth@kubernetescrd'
@@ -3705,7 +3705,7 @@ def line_of(text, index):
 COMMENT_LINE = re.compile(r'^\s*(#|//|/?\*|--)')
 
 
-# A dependency install must come from a lockfile (homelab-apps .github/check-dependencies.py): a floating one
+# A dependency install must come from a lockfile (app CI's only copy of this rule): a floating one
 # can pull a different, possibly malicious, version on every build. (match, what it must also contain, advice)
 LOCKED_INSTALLS = [
     (re.compile(r'\b(?:python\d*(?:\.\d+)?\s+-m\s+)?pip3?\s+install\b'), re.compile(r'--require-hashes\b'),
@@ -4089,7 +4089,7 @@ def check_merged_branch(root):
 # --- check --ui: CI's browser check, here ---------------------------------------------
 
 UI_SCRIPT = '.github/ui-check/ui_check.py'
-BUILD_WORKFLOW = '.github/workflows/build-app.yaml'
+APPS_BUILD_WORKFLOW = '.github/workflows/build-app.yaml'  # homelab-apps' shared build (its pins)
 UI_PINS = ('PLAYWRIGHT_VERSION', 'AXE_VERSION', 'AXE_SHA256', 'POSTGRES_IMAGE')
 UI_POSTGRES_URL = 'postgresql://ui:ui@ui-postgres:5432/ui'  # the throwaway database, named as CI names it
 UI_CACHE_VOLUME = 'magehand-ui-check-cache'  # pip's wheels and axe-core between runs (a volume: no host file owners)
@@ -4132,7 +4132,7 @@ sys.exit(subprocess.run([sys.executable, '/check/ui_check.py', '--app-dir', '/ap
 
 def ui_pins():
     """The "Browser check" step's pins in homelab-apps build-app.yaml (and its PyYAML), so this run is CI's."""
-    flow = yaml.safe_load(github_file(APPS_REPO, BUILD_WORKFLOW)) or {}
+    flow = yaml.safe_load(github_file(APPS_REPO, APPS_BUILD_WORKFLOW)) or {}
     for job in (flow.get('jobs') or {}).values():
         for step in (job or {}).get('steps') or []:
             if step.get('name') != 'Browser check':
@@ -4142,7 +4142,7 @@ def ui_pins():
             pins['PYYAML_VERSION'] = m.group(1) if m else ''
             if all(re.fullmatch(r'[\w.:@/-]+', v) for v in pins.values()):
                 return pins
-    die(f'{APPS_REPO} {BUILD_WORKFLOW} has no "Browser check" step with its pins; tell the owner')
+    die(f'{APPS_REPO} {APPS_BUILD_WORKFLOW} has no "Browser check" step with its pins; tell the owner')
 
 
 def ui_env(cfg):
