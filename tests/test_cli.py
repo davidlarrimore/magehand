@@ -5393,7 +5393,19 @@ class Jobs(unittest.TestCase):
         good = {'schema': 1, 'as_of': '2026-10-28T06:20:00Z', 'envs': {'dev': []}}
         for broken in ({'schema': 1}, {**good, 'as_of': None}, {**good, 'as_of': 'yesterday'}, {**good, 'envs': []},
                        {**good, 'envs': {}}, {**good, 'envs': {'dev': 'x'}}, {**good, 'envs': {'dev': ['x']}},
-                       {**good, 'envs': {'dev': [], 'prod': None}}):
+                       {**good, 'envs': {'dev': [], 'prod': None}},
+                       # items that are objects but not what job_rows and job_runs read
+                       {**good, 'envs': {'dev': [{'kind': 'CronJob', 'metadata': 'broken'}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'CronJob', 'metadata': {}}]}},
+                       {**good, 'envs': {'dev': [{'metadata': {'name': 'collect'}}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'CronJob', 'metadata': {'name': 'c'}, 'spec': []}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'CronJob', 'metadata': {'name': 'c'}, 'spec': {'schedule': 5}}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'CronJob', 'metadata': {'name': 'c'}, 'status': {'active': 1}}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'Job', 'metadata': {'name': 'c-1', 'ownerReferences': ['x']}}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'Job', 'metadata': {'name': 'c-1'}, 'status': {'conditions': {}}}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'Job', 'metadata': {'name': 'c-1'},
+                                                  'status': {'conditions': [{'type': 'Failed', 'lastTransitionTime': 0}]}}]}},
+                       {**good, 'envs': {'dev': [{'kind': 'Job', 'metadata': {'name': 'c-1'}, 'status': {'startTime': 1}}]}}):
             body = f'<!-- homelab-platform-status\n{json.dumps(broken)}\n-->'
             cases += ((0, json.dumps([{'number': 5, 'title': 'Platform status', 'body': body}]), '',
                        'davidlarrimore/demo#5 is not a status this magehand reads'),)

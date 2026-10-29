@@ -1068,6 +1068,23 @@ RUNS_ELSEWHERE = ("for dev's job runs, ask OpenClaw on Telegram (it reads dev), 
 PLATFORM_STATUS_TITLE = 'Platform status'
 PLATFORM_STATUS_MARK = 'homelab-platform-status'
 PLATFORM_STATUS_STALE = 2 * 3600  # it is rewritten at least hourly: older than this, the publisher has stopped
+# What job ls reads of each published item (job_rows, job_runs) and the type each must have when present.
+PLATFORM_STATUS_ITEM = {
+    'kind': str, 'metadata': {'name': str, 'ownerReferences': [{'kind': str, 'name': str}]},
+    'spec': {'schedule': str, 'timeZone': str, 'suspend': bool},
+    'status': {'lastScheduleTime': str, 'lastSuccessfulTime': str, 'active': list, 'startTime': str,
+               'completionTime': str, 'succeeded': int,
+               'conditions': [{'type': str, 'status': str, 'lastTransitionTime': str}]}}
+
+
+def shaped(value, shape):
+    """True when `value` fits `shape`: a type, a dict of key: shape (an absent or null key fits), or a
+    one-item list [shape] for a list of those."""
+    if isinstance(shape, dict):
+        return isinstance(value, dict) and all(value.get(k) is None or shaped(value[k], s) for k, s in shape.items())
+    if isinstance(shape, list):
+        return isinstance(value, list) and all(shaped(v, shape[0]) for v in value)
+    return isinstance(value, shape)
 
 
 def platform_status(repo):
@@ -1090,11 +1107,13 @@ def platform_status(repo):
     unreadable = f'{repo}#{issue.get("number")} is not a status this magehand reads (`magehand upgrade`?)'
     if not isinstance(data, dict) or data.get('schema') != 1:
         return None, unreadable
-    # Schema 1 as publish-status writes it: a timestamp, and dev's items as a list of objects (an empty list is
-    # a dev with no jobs; a missing one is no status at all, never an empty dev).
+    # Schema 1 as publish-status writes it: a timestamp, and dev's items, each named and shaped as job ls reads
+    # them (an empty list is a dev with no jobs; a missing one is no status at all, never an empty dev).
     envs = data.get('envs')
     if seconds_between(data.get('as_of'), data.get('as_of')) is None or not isinstance(envs, dict) or 'dev' not in envs \
-            or not all(isinstance(items, list) and all(isinstance(i, dict) for i in items) for items in envs.values()):
+            or not all(shaped(items, [PLATFORM_STATUS_ITEM]) and all(
+                isinstance(i.get('kind'), str) and isinstance((i.get('metadata') or {}).get('name'), str)
+                for i in items) for items in envs.values()):
         return None, unreadable
     return data, None
 
