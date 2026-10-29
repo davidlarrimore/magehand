@@ -3736,6 +3736,23 @@ class CommandLine(unittest.TestCase):
             magehand.cmd_version = saved
 
 
+
+    def test_post_deploy_status_exit_json_and_next(self):
+        for state, code in [('ok', 0), ('unknown', 0), ('failed', 1), ('error', 1), ('pending', 0)]:
+            report = {'app': 'demo', 'repo': 'example/demo', 'commit': 'a' * 40, 'subject': 'test',
+                      'stages': [{'stage': stage, 'state': 'ok', 'text': 'done'}
+                                 for stage in ('build', 'deploy', 'dev')] +
+                                [{'stage': 'post-deploy', 'state': state, 'text': 'endpoint result'}]}
+            with mock.patch.object(magehand, 'status_target', return_value=('demo', 'example/demo')), \
+                    mock.patch.object(magehand, 'lifecycle_stages', return_value=[]), \
+                    mock.patch.object(magehand, 'collect_status', return_value=report):
+                actual, out, err = self.run_main('status', 'demo', '--json', '--no-cluster')
+            self.assertEqual(actual, code)
+            result = json.loads(out)
+            self.assertIn('next', result)
+            self.assertEqual(result['ok'], state in ('ok', 'unknown'))
+
+
 class ArgoAccess(unittest.TestCase):
     """status says when Argo cannot read the app's repo."""
 
@@ -5759,3 +5776,68 @@ class ModuleConstants(unittest.TestCase):
     def test_app_builds_are_read_from_the_template_s_workflow(self):
         self.assertEqual(magehand.BUILD_WORKFLOW, APP_BUILD)
 
+
+class PostDeployChecks(unittest.TestCase):
+    def test_schema_accepts_platform_forms_and_boundaries(self):
+        for method, extra in [('GET', {}), ('HEAD', {}), ('GET', {'body_contains': 'ok'}),
+                              ('GET', {'json_key': 'ok'})]:
+            checks = [{'method': method, 'path': '/health?ready=1', 'status': 200, **extra}]
+            self.assertEqual(magehand.parse_post_checks(magehand.yaml.safe_dump(
+                {'version': 1, 'checks': checks})), checks)
+
+    def test_schema_rejects_unsafe_and_malformed_documents(self):
+        base = {'method': 'GET', 'path': '/', 'status': 200}
+        invalid = [dict(base, **patch) for patch in (
+            {'method': 'POST'}, {'path': 'https://example.com/'}, {'path': '//example.com'},
+            {'path': '/%2e%2e/a'}, {'path': '/%252e%252e/a'}, {'path': '/a%2fb'}, {'path': '/a/./b'}, {'path': '/a#b'}, {'path': '/a b'},
+            {'path': '/a\\b'}, {'path': '/' + 'a' * 2048}, {'status': True}, {'status': 600},
+            {'status': '200'}, {'headers': {}}, {'code': 'print(1)'}, {'body_contains': ''},
+            {'json_key': 'a' * 1025}, {'json_key': 'ok', 'body_contains': 'ok'},
+            {'method': 'HEAD', 'json_key': 'ok'})]
+        docs = [{'version': 1, 'checks': [c]} for c in invalid]
+        docs += [{'version': True, 'checks': [base]}, {'version': 2, 'checks': [base]},
+                 {'version': 1, 'checks': []}, {'version': 1, 'checks': [base.copy() for _ in range(21)]},
+                 {'version': 1, 'checks': [base], 'url': 'https://example.com'}]
+        texts = [magehand.yaml.safe_dump(d) for d in docs]
+        texts += ['version: 1\nversion: 1\nchecks: []', 'version: 1\nchecks: &x [*x]',
+                  '[]', 'checks: [', '1: value', 'x' * 32769, '!!python/object:bad {}']
+        for text in texts:
+            with self.subTest(text=text[:120]), self.assertRaises(ValueError):
+                magehand.parse_post_checks(text)
+
+    def test_optional_file_findings_and_scaffold_preservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            self.assertEqual(magehand.check_post_checks(root), [])
+            path = root / 'deploy/checks.yaml'
+            path.parent.mkdir()
+            original = 'version: 1\nchecks:\n  - {method: GET, path: /, status: 200}\n'
+            path.write_text(original)
+            self.assertEqual(magehand.check_post_checks(root), [])
+            self.assertFalse(any(f['where'] == 'deploy/checks.yaml'
+                                 for f in magehand.check_deploy_files(root, 'demo')))
+            magehand.scaffold(root, 'demo', 'demo')
+            self.assertEqual(path.read_text(), original)
+            path.write_bytes(b'\xff')
+            self.assertEqual(magehand.check_post_checks(root)[0]['level'], 'error')
+            path.write_text('version: 2')
+            finding = magehand.check_deploy_files(root, 'demo')[0]
+            self.assertEqual(finding['where'], 'deploy/checks.yaml')
+            self.assertIn('Post-deploy checks', finding['see'])
+
+    def test_commit_context_states_and_latest_result(self):
+        for status, expected in [('success', 'ok'), ('failure', 'failed'), ('error', 'failed'),
+                                 ('pending', 'pending')]:
+            result = {'statuses': [{'id': 1, 'context': 'other', 'state': 'success'},
+                                   {'id': 2, 'context': 'homelab/post-deploy', 'state': status,
+                                    'description': 'endpoint result', 'target_url': 'https://example.com/check'}]}
+            with mock.patch.object(magehand, 'gh_query', return_value=(result, None)) as query:
+                stage = magehand.post_deploy_stage('example/demo', 'a' * 40, 'demo')
+            query.assert_called_once_with('api', 'repos/example/demo/commits/' + 'a' * 40 + '/status')
+            self.assertEqual(stage['state'], expected)
+            self.assertIn('endpoint result', stage['text'])
+            self.assertEqual(stage['commit'], 'a' * 40)
+        with mock.patch.object(magehand, 'gh_query', return_value=({'statuses': []}, None)):
+            self.assertEqual(magehand.post_deploy_stage('example/demo', 'abc', 'demo')['state'], 'unknown')
+        with mock.patch.object(magehand, 'gh_query', return_value=(None, 'access denied')):
+            self.assertEqual(magehand.post_deploy_stage('example/demo', 'abc', 'demo')['state'], 'error')
