@@ -23,6 +23,8 @@ from unittest import mock
 
 from magehand import cli as magehand
 
+APP_BUILD = '.github/workflows/build.yaml'  # the template's Build workflow, as GitHub reports its runs
+
 os.environ['MAGEHAND_NO_UPDATE_CHECK'] = '1'  # tests never ask GitHub for the latest version
 
 APP = {
@@ -3995,7 +3997,7 @@ class Release(unittest.TestCase):
                 {'name': 'security / scan', 'status': 'completed', 'conclusion': 'success'},
                 {'name': 'image', 'status': 'completed', 'conclusion': 'skipped'}]},
             app + f'actions/runs?head_sha={head}&per_page=100': {'workflow_runs': [
-                {'path': magehand.BUILD_WORKFLOW, 'event': 'push', 'status': 'completed', 'conclusion': 'success'}]},
+                {'path': APP_BUILD, 'event': 'push', 'status': 'completed', 'conclusion': 'success'}]},
         }
         data.update(overrides)
 
@@ -4085,7 +4087,7 @@ class Release(unittest.TestCase):
         checks = self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1'
         self.assertTrue(any('no checks ran' in p for p in self.plan(**{checks: {'total_count': 0, 'check_runs': []}})['problems']))
         self.assertTrue(any('did not run' in p for p in self.plan(**{runs: {'workflow_runs': []}})['problems']))
-        failed = {'workflow_runs': [{'path': magehand.BUILD_WORKFLOW, 'event': 'push', 'status': 'completed',
+        failed = {'workflow_runs': [{'path': APP_BUILD, 'event': 'push', 'status': 'completed',
                                      'conclusion': 'failure'}]}
         self.assertTrue(any('has not passed' in p for p in self.plan(**{runs: failed})['problems']))
         # skipped jobs (the image build is skipped on a push) are fine when the scan itself passed
@@ -4384,7 +4386,7 @@ class Status(unittest.TestCase):
                 'title': title, 'body': body, 'statusCheckRollup': [{'name': n, 'conclusion': c} for n, c in checks]}
 
     def build_run(self, event='pull_request', status='completed', conclusion='success', created='2026-10-11T02:29:36Z',
-            path=magehand.BUILD_WORKFLOW):
+            path=APP_BUILD):
         return {'path': path, 'event': event, 'status': status, 'conclusion': conclusion, 'created_at': created,
                 'run_started_at': created, 'updated_at': '2026-10-11T02:30:53Z', 'html_url': 'https://example.com/r'}
 
@@ -5431,7 +5433,7 @@ class CheckUI(unittest.TestCase):
         (self.root / 'ui-check.yaml').write_text('port: 8080\nenv:\n  DATABASE_URL: ${POSTGRES_URL}\n  MODE: ui\n'
                                                  'pages:\n  - path: /\n')
         self.calls, self.runs, self.result = [], [], 0
-        files = {magehand.BUILD_WORKFLOW: BUILD_APP, magehand.UI_SCRIPT: 'print("ui check")\n'}
+        files = {magehand.APPS_BUILD_WORKFLOW: BUILD_APP, magehand.UI_SCRIPT: 'print("ui check")\n'}
         for patch in (mock.patch.object(magehand, 'CACHE', pathlib.Path(tmp.name) / 'cache'),
                       mock.patch.object(magehand, 'runtime', lambda: 'docker'),
                       mock.patch.object(magehand.shutil, 'which', lambda cli: '/usr/bin/' + cli),
@@ -5608,3 +5610,22 @@ def yaml_load(text):
 
 
 ManagedCopy.run_main = CommandLine.run_main
+
+
+class ModuleConstants(unittest.TestCase):
+    def test_no_module_level_name_is_assigned_twice(self):
+        # check --ui's BUILD_WORKFLOW (homelab-apps' build-app.yaml) once replaced the app repo's, and release and
+        # status then looked for runs no app repo has (0.40.0-0.42.1)
+        import ast
+        tree = ast.parse(pathlib.Path(magehand.__file__).read_text())
+        seen = {}
+        for node in tree.body:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    self.assertFalse(target.id in seen, f'{target.id} assigned at lines {seen.get(target.id)} and {node.lineno}')
+                    seen[target.id] = node.lineno
+
+    def test_app_builds_are_read_from_the_template_s_workflow(self):
+        self.assertEqual(magehand.BUILD_WORKFLOW, APP_BUILD)
+
