@@ -3897,6 +3897,29 @@ class PinnedLayout(unittest.TestCase):
             magehand.main()
         self.assertIsNone(json.loads(out.getvalue())['next'])
 
+    def test_an_app_repo_build_of_a_pinned_app_still_checks_the_code(self):
+        # the shortcut above is for homelab-apps' --manifests-only run; an app repo's build passes --code and
+        # --apps-dir, and its Dockerfile must still be checked (it is CI's only Dockerfile check)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'Dockerfile').write_text('FROM alpine\nRUN pip install flask\nUSER root\n')
+            (root / 'ui-check.yaml').write_text('pages:\n  - path: /\n')
+            argv = ['check', 'elvis', '--code', tmp, '--apps-dir', '/nonexistent', '--strict', '--json']
+            for origin, missing in ((None, False), ('elvis', True)):
+                with mock.patch.object(magehand, 'try_load_app', side_effect=magehand.PinnedApp('elvis', self.PIN)), \
+                        mock.patch.object(magehand, 'remote_repo', lambda root, origin=origin: origin), \
+                        mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                        mock.patch.object(magehand, 'check_agents_drift', lambda root: []), \
+                        mock.patch.object(magehand, 'check_merged_branch', lambda root: []):
+                    code, out, _ = CommandLine.run_main(self, *argv)
+                report = json.loads(out)
+                errors = [f['text'] for f in report['findings'] if f['level'] == 'error']
+                self.assertEqual(code, 1)
+                self.assertTrue(any("base image 'alpine' must be pinned by digest" in e for e in errors), errors)
+                self.assertTrue(any('pip install needs --require-hashes' in e for e in errors), errors)
+                self.assertTrue(any('non-root uid' in e for e in errors), errors)
+                self.assertEqual(any("is deployed from this repo's deploy/" in e for e in errors), missing, errors)
+
 
 class Release(unittest.TestCase):
     """`release` picks the next semver version from what merged, and refuses what would not deploy."""
