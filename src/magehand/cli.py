@@ -3518,6 +3518,18 @@ def tool_missing(tool, what):
     return f'{DEPLOY}: {what} not checked ({tool} is not installed: {TOOL_INSTALL[tool]}); CI checks them'
 
 
+def run_tool(argv, timeout, **kwargs):
+    """(result, None) from running a check's tool, or (None, why) when it couldn't start or didn't finish: the
+    caller reports that as a skipped check (an error with --strict), never a crash that loses the other findings."""
+    tool = pathlib.Path(argv[0]).name
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs), None  # nosec B603
+    except subprocess.TimeoutExpired:
+        return None, f'{tool} did not finish within {timeout}s'
+    except OSError as error:
+        return None, f'{tool} could not run: {error.strerror or error}'
+
+
 def check_admission(name, rendered):
     """The cluster's admission policies (Kyverno) on each rendered overlay, as homelab-apps CI runs them: the
     render made to look as Argo CD applies it (the app's own image pinned by a digest, and the Application's
@@ -3528,7 +3540,7 @@ def check_admission(name, rendered):
     names = [n for n in github_dir(APPS_REPO, POLICY_DIR) if n.endswith(('.yaml', '.yml'))]
     if not names:
         return [], [f'{DEPLOY}: admission policies not checked (cannot read {APPS_REPO} {POLICY_DIR}); CI checks them']
-    found, see = [], 'homelab-apps AGENTS.md "Every workload must"'
+    found, skipped, see = [], [], 'homelab-apps AGENTS.md "Every workload must"'
     with tempfile.TemporaryDirectory() as tmp:
         policies = pathlib.Path(tmp) / 'policies'
         policies.mkdir()
@@ -3543,15 +3555,19 @@ def check_admission(name, rendered):
                 'resources': ['app.yaml'],
                 'images': [{'name': f'ghcr.io/davidlarrimore/homelab-apps/{name}', 'digest': POLICY_DIGEST}],
                 'commonAnnotations': {'argocd.argoproj.io/tracking-id': f'{name}-{env}:policy-check'}}))
-            applied = subprocess.run(['kubectl', 'kustomize', str(kdir)], capture_output=True, text=True,  # nosec B603 B607
-                                     timeout=60)
+            applied, why = run_tool(['kubectl', 'kustomize', str(kdir)], 60)
+            if why:
+                skipped.append(f'{where}: admission policies not checked ({why}); CI checks them')
+                continue
             if applied.returncode:
                 found.append(finding('error', where, 'cannot prepare it for the admission policies: '
                                      + (applied.stderr.strip().splitlines() or ['kubectl kustomize failed'])[-1], see))
                 continue
             (kdir / 'applied.yaml').write_text(applied.stdout)
-            out = subprocess.run([kyverno, 'apply', str(policies), '--resource', str(kdir / 'applied.yaml')],  # nosec B603
-                                 capture_output=True, text=True, timeout=120)
+            out, why = run_tool([kyverno, 'apply', str(policies), '--resource', str(kdir / 'applied.yaml')], 120)
+            if why:
+                skipped.append(f'{where}: admission policies not checked ({why}); CI checks them')
+                continue
             text = out.stdout + out.stderr
             m = re.search(r'pass: (\d+), fail: (\d+), warn: \d+, error: (\d+)', text)
             if not m:
@@ -3560,7 +3576,7 @@ def check_admission(name, rendered):
             elif int(m.group(2)) or int(m.group(3)):
                 found += [finding('error', where, f'the cluster would refuse it: {refusal}', see)
                           for refusal in policy_refusals(text)]
-    return found, []
+    return found, skipped
 
 
 def policy_refusals(text):
@@ -3592,9 +3608,11 @@ def check_schemas(rendered):
     found, skipped, see = [], [], 'README "How an app is put together"'
     for overlay, docs in rendered:
         where = f'{DEPLOY}/{overlay}'
-        out = subprocess.run([kubeconform, '-strict', '-summary', '-schema-location', 'default',  # nosec B603
-                              '-schema-location', CRD_SCHEMAS], input=yaml.safe_dump_all(docs, sort_keys=False),
-                             capture_output=True, text=True, timeout=120)
+        out, why = run_tool([kubeconform, '-strict', '-summary', '-schema-location', 'default', '-schema-location',
+                             CRD_SCHEMAS], 120, input=yaml.safe_dump_all(docs, sort_keys=False))
+        if why:
+            skipped.append(f'{where}: schemas not checked ({why}); CI checks them')
+            continue
         if out.returncode == 0:
             continue
         lines = [line.strip() for line in (out.stdout + out.stderr).splitlines()

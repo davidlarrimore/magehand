@@ -1695,6 +1695,53 @@ class DeployDir(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertIn('schemas not checked (cannot download them here)', skipped[0])
 
+    def test_a_tool_that_hangs_or_cannot_start_is_a_skip_not_a_crash(self):
+        def run(argv, **kw):
+            if argv[:2] == ['kubectl', 'kustomize']:
+                return subprocess.CompletedProcess(argv, 0, 'kind: Deployment\n', '')
+            if argv[0].endswith('kyverno'):
+                raise subprocess.TimeoutExpired(argv, kw['timeout'])
+            raise PermissionError(13, 'Permission denied')
+        with mock.patch.object(magehand.subprocess, 'run', run), \
+                mock.patch.object(magehand.shutil, 'which', lambda t: f'/usr/local/bin/{t}'), \
+                mock.patch.object(magehand, 'github_dir', lambda *a, **k: ['pods.yaml']), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: 'kind: ClusterPolicy\n'):
+            rendered = [('dev', [self.DEV_DEPLOYMENT])]
+            admission, schemas = magehand.check_admission('demo', rendered), magehand.check_schemas(rendered)
+        self.assertEqual(admission, ([], ['deploy/dev: admission policies not checked (kyverno did not finish within '
+                                          '120s); CI checks them']))
+        self.assertEqual(schemas, ([], ['deploy/dev: schemas not checked (kubeconform could not run: Permission '
+                                        'denied); CI checks them']))
+        # kubectl itself hanging while it pins the image: the same
+        def hang(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw['timeout'])
+        with mock.patch.object(magehand.subprocess, 'run', hang), \
+                mock.patch.object(magehand.shutil, 'which', lambda t: f'/usr/local/bin/{t}'), \
+                mock.patch.object(magehand, 'github_dir', lambda *a, **k: ['pods.yaml']), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: 'kind: ClusterPolicy\n'):
+            self.assertIn('kubectl did not finish within 60s', magehand.check_admission('demo', rendered)[1][0])
+
+    def test_a_hung_tool_keeps_the_json_report_and_fails_it_only_with_strict(self):
+        def run(argv, **kw):
+            if argv[0].endswith(('kyverno', 'kubeconform')):
+                raise subprocess.TimeoutExpired(argv, kw['timeout'])
+            out = 'kind: Deployment\n' if argv[:2] == ['kubectl', 'kustomize'] else ''
+            return subprocess.CompletedProcess(argv, 0 if out else 1, out, '')  # git: not a checkout
+        with tempfile.TemporaryDirectory() as tmp:
+            root = deploy_repo(tmp)
+            argv = ['check', 'demo', '--code', str(root), '--manifests-only', '--json']
+            with mock.patch.object(magehand, 'render_overlay', lambda local, overlay: ([self.DEV_DEPLOYMENT], None)), \
+                    mock.patch.object(magehand.subprocess, 'run', run), \
+                    mock.patch.object(magehand.shutil, 'which', lambda t: f'/usr/local/bin/{t}'), \
+                    mock.patch.object(magehand, 'github_dir', lambda *a, **k: ['pods.yaml']), \
+                    mock.patch.object(magehand, 'github_file', lambda *a, **k: 'kind: ClusterPolicy\n'):
+                code, out, _ = CommandLine.run_main(self, *argv)
+                strict_code, strict_out, _ = CommandLine.run_main(self, *argv, '--strict')
+        report, strict = json.loads(out), json.loads(strict_out)
+        self.assertEqual((code, report['errors'], len(report['skipped'])), (0, 0, 2))
+        self.assertIn('did not finish within 120s', report['skipped'][0])
+        self.assertEqual((strict_code, strict['errors'], strict['skipped']), (1, 2, []))
+
     def test_strict_makes_every_skip_an_error_and_ci_only_the_render(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = deploy_repo(tmp)
