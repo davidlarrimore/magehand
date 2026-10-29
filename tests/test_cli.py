@@ -1603,11 +1603,11 @@ class DeployDir(unittest.TestCase):
         self.assertEqual(ci['skipped'], [])
         self.assertIn(('error', 'deploy/dev'), [(f['level'], f['where']) for f in ci['findings']])
 
-    KYVERNO_FAIL = ('Applying 4 policy rule(s) to 2 resource(s)...\n\n'
-                    'policy require-non-root -> resource demo-dev/Deployment/demo failed:\n'
-                    '1. autogen-run-as-non-root: validation error: Running as root is not allowed. rule '
-                    'autogen-run-as-non-root failed at path /spec/template/spec/securityContext/runAsNonRoot/\n\n'
-                    'pass: 7, fail: 1, warn: 0, error: 0, skip: 2\n')
+    # kyverno 1.19's output for a Deployment that allows privilege escalation (a real run)
+    KYVERNO_FAIL = ('\nApplying 11 policy rule(s) to 3 resource(s)...\n'
+                    'policy apps-pod-security -> resource demo-dev/Deployment/demo failed:\n'
+                    '1 -  Every container must set securityContext.allowPrivilegeEscalation to false.\n\n'
+                    'pass: 7, fail: 1, warn: 0, error: 0, skip: 4 \n')
 
     def cluster_rules(self, kyverno='', kubeconform='', tools=('kyverno', 'kubeconform'), policies=('pods.yaml',),
                       kustomize=0):
@@ -1650,8 +1650,13 @@ class DeployDir(unittest.TestCase):
         (found, skipped), _, _ = self.cluster_rules(kyverno=self.KYVERNO_FAIL)
         self.assertEqual(skipped, [])
         self.assertEqual([(f['level'], f['where']) for f in found], [('error', 'deploy/dev')])
-        self.assertIn('the cluster would refuse it: require-non-root on demo: autogen-run-as-non-root: validation '
-                      'error: Running as root is not allowed', found[0]['text'])
+        self.assertEqual(found[0]['text'], 'the cluster would refuse it: apps-pod-security on demo: Every container '
+                                           'must set securityContext.allowPrivilegeEscalation to false.')
+        # before 1.19: "1. rule: why"; two refusals are two findings
+        older = ('policy a -> resource demo-dev/Deployment/demo failed:\n1. rule-a: no root\n\n'
+                 'policy b -> resource demo-dev/Service/web failed:\n1. rule-b: ClusterIP only\n2. rule-c: x\n')
+        self.assertEqual(magehand.policy_refusals(older), ['a on demo: rule-a: no root',
+                                                           'b on web: rule-b: ClusterIP only; rule-c: x'])
         self.assertIn('"Every workload must"', found[0]['see'])
 
     def test_kyverno_output_without_a_summary_is_an_error(self):

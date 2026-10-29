@@ -3564,8 +3564,8 @@ def check_admission(name, rendered):
 
 
 def policy_refusals(text):
-    """Each refusal in `kyverno apply`'s output ("policy P -> resource R failed:" and its numbered reasons),
-    one string each; the output's own lines when it has none in that shape."""
+    """Each refusal in `kyverno apply`'s output ("policy P -> resource R failed:" and its numbered reasons,
+    "1 -  why" in 1.19, "1. rule: why" before), one string each; the output's own lines when it has none."""
     refusals, current = [], None
     for line in text.splitlines():
         line = line.strip()
@@ -3573,8 +3573,8 @@ def policy_refusals(text):
         if head:
             current = [f'{head.group(1)} on {head.group(2).strip("/").rsplit("/", 1)[-1]}']
             refusals.append(current)
-        elif current is not None and re.match(r'\d+\. ', line):
-            current.append(re.sub(r'^\d+\.\s*', '', line))
+        elif current is not None and re.match(r'\d+(?:\.|\s+-)\s', line):
+            current.append(re.sub(r'^\d+(?:\.|\s+-)\s+', '', line))
         elif not line:
             current = None
     if refusals:
