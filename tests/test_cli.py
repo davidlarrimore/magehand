@@ -5306,6 +5306,45 @@ class Jobs(unittest.TestCase):
             self.assertEqual(out.splitlines()[-1], 'next: nothing')
             self.assertIsNone(json.loads(self.run_main('job', 'ls', '--no-cluster', '--json')[1])['next'])
 
+    def test_ls_without_cluster_access_says_so_and_where_the_runs_are(self):
+        # a laptop with kubectl but no kubeconfig: kubectl's own words were "connection to the server
+        # localhost:8080 was refused", which read like a broken cluster
+        self.add()
+        refused = 'The connection to the server localhost:8080 was refused - did you specify the right host or port?'
+        for why, said in ((refused, 'kubectl has no cluster context'), ('kubectl is not installed', 'kubectl is not installed')):
+            with mock.patch.object(magehand, 'kubectl_json', lambda *a, why=why: (None, why)):
+                code, out, _ = self.run_main('job', 'ls')
+                data = json.loads(self.run_main('job', 'ls', '--json')[1])
+            self.assertEqual(code, 0)
+            self.assertIn(f'dev: not checked (no cluster access configured on this machine ({said}))', out)
+            self.assertNotIn('localhost:8080', out)
+            self.assertIn('ask OpenClaw on Telegram', out.splitlines()[-1])
+            self.assertEqual(data['cluster'], f'no cluster access configured on this machine ({said})')
+            self.assertIn('ask OpenClaw on Telegram', data['next'])
+        # any other kubectl failure is shown as kubectl said it
+        with mock.patch.object(magehand, 'kubectl_json', lambda *a: (None, 'Forbidden: cronjobs is forbidden')):
+            out = self.run_main('job', 'ls')[1]
+        self.assertIn('dev: not checked (Forbidden: cronjobs is forbidden)', out)
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
+
+    def test_cluster_access_reads_only_kubectl_s_config(self):
+        runs = []
+
+        def run(argv, **kw):
+            runs.append(argv)
+            return subprocess.CompletedProcess(argv, self.context_code, self.context, '')
+        with mock.patch.object(magehand.shutil, 'which', lambda t: '/usr/local/bin/kubectl'), \
+                mock.patch.object(magehand.subprocess, 'run', run):
+            self.context_code, self.context = 0, 'k8s-01\n'
+            self.assertIsNone(magehand.cluster_access())
+            self.context_code, self.context = 1, ''
+            self.assertEqual(magehand.cluster_access(), 'kubectl has no context')
+        self.assertEqual(runs[0], ['kubectl', 'config', 'current-context'])
+        with mock.patch.object(magehand.shutil, 'which', lambda t: None):
+            self.assertEqual(magehand.cluster_access(), 'kubectl is not installed')
+        self.assertIn('kubectl has no cluster context', magehand.no_cluster('kubectl has no context'))
+        self.assertIsNone(magehand.no_cluster('Forbidden'))
+
     def test_ls_without_jobs_says_how_to_add_one(self):
         out = self.run_main('job', 'ls', '--no-cluster')[1]
         self.assertEqual(out.splitlines()[-1], 'next: `magehand job add NAME --schedule CRON -- COMMAND`')

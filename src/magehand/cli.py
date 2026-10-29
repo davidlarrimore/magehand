@@ -1059,7 +1059,30 @@ def argo_problem(application):
 
 # kubectl's answers when this machine has no cluster to ask (a laptop): not a problem, so said plainly.
 NO_CLUSTER = re.compile(r'kubectl is not installed|localhost:8080|no configuration has been provided|'
-                        r'current-context is not set|context was not found', re.I)
+                        r'current-context is not set|context was not found|kubectl has no context', re.I)
+# Where dev's job runs can be read from a machine without cluster access.
+RUNS_ELSEWHERE = ("for dev's job runs, ask OpenClaw on Telegram (it reads dev), or run `magehand job ls` where kubectl "
+                  'reaches the cluster; failed and missed runs alert the owner either way')
+
+
+def no_cluster(why):
+    """Plain words for a kubectl failure that means this machine has no cluster to ask (NO_CLUSTER), else None."""
+    if not why or not NO_CLUSTER.search(why):
+        return None
+    return 'no cluster access configured on this machine (' + (
+        'kubectl is not installed' if 'not installed' in why else 'kubectl has no cluster context') + ')'
+
+
+def cluster_access():
+    """None when kubectl has a current context, else why not. Reads kubectl's config only: no network call."""
+    if not shutil.which('kubectl'):
+        return 'kubectl is not installed'
+    try:
+        out = subprocess.run(['kubectl', 'config', 'current-context'], capture_output=True, text=True,  # nosec B603 B607
+                             timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return 'kubectl did not answer'
+    return None if out.returncode == 0 and (out.stdout or '').strip() else 'kubectl has no context'
 
 
 def platform_deployment(repo, environment, sha, application, image=None):
@@ -3168,6 +3191,14 @@ def cmd_doctor(a):
             print(f'--   {note}')
     elif stale == []:
         check("app repos' AGENTS.md match the template", True)
+    # Cluster access is a note, never a failure: only `job ls` and status's per-pod detail use it, and a laptop
+    # normally has none (dev's state is in GitHub Deployments; OpenClaw reads the cluster).
+    absent = no_cluster(cluster_access() or '')
+    note = (f'cluster access: none, {absent.split("(", 1)[1].rstrip(")")}: `magehand job ls` and status\'s pod detail '
+            "can't read dev here (normal on a laptop; OpenClaw can)" if absent else 'cluster access: kubectl has a context')
+    results.append({'check': 'cluster access', 'ok': None, 'hint': note})
+    if not a.json:
+        print(f'--   {note}')
     configured = configured_runtime()
     found = [] if configured else detect_runtimes()
     chosen = choose_runtime(configured, found)
@@ -5951,10 +5982,12 @@ def job_ls(a, app):
     cluster, why = (None, '--no-cluster') if a.no_cluster else kubectl_json('cronjobs,jobs', '-n', namespace)
     rows = job_rows(local_jobs(app), cluster)
     failed = [run['job'] for row in rows for run in ((row['dev'] or {}).get('runs') or [])[:1] if run['state'] == 'failed']
+    absent = no_cluster(why)  # a laptop: say so, and where the runs can be read, not kubectl's own error
     step = ('`magehand job add NAME --schedule CRON -- COMMAND`' if not rows else
-            f'read why its last run failed: `kubectl -n {namespace} logs job/{failed[0]}`' if failed else None)
+            f'read why its last run failed: `kubectl -n {namespace} logs job/{failed[0]}`' if failed else
+            RUNS_ELSEWHERE if absent else None)
     if a.json:
-        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': why or 'read', 'jobs': rows,
+        print(json.dumps({'app': app['name'], 'namespace': namespace, 'cluster': absent or why or 'read', 'jobs': rows,
                           'next': step}, indent=1))
         return
     if not rows:
@@ -5967,7 +6000,7 @@ def job_ls(a, app):
         print(f'{row["name"]}: {row["schedule"]} ({row["timezone"]}), {command} [{where}]')
         dev = row['dev']
         if cluster is None:
-            print(f'  dev: not checked ({why})')
+            print(f'  dev: not checked ({absent or why})')
         elif dev is None:
             print('  dev: not deployed yet (it deploys when merged)')
         else:
