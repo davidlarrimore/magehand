@@ -4308,21 +4308,30 @@ def cmd_check(a):
     name = a.app_flag or a.app or current_app(root)
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
+    pinned_here = []  # a pinned app checked with --apps-dir from a checkout without deploy/app.yaml
     try:
         app = try_load_app(name, root)
     except PinnedApp as pinned:
         repo, ref = pinned.pin.get('repo') or name, str(pinned.pin['ref'])
-        note = (f'{name} is pinned to {OWNER}/{repo} at {ref[:7]}: its manifests are in that repo and are checked by its '
-                'build (`magehand check` there); nothing to check in this homelab-apps checkout')
-        if a.json:
-            print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': [],
-                              'next': None}, indent=1))
-        else:
-            print(f'magehand check {name}: {note}')
-            print(next_line(None))
-        sys.exit(0)
-    found = (check_manifests(app, catalog) + check_jobs(app, catalog) if app else seeded_name_findings(name, root)) \
-        + check_deploy_files(root, name)
+        if manifests_only:  # homelab-apps' own CI: only the pin is there, and the app repo's build checks the rest
+            note = (f'{name} is pinned to {OWNER}/{repo} at {ref[:7]}: its manifests are in that repo and are checked by '
+                    'its build (`magehand check` there); nothing to check in this homelab-apps checkout')
+            if a.json:
+                print(json.dumps({'app': name, 'pinned': {'repo': repo, 'ref': ref}, 'errors': 0, 'findings': [],
+                                  'next': None}, indent=1))
+            else:
+                print(f'magehand check {name}: {note}')
+                print(next_line(None))
+            sys.exit(0)
+        # An app repo's build (or any --code): the code rules still apply. In the pinned repo's own checkout, a
+        # missing deploy/app.yaml is an error: the platform deploys this repo's deploy/ at the pinned commit.
+        app = None
+        if remote_repo(root) == repo:
+            pinned_here.append(finding('error', f'{DEPLOY}/app.yaml', f'missing: {name} is deployed from this repo\'s '
+                                       f'{DEPLOY}/ (pinned at {ref[:7]}), so every commit needs it',
+                                       'README "How an app is put together"'))
+    found = pinned_here + (check_manifests(app, catalog) + check_jobs(app, catalog) if app
+                           else seeded_name_findings(name, root)) + check_deploy_files(root, name)
     rendered, skipped = check_rendered(root, name)
     found += rendered
     # CI must check everything a merge deploys: there a render that was skipped is a failure, and with --strict
