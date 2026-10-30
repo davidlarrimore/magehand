@@ -1382,8 +1382,9 @@ def status_next(report, failed, done):
 
 def render_status(report):
     lines = [f'{report["app"]}  ({report["repo"]} main {report["commit"][:7]}: {report["subject"]})']
+    width = max((len(st['stage']) for st in report['stages']), default=0) + 1
     for st in report['stages']:
-        lines.append(f'  {st["stage"]:<9}{STATUS_MARK[st["state"]]} {st["text"]}')
+        lines.append(f'  {st["stage"]:<{width}}{STATUS_MARK[st["state"]]} {st["text"]}')
     return '\n'.join(lines)
 
 

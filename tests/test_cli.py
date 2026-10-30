@@ -3752,6 +3752,13 @@ class CommandLine(unittest.TestCase):
             self.assertIn('next', result)
             self.assertEqual(result['ok'], state in ('ok', 'unknown'))
 
+    def test_status_marks_line_up_past_the_longest_stage(self):
+        report = {'app': 'demo', 'repo': 'example/demo', 'commit': 'a' * 40, 'subject': 'test',
+                  'stages': [{'stage': stage, 'state': 'ok', 'text': 'done'}
+                             for stage in ('repo', 'dev', 'post-deploy')]}
+        rows = magehand.render_status(report).splitlines()[1:]
+        self.assertEqual(rows, ['  repo        ✓ done', '  dev         ✓ done', '  post-deploy ✓ done'])
+
 
 class ArgoAccess(unittest.TestCase):
     """status says when Argo cannot read the app's repo."""
