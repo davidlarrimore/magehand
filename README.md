@@ -146,7 +146,7 @@ using its Kubernetes Service proxy. It never runs app code or checks production.
 version: 1
 checks:
   - method: GET
-    path: /health
+    path: /healthz
     status: 200
     json_key: ok
   - method: GET
@@ -154,7 +154,7 @@ checks:
     status: 200
     body_contains: Welcome
   - method: HEAD
-    path: /health
+    path: /healthz
     status: 200
 ```
 
