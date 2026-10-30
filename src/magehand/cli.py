@@ -1224,6 +1224,25 @@ def build_runs(repo, head):
     return runs, None
 
 
+def post_deploy_stage(repo, sha, name):
+    """Read the context on this deployed commit, never an unrelated branch tip."""
+    result, err = gh_query('api', f'repos/{repo}/commits/{sha}/status')
+    if err:
+        return query_error('post-deploy', 'homelab/post-deploy', err)
+    statuses = [s for s in result.get('statuses', []) if s.get('context') == 'homelab/post-deploy']
+    if not statuses:
+        return {'stage': 'post-deploy', 'state': 'unknown', 'commit': sha,
+                'text': 'homelab/post-deploy: no result for this commit (legacy apps may skip checks)'}
+    latest = max(statuses, key=lambda s: s.get('id', 0))
+    state = {'success': 'ok', 'failure': 'failed', 'error': 'failed', 'pending': 'pending'}.get(
+        latest.get('state'), 'unknown')
+    return {'stage': 'post-deploy', 'state': state, 'commit': sha,
+            'text': 'homelab/post-deploy: ' + (latest.get('description') or latest.get('state', 'unknown')),
+            'url': latest.get('target_url'),
+            **({'next': f'fix deploy/checks.yaml or the failing endpoint, push, then `magehand status {name} --watch`'}
+               if state == 'failed' else {})}
+
+
 def collect_status(repo, name, cluster=True, ref='main'):
     """The stages for the app `name` whose code is `repo` (OWNER/NAME) at `ref` (main, or the one commit
     `release` is about to tag); a failed query is a stage in state 'error' naming what could not be read."""
@@ -1259,6 +1278,7 @@ def collect_status(repo, name, cluster=True, ref='main'):
     stages = [build, deploy, prod]
     if deploy['state'] == 'ok':
         stages.insert(2, dev_stage(name, deploy, cluster, repo, head))
+        stages.insert(3, post_deploy_stage(repo, head, name))
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
 
@@ -1403,11 +1423,11 @@ def cmd_status(a):
             lifecycle = lifecycle_stages(repo, name)
         seen = report['commit']
         report['stages'] = lifecycle + report['stages']
-        # build and deploy always count; dev's pods only when they could be read (an unknown one doesn't)
-        states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev')]
+        # Build and deploy count; dev and post-deploy count when readable (unknown is optional).
+        states = [st['state'] for st in report['stages'] if st['stage'] in ('build', 'deploy', 'dev', 'post-deploy')]
         stopped = 'failed' in states or any(st['state'] == 'error' for st in report['stages'] if st not in lifecycle)
         waiting = [st['stage'] for st in report['stages'] if st['state'] == 'pending'
-                   and (st['stage'] in ('build', 'deploy', 'dev') or st in lifecycle)]
+                   and (st['stage'] in ('build', 'deploy', 'dev', 'post-deploy') or st in lifecycle)]
         done = all(st == 'ok' for st in states if st != 'unknown') and len(
             [st for st in report['stages'] if st['stage'] in ('build', 'deploy') and st['state'] == 'ok']) == 2 \
             and not any(st['state'] in ('pending', 'error') for st in lifecycle)  # waiting, or not read yet
@@ -3712,19 +3732,78 @@ def check_schemas(rendered):
     return found, skipped
 
 
+def parse_post_checks(text):
+    """Version 1: a bounded, declarative YAML document. No app code or YAML constructors."""
+    if len(text.encode()) > 32768:
+        raise ValueError('checks.yaml exceeds 32 KiB')
+    class Loader(yaml.SafeLoader):
+        def compose_node(self, parent, index):
+            if self.check_event(yaml.AliasEvent):
+                raise ValueError('checks.yaml aliases are forbidden')
+            return super().compose_node(parent, index)
+
+        def construct_mapping(self, node, deep=False):
+            keys = [self.construct_object(k, deep=deep) for k, _ in node.value]
+            if any(not isinstance(k, str) for k in keys) or len(set(keys)) != len(keys):
+                raise ValueError('checks.yaml requires unique string keys')
+            return super().construct_mapping(node, deep=deep)
+    try:
+        doc = yaml.load(text, Loader=Loader)  # nosec B506  # Loader subclasses SafeLoader and rejects aliases/duplicate keys
+    except (yaml.YAMLError, RecursionError, ValueError, TypeError):
+        raise ValueError('invalid checks.yaml YAML') from None
+    if not isinstance(doc, dict) or set(doc) != {'version', 'checks'} or type(doc['version']) is not int \
+            or doc['version'] != 1 or not isinstance(doc['checks'], list) or not 1 <= len(doc['checks']) <= 20:
+        raise ValueError('checks.yaml needs version: 1 and 1–20 checks')
+    for c in doc['checks']:
+        if not isinstance(c, dict) or not {'method', 'path', 'status'} <= set(c) \
+                or set(c) - {'method', 'path', 'status', 'body_contains', 'json_key'}:
+            raise ValueError('check needs method, path, status; optional body_contains OR json_key')
+        path = c['path']
+        if c['method'] not in ('GET', 'HEAD') or not isinstance(path, str) or len(path) > 2048 \
+                or not path.startswith('/') or path.startswith('//') or '#' in path \
+                or any(ord(ch) < 33 or ch == '\\' for ch in path) \
+                or re.search(r'%25|%2f|%5c', path, re.IGNORECASE) \
+                or any(part in ('.', '..') for part in urllib.parse.unquote(path).split('/')):
+            raise ValueError('check needs GET/HEAD and an absolute local path without traversal')
+        if type(c['status']) is not int or not 100 <= c['status'] <= 599:
+            raise ValueError('check status must be an HTTP status integer')
+        assertions = set(c) & {'body_contains', 'json_key'}
+        if len(assertions) > 1 or (assertions and c['method'] == 'HEAD') \
+                or any(not isinstance(c[k], str) or not c[k] or len(c[k]) > 1024 for k in assertions):
+            raise ValueError('GET permits one nonempty body_contains or top-level json_key')
+    return doc['checks']
+
+
+def check_post_checks(root):
+    path = pathlib.Path(root) / DEPLOY / 'checks.yaml'
+    if not path.exists():
+        return []  # optional for legacy apps
+    try:
+        with path.open('rb') as stream:
+            raw = stream.read(32769)
+        if len(raw) > 32768:
+            raise ValueError('checks.yaml exceeds 32 KiB')
+        parse_post_checks(raw.decode('utf-8'))
+    except (OSError, UnicodeError, ValueError) as error:
+        return [finding('error', f'{DEPLOY}/checks.yaml',
+                        f'{error}; fix deploy/checks.yaml or remove it to skip dev checks',
+                        'README "Post-deploy checks"')]
+    return []
+
+
 def check_deploy_files(root, name=None):
-    """deploy/ holds app.yaml, base/ (the Kustomize base), the dev/ overlay (namespace <app>-dev: Argo CD deploys
+    """deploy/ holds app.yaml, optional dev checks.yaml, base/ (the Kustomize base), the dev/ overlay (namespace <app>-dev: Argo CD deploys
     it, and registration and CI need it once base/ exists) and the optional prod/ (namespace <app>, needed for
     production releases): merging copies exactly those."""
     local = deploy_dir(root)
     if not local:
         return []
-    found = []
+    found = check_post_checks(root)
     for path in sorted(local.rglob('*')):
         rel = path.relative_to(local)
-        if path.is_file() and not (rel.as_posix() == 'app.yaml' or (len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
+        if path.is_file() and not (rel.as_posix() in ('app.yaml', 'checks.yaml') or (len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
                                                                     and rel.suffix in ('.yaml', '.yml'))):
-            found.append(finding('error', f'{DEPLOY}/{rel.as_posix()}', 'not deployed: deploy/ holds app.yaml and '
+            found.append(finding('error', f'{DEPLOY}/{rel.as_posix()}', 'not deployed: deploy/ holds app.yaml, checks.yaml and '
                                  'base/, dev/, prod/ *.yaml only, and a merge with anything else is not deployed',
                                  'README "How an app is put together"'))
     if not any((local / 'base').glob('*.y*ml')):
