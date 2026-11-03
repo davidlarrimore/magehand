@@ -3195,17 +3195,19 @@ def cmd_doctor(a):
             print(f'--   {note}')
         left = None
     else:
-        blocked = False
+        blocked = status = False
         try:
-            reach = urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
-        except urllib.error.HTTPError:
-            reach = False
+            status = urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status  # nosec B310
+        except urllib.error.HTTPError as error:
+            status = error.code
         except OSError as error:
-            reach, blocked = False, local_network_blocked(error)
-        check(f'reach {OPENBAO}', reach, f'{LOCAL_NETWORK}: {local_network_step()}' if blocked else NOT_SET_UP)
+            blocked = local_network_blocked(error)
+        reach = status == 200
+        check(f'reach {OPENBAO}', reach, unhealthy(status) if status else
+              f'{LOCAL_NETWORK}: {local_network_step()}' if blocked else NOT_SET_UP)
         left = signin_left() if reach else None
         check('signed in to OpenBao' + (f', {minutes(left)} left' if left is not None else ''), left is not None,
-              '`magehand login`')
+              '`magehand login`' if reach else 'not checked: OpenBao is not serving')
     if left is not None and left < SIGNIN_WARN:
         note = f'sign-in has {minutes(left)} left; `magehand login` renews it before a long task'
         results.append({'check': 'sign-in time left', 'ok': None, 'hint': note})
@@ -4940,11 +4942,26 @@ def dns_answer(server, host):
     return lines[0] if out.returncode == 0 and lines else None
 
 
-def reachable():
+def lab_health():
+    """OpenBao's health answer: 200 when it serves, another HTTP status when it answered but can't serve (503
+    sealed, 501 not initialized), None when nothing answered (DNS, the network, Local Network privacy)."""
     try:
-        return urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status == 200  # nosec B310
-    except (OSError, urllib.error.HTTPError):
-        return False
+        return urllib.request.urlopen(f'{OPENBAO}/v1/sys/health', timeout=5).status  # nosec B310
+    except urllib.error.HTTPError as error:
+        return error.code
+    except OSError:
+        return None
+
+
+def reachable():
+    """Whether anything answers at OpenBao's address, healthy or not: DNS and the network work."""
+    return lab_health() is not None
+
+
+def unhealthy(status):
+    """What an answer other than 200 means. Nothing on this machine fixes it, so it never points at setup or DNS."""
+    state = {503: 'sealed', 501: 'not initialized'}.get(status, 'not serving')
+    return f'OpenBao answered HTTP {status} ({state}): the homelab needs it fixed, not this machine'
 
 
 def local_network_blocked(error=None):
@@ -5061,8 +5078,13 @@ def cmd_setup(a):
         else:
             die(f'{host} now resolves via {server} but https still fails; is this Mac on a network that reaches it?')
         print(f'    ok: {host} -> {lab_address(host)} (undo: magehand setup --undo)')
+    unfinished = []  # steps that can fail without stopping setup: said at the end, with how to fix them
     print('4/6 sign in')
-    if signin_left() is not None:
+    status = lab_health()
+    if status not in (200, None):
+        print(f'    not signed in: {unhealthy(status)}')
+        unfinished.append(f'sign-in: {unhealthy(status)}; run `magehand setup` again once it is back')
+    elif signin_left() is not None:
         print('    ok (already signed in)')
     else:
         cmd_login(None)
@@ -5075,8 +5097,10 @@ def cmd_setup(a):
     for path, problem in install_approvals():
         print(f'    not installed: {path}: {problem}' if problem else f'    ok: {path}')
         rejected = rejected or problem
-    if rejected:  # the one step that can fail without stopping setup: say it failed, and how to fix it
-        die('setup is done except for Codex: ' + rejected_rules_step(rejected))
+    if rejected:
+        unfinished.append('Codex: ' + rejected_rules_step(rejected))
+    if unfinished:
+        die('setup is done except for ' + '; and '.join(unfinished))
     print('Done: this machine is set up.')
     print(next_line('in an app repo, `magehand status` (or `magehand new REPO` to start one)'))
 
@@ -5096,9 +5120,12 @@ def setup_refresh(host):
         github_token()
     except SystemExit:
         needs.append('GitHub sign-in (`gh auth login`)')
-    if not reachable():
+    status = lab_health()
+    if status is None:
         needs.append(f'{LOCAL_NETWORK}: {local_network_step()}' if local_network_blocked()
                      else f'{host} is not reachable')
+    elif status != 200:
+        print(f'note: {unhealthy(status)}')  # nothing setup can do about it
     missing = approvals_missing()
     if rejected:
         needs.append(rejected_rules_step(rejected))

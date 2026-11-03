@@ -1090,14 +1090,35 @@ class LocalNetworkBlocked(unittest.TestCase):
         self.assertIn('Privacy & Security > Local Network', reach['hint'])
         self.assertIn("`magehand setup` (it moves magehand onto Apple's Python", movable['hint'])
 
+    def test_doctor_names_an_unhealthy_openbao_not_setup(self):
+        # magehand#67's review: an HTTP error is an answer, so neither setup nor the permission is the fix
+        def urlopen(*_a, **_k):
+            raise magehand.urllib.error.HTTPError('u', 503, 'sealed', {}, None)
+        with mock.patch.object(magehand.urllib.request, 'urlopen', urlopen), \
+                mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
+                mock.patch.object(magehand, 'install_method', lambda: 'uv'), \
+                mock.patch.object(magehand, 'saved_token', lambda: None), \
+                mock.patch.object(magehand, 'current_repo', lambda *a: None), \
+                mock.patch.object(magehand, 'configured_runtime', lambda: 'none'), \
+                mock.patch.object(magehand, 'choose_runtime', lambda configured, found: None):
+            code, out, _ = CommandLine.run_main(self, 'doctor', '--json')
+        reach = next(c for c in json.loads(out)['checks'] if c['check'].startswith('reach '))
+        self.assertEqual((code, reach['ok']), (1, False))
+        self.assertIn('OpenBao answered HTTP 503 (sealed)', reach['hint'])
+        self.assertNotIn('magehand setup', reach['hint'])
+        signin = next(c for c in json.loads(out)['checks'] if c['check'].startswith('signed in'))
+        self.assertEqual(signin['hint'], 'not checked: OpenBao is not serving')  # `magehand login` can't work now
+
 
 class Setup(unittest.TestCase):
     def setUp(self):
-        self.names = ('reachable', 'lab_address', 'dns_answer', 'sudo_write_resolver', 'github_token',
+        self.names = ('reachable', 'lab_health', 'lab_address', 'dns_answer', 'sudo_write_resolver', 'github_token',
                       'saved_token', 'cmd_login', 'shutil', 'install_skill', 'local_network_blocked',
                       'can_move_to_apple_python', 'move_to_apple_python')
         self.saved = {n: getattr(magehand, n) for n in self.names}
         magehand.local_network_blocked = lambda: False
+        magehand.lab_health = lambda: 200
         magehand.can_move_to_apple_python = lambda: False
         self.moved = []
         magehand.move_to_apple_python = lambda: self.moved.append(1) or sys.exit(0)
@@ -1165,6 +1186,34 @@ class Setup(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_setup(['--dns', '192.0.2.1'])
         self.assertEqual(self.written, [])
+
+    def test_an_unhealthy_openbao_is_not_blamed_on_dns(self):
+        # magehand#67's review: a sealed OpenBao (HTTP 503) answers, so DNS and the network are fine
+        magehand.lab_health = lambda: 503
+        magehand.reachable = lambda: True
+        with self.assertRaises(SystemExit) as stop:
+            self.run_setup([])
+        self.assertEqual((self.written, self.logins, self.skills), ([], [], [1]))  # skill still installed
+        message = str(stop.exception)
+        self.assertIn('setup is done except for sign-in: OpenBao answered HTTP 503 (sealed)', message)
+        self.assertIn('`magehand setup` again once it is back', message)
+        self.assertNotIn('--dns', message)
+
+    def test_lab_health_tells_an_answer_from_no_answer(self):
+        def urlopen(status=None, error=None):
+            def fake(*_a, **_k):
+                if error:
+                    raise error
+                return mock.Mock(status=status)
+            return fake
+        sealed = magehand.urllib.error.HTTPError('u', 503, 'sealed', {}, None)
+        for fake, health, reach in ((urlopen(200), 200, True), (urlopen(error=sealed), 503, True),
+                                    (urlopen(error=magehand.urllib.error.URLError('no dns')), None, False),
+                                    (urlopen(error=TimeoutError()), None, False)):
+            with mock.patch.object(magehand.urllib.request, 'urlopen', fake), \
+                    mock.patch.object(magehand, 'lab_health', self.saved['lab_health']), \
+                    mock.patch.object(magehand, 'reachable', self.saved['reachable']):
+                self.assertEqual((magehand.lab_health(), magehand.reachable()), (health, reach))
 
 
 class ProxyHeaders(unittest.TestCase):
@@ -3277,7 +3326,7 @@ class Approvals(unittest.TestCase):
         self.assertTrue(self.plugin.is_dir())
         self.assertEqual(magehand.approvals_missing(), ['Codex'])
         with rejected, mock.patch.object(magehand, 'github_token', lambda: 't'), \
-                mock.patch.object(magehand, 'reachable', lambda: True):
+                mock.patch.object(magehand, 'lab_health', lambda: 200):
             code, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
         self.assertEqual(code, 0)
         self.assertIn('not for Codex', out)
@@ -3339,7 +3388,7 @@ class Approvals(unittest.TestCase):
 
     def test_refresh_rewrites_what_setup_installed_and_says_when_setup_is_needed(self):
         with mock.patch.object(magehand, 'github_token', lambda: 't'), \
-                mock.patch.object(magehand, 'reachable', lambda: True):
+                mock.patch.object(magehand, 'lab_health', lambda: 200):
             code, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
             self.assertEqual(code, 0)
             self.assertIn('needs setup: the pre-approved commands', out)  # never installed: setup installs them
@@ -3352,10 +3401,17 @@ class Approvals(unittest.TestCase):
         self.assertNotEqual((self.plugin / 'hooks/approve.py').read_text(), 'stale')
         self.assertEqual(out.splitlines()[-1], 'next: nothing')
         with mock.patch.object(magehand, 'github_token', lambda: sys.exit('no token')), \
-                mock.patch.object(magehand, 'reachable', lambda: False):
+                mock.patch.object(magehand, 'lab_health', lambda: None), \
+                mock.patch.object(magehand, 'local_network_blocked', lambda: False):
             _, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
         self.assertIn('needs setup: GitHub sign-in', out)
         self.assertIn('is not reachable', out)
+        with mock.patch.object(magehand, 'github_token', lambda: 't'), \
+                mock.patch.object(magehand, 'lab_health', lambda: 503):
+            _, out, _ = CommandLine.run_main(self, 'setup', '--refresh')
+        self.assertIn('note: OpenBao answered HTTP 503 (sealed)', out)  # not something setup can fix
+        self.assertNotIn('not reachable', out)
+        self.assertEqual(out.splitlines()[-1], 'next: nothing')
 
     def test_upgrade_runs_the_new_versions_quiet_setup(self):
         calls = []
