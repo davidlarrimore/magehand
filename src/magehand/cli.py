@@ -3563,6 +3563,78 @@ def render_overlay(local, overlay):
         return 'failed', str(error).splitlines()[0]
 
 
+# Memory (requests, limits) in MiB: each namespace's quota (homelab platform/agent-apps-baseline{,-prod}/
+# resource-quota.yaml) and each block's pod (platform/building-blocks/<type>/templates/statefulset.yaml).
+NAMESPACE_MEMORY_MI = {'dev': (1024, 2048), 'prod': (2048, 4096)}
+BLOCK_MEMORY_MI = {'postgres': (128, 512), 'redis': (64, 256)}
+
+
+def pod_memory_mi(pod):
+    """(requests, limits) MiB of a pod spec: its containers summed, or its largest init container if that is more.
+    A size not written in Mi or Gi counts as 0, so the rollout check only warns on what it can read."""
+    def of(container, kind):
+        return memory_mi(((container.get('resources') or {}).get(kind) or {}).get('memory')) or 0
+    return tuple(max(sum(of(c, kind) for c in pod.get('containers') or []),
+                     max((of(c, kind) for c in pod.get('initContainers') or []), default=0))
+                 for kind in ('requests', 'limits'))
+
+
+def surge_pods(spec, replicas):
+    """How many extra pods a Deployment's RollingUpdate starts (maxSurge, Kubernetes' default 25%, rounded up)."""
+    surge = str(((spec.get('strategy') or {}).get('rollingUpdate') or {}).get('maxSurge', '25%'))
+    if surge.endswith('%') and surge[:-1].isdigit():
+        return -(-replicas * int(surge[:-1]) // 100)
+    return int(surge) if surge.isdigit() else 1
+
+
+def check_rollout_room(where, overlay, docs, services):
+    """A Deployment's default RollingUpdate starts its new pods beside the old ones, so the namespace quota must hold
+    both, with the blocks' pods. When it can't, the new pod is refused and the old image keeps running."""
+    quota = NAMESPACE_MEMORY_MI.get(overlay)
+    if not quota:
+        return []
+    steady = [0, 0]
+    for block in (services or {}).values():
+        for i, mi in enumerate(BLOCK_MEMORY_MI.get((block or {}).get('type') if isinstance(block, dict) else None,
+                                                   (0, 0))):
+            steady[i] += mi
+    rolling = []
+    for doc in docs:
+        spec = doc.get('spec') or {}
+        if doc.get('kind') not in ('Deployment', 'StatefulSet'):
+            continue
+        replicas = spec.get('replicas', 1) if isinstance(spec.get('replicas', 1), int) else 1
+        pod = pod_memory_mi((spec.get('template') or {}).get('spec') or {})
+        for i in (0, 1):
+            steady[i] += pod[i] * replicas
+        if doc.get('kind') == 'Deployment' and (spec.get('strategy') or {}).get('type', 'RollingUpdate') == 'RollingUpdate':
+            extra = surge_pods(spec, replicas)
+            rolling.append(((doc.get('metadata') or {}).get('name', '?'), [m * extra for m in pod]))
+    found = []
+    for name, extra in rolling:
+        for i, kind in enumerate(('requests', 'limits')):
+            need = steady[i] + extra[i]
+            if extra[i] and need > quota[i]:
+                found.append(finding('warning', f'{where}: Deployment {name}',
+                                     f'a rolling update needs {need}Mi of memory {kind} (its new pod beside the old '
+                                     f'one, the rest of the app and its blocks), more than the {quota[i]}Mi {overlay} '
+                                     f'quota: the new pod is refused and the old image keeps running. Lower the '
+                                     f'{kind}, or use spec.strategy.type: Recreate (one replica; about a minute of '
+                                     f'downtime per deploy)', 'homelab-apps AGENTS.md "Storage and resources"'))
+                break
+    return found
+
+
+def app_services(local):
+    """deploy/app.yaml's `services:` in the deploy/ directory `local`, or {} when it can't be read."""
+    try:
+        spec = yaml.safe_load((local / 'app.yaml').read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    services = spec.get('services') if isinstance(spec, dict) else None
+    return services if isinstance(services, dict) else {}
+
+
 def check_rendered(root, name):
     """The rules CI applies to deploy/ rendered by kustomize (build-app.yaml "Render and check deploy/"): each
     overlay's namespace, the kinds an app may deploy, Ingress hosts and middlewares, and the `app` container the
@@ -3591,6 +3663,7 @@ def check_rendered(root, name):
             skipped.append(f'{where}: not rendered ({why}); CI renders and checks it')
             continue
         rendered.append((overlay, docs))
+        found += check_rollout_room(where, overlay, docs, app_services(local))
         lab, public = f'{namespace}.{LAB}', f'{namespace}.{domain}'
         for doc in docs:
             meta = doc.get('metadata') or {}
