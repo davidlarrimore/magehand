@@ -17,6 +17,7 @@ platform/openbao/policies/dev-read.hcl).
 """
 import argparse
 import base64
+import colorsys
 import datetime
 import difflib
 import errno
@@ -35,6 +36,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess  # nosec B404  # runs docker, git, gh and the user's own command
 import sys
 import tempfile
@@ -45,6 +47,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET  # nosec B405  # parses only S3 responses from the bucket's own endpoint
+import zlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 
 import yaml
@@ -2098,6 +2101,7 @@ resources:
   - deployment.yaml
   - service.yaml
   - ingress.yaml
+  - app-icon.yaml  # the app's icon: `magehand icon set FILE`
 """,
     'deploy/base/deployment.yaml': """\
 apiVersion: apps/v1
@@ -2233,6 +2237,10 @@ def scaffold(root, app, repo_name, skip=()):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text.format(**values))
         written.append(rel)
+    icon = root / ICON_PATH
+    if f'{DEPLOY}/base/kustomization.yaml' in written and not icon.exists():  # the base lists it
+        icon.write_text(icon_manifest('png', generated_icon(app), generated=True))
+        written.append(ICON_PATH)
     return written
 
 
@@ -4499,7 +4507,7 @@ def cmd_check(a):
             pinned_here.append(finding('error', f'{DEPLOY}/app.yaml', f'missing: {name} is deployed from this repo\'s '
                                        f'{DEPLOY}/ (pinned at {ref[:7]}), so every commit needs it',
                                        'README "How an app is put together"'))
-    found = pinned_here + (check_manifests(app, catalog) + check_jobs(app, catalog) if app
+    found = pinned_here + (check_manifests(app, catalog) + check_jobs(app, catalog) + check_icon(app) if app
                            else seeded_name_findings(name, root)) + check_deploy_files(root, name)
     rendered, skipped = check_rendered(root, name)
     found += rendered
@@ -4646,7 +4654,9 @@ adds X-authentik-* headers); the root filesystem is read-only (state goes in
 a block); a block key is never `optional: true`; merging code deploys dev by
 itself, `deploy/` included (never pin images by hand); the code calls only
 models its llm block requests; scheduled work is a CronJob that
-`magehand job add` writes (never a scheduler inside the app's process).
+`magehand job add` writes (never a scheduler inside the app's process); the
+app's icon is `deploy/base/app-icon.yaml`, which `magehand icon set FILE`
+writes (a square PNG or WebP, 128 px; never edit it by hand).
 """
 
 
@@ -6283,6 +6293,214 @@ def cmd_pr(a):
     finish(True, None if changed else 'already ready, and its review requested',
            "wait for OpenClaw's review (it starts within about 5 minutes); the owner merges")
 
+# --- icon: the app's tile in the homelab's app library (authentik) ---------------------------
+# The app ships its icon in its own deploy/base as the ConfigMap app-icon (binaryData icon.png or icon.webp);
+# homelab's app registrar copies it to authentik, which serves it to the library (homelab docs/authentication.md).
+# A YAML file, not an image beside it: the platform deploys deploy/ *.yaml only. The registrar takes PNG or WebP
+# bytes up to ICON_MAX_BYTES (never SVG, which would be served from the sign-in host); anything else is a cube.
+
+ICON_NAME = 'app-icon'                     # the ConfigMap
+ICON_PATH = f'{DEPLOY}/base/app-icon.yaml'
+ICON_KEYS = {'png': 'icon.png', 'webp': 'icon.webp'}
+ICON_MAX_BYTES = 48 * 1024                 # the registrar's limit
+ICON_SIDES = (64, 512)                     # px; 128 is what the library needs (64 px at 2x)
+ICON_GENERATED = 'homelab.davidlarrimore.com/icon-generated'
+ICON_SEE = 'recipes "Give the app its icon"'
+PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
+
+
+def image_size(data):
+    """('png' or 'webp', width, height) of image bytes, or None for anything else (SVG, JPEG, GIF, ...)."""
+    if data[:8] == PNG_MAGIC and len(data) >= 24 and data[12:16] == b'IHDR':
+        width, height = struct.unpack('>II', data[16:24])
+        return 'png', width, height
+    if len(data) >= 30 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        kind = data[12:16]
+        if kind == b'VP8 ' and data[23:26] == b'\x9d\x01\x2a':
+            width, height = struct.unpack('<HH', data[26:30])
+            return 'webp', width & 0x3fff, height & 0x3fff
+        if kind == b'VP8L' and data[20:21] == b'\x2f':
+            bits = int.from_bytes(data[21:25], 'little')
+            return 'webp', (bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1
+        if kind == b'VP8X':
+            return 'webp', int.from_bytes(data[24:27], 'little') + 1, int.from_bytes(data[27:30], 'little') + 1
+    return None
+
+
+def icon_problem(data):
+    """Why these bytes aren't a good app icon, or None: PNG or WebP, square, ICON_SIDES px, ICON_MAX_BYTES."""
+    size = image_size(data)
+    if not size:
+        return 'not a PNG or WebP image (SVG, JPEG and others are not served): export a 128 px PNG'
+    _, width, height = size
+    if len(data) > ICON_MAX_BYTES:
+        return (f'{len(data) // 1024} KiB, more than {ICON_MAX_BYTES // 1024} KiB: export it at 128 px '
+                '(sips -Z 128 icon.png on a Mac) or as WebP')
+    if width != height:
+        return f'{width}x{height} px: an icon is square'
+    if not ICON_SIDES[0] <= width <= ICON_SIDES[1]:
+        return f'{width} px: {ICON_SIDES[0]} to {ICON_SIDES[1]} px a side (128 is best)'
+    return None
+
+
+def png_image(width, height, pixel):
+    """PNG bytes (8-bit RGB) of a width x height image whose pixel(x, y) is an (r, g, b) tuple."""
+    def chunk(kind, body):
+        return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body) & 0xffffffff)
+    rows = b''.join(b'\0' + bytes(c for x in range(width) for c in pixel(x, y)) for y in range(height))
+    return (PNG_MAGIC + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(rows, 9)) + chunk(b'IEND', b''))
+
+
+def generated_icon(app, side=128):
+    """A 128 px PNG for an app without art of its own: a mirrored 5x5 pattern in a color, both from the app's
+    name, so every app's differs and stays the same between runs."""
+    digest = hashlib.sha256(str(app).encode()).digest()
+    hue = digest[0] / 255
+    fg = tuple(round(c * 255) for c in colorsys.hls_to_rgb(hue, 0.45, 0.65))
+    bg = tuple(round(c * 255) for c in colorsys.hls_to_rgb(hue, 0.93, 0.45))
+    bits = int.from_bytes(digest[1:4], 'big')
+    on = {(col, row) for row in range(5) for col in range(3) if bits >> (row * 3 + col) & 1}
+    on |= {(4 - col, row) for col, row in on}
+    if not on:
+        on = {(2, 2)}
+    margin, cell = side // 8, (side - 2 * (side // 8)) // 5
+
+    def pixel(x, y):
+        col, row = (x - margin) // cell, (y - margin) // cell
+        inside = margin <= x < margin + 5 * cell and margin <= y < margin + 5 * cell
+        return fg if inside and (col, row) in on else bg
+    return png_image(side, side, pixel)
+
+
+def icon_manifest(kind, data, generated=False):
+    """deploy/base/app-icon.yaml: the ConfigMap app-icon holding the image."""
+    encoded = base64.b64encode(data).decode()
+    how = '`magehand icon generate` (made from the app\'s name)' if generated else '`magehand icon set FILE`'
+    lines = [f"# The app's icon: its tile in the homelab's app library. Written by {how}:",
+             "# change it with `magehand icon set FILE`, not by hand (magehand guide search icon).",
+             'apiVersion: v1', 'kind: ConfigMap', 'metadata:', f'  name: {ICON_NAME}']
+    if generated:
+        lines += ['  annotations:', f'    {ICON_GENERATED}: "true"']
+    lines += ['binaryData:', f'  {ICON_KEYS[kind]}: |']
+    lines += [f'    {encoded[i:i + 76]}' for i in range(0, len(encoded), 76)]
+    return '\n'.join(lines) + '\n'
+
+
+def icon_documents(local):
+    """(file, document) of each app-icon ConfigMap in the checkout's deploy/."""
+    return [(where, doc) for where, doc in deploy_documents(local)
+            if doc.get('kind') == 'ConfigMap' and (doc.get('metadata') or {}).get('name') == ICON_NAME]
+
+
+def icon_bytes(doc):
+    """(kind, bytes, None) of an app-icon ConfigMap's image, or (None, None, why it has none)."""
+    data = doc.get('binaryData') or {}
+    for kind, key in ICON_KEYS.items():
+        value = data.get(key) if isinstance(data, dict) else None
+        if value is None:
+            continue
+        try:
+            raw = base64.b64decode(''.join(str(value).split()), validate=True)
+        except (ValueError, TypeError):
+            return None, None, f'binaryData {key} is not base64'
+        size = image_size(raw)
+        if not size or size[0] != kind:
+            return None, None, f'binaryData {key} is not a {kind.upper()} image'
+        return kind, raw, None
+    if any(k in (doc.get('data') or {}) for k in ICON_KEYS.values()):
+        return None, None, 'the image is under data: it goes under binaryData (`magehand icon set FILE` writes it)'
+    return None, None, 'no binaryData icon.png or icon.webp'
+
+
+def check_icon(app):
+    """The app's icon (its tile in the library): an app-icon ConfigMap in deploy/base, listed in the base, holding
+    a PNG or WebP the registrar takes. Warnings: without one the tile is a generic cube, nothing breaks."""
+    if app.get('where') != DEPLOY or not app.get('root'):
+        return []
+    local = pathlib.Path(app['root']) / DEPLOY
+    if not any((local / 'base').glob('*.y*ml')):
+        return []
+    docs = icon_documents(local)
+    if not docs:
+        return [finding('warning', f'{DEPLOY}/base', "no icon: the app's tile in the homelab's app library is a "
+                        'generic cube; `magehand icon set FILE` (a 128 px PNG) or `magehand icon generate`', ICON_SEE)]
+    found = []
+    where, doc = docs[0]
+    if not where.startswith(f'{DEPLOY}/base/'):
+        found.append(finding('warning', where, f'the {ICON_NAME} ConfigMap goes in {DEPLOY}/base (dev and '
+                             'production share the icon)', ICON_SEE))
+    kind, raw, why = icon_bytes(doc)
+    problem = why or icon_problem(raw)
+    if problem:
+        found.append(finding('warning', where, f'icon: {problem}; until then the tile is a generic cube', ICON_SEE))
+    kustomization = local / 'base' / 'kustomization.yaml'
+    listed = kustomization_resources(kustomization.read_text()) if kustomization.is_file() else None
+    name = where.rsplit('/', 1)[-1]
+    if where.startswith(f'{DEPLOY}/base/') and listed is not None and name not in listed:
+        found.append(finding('warning', where, f'not in {DEPLOY}/base/kustomization.yaml resources, so the icon is '
+                             f'not deployed: add `  - {name}`', ICON_SEE))
+    return found
+
+
+def cmd_icon(a):
+    here = app_repo_here()
+    if not here:
+        die("run `magehand icon` inside the app's repo: the icon is a file in its deploy/base")
+    app = app_here(here)
+    if app.get('where') != DEPLOY or not app.get('root'):
+        die(f'{here} has no deploy/ with a base in this checkout: the icon goes in deploy/base next to the Deployment')
+    root = pathlib.Path(app['root'])
+    local, path = root / DEPLOY, root / ICON_PATH
+    docs = icon_documents(local)
+    if docs and docs[0][0] != ICON_PATH:
+        die(f'the icon is in {docs[0][0]}: move it to {ICON_PATH} or remove it, then run this again')
+    if a.icon_action == 'set':
+        source = pathlib.Path(a.file).expanduser()
+        try:
+            raw = source.read_bytes()
+        except OSError as error:
+            die(f'{a.file}: {error.strerror or error}')
+        problem = icon_problem(raw)
+        if problem:
+            die(f'{a.file}: {problem}')
+        kind, generated = image_size(raw)[0], False
+    else:
+        if docs and not ((docs[0][1].get('metadata') or {}).get('annotations') or {}).get(ICON_GENERATED) \
+                and not a.force:
+            die(f"{ICON_PATH} is the app's own icon: keep it, or --force to replace it with a generated one")
+        raw, kind, generated = generated_icon(here), 'png', True
+    kustomization = local / 'base' / 'kustomization.yaml'
+    new = None
+    if kustomization.is_file():
+        text = kustomization.read_text()
+        if path.name not in (kustomization_resources(text) or []):
+            new = edit_kustomization(text, path.name)
+            if new is None:
+                die(f'could not add {path.name} to {DEPLOY}/base/kustomization.yaml without changing its other '
+                    'resources (an unusual layout): nothing written. List it by hand, or write resources as a block '
+                    'list (`resources:` then `  - deployment.yaml` lines)')
+    path.write_text(icon_manifest(kind, raw, generated=generated))
+    if new is not None:
+        kustomization.write_text(new)
+    size = image_size(raw)
+    step = (f'`magehand check`, then commit {ICON_PATH} and merge: the tile shows it within minutes of the deploy')
+    if a.json:
+        print(json.dumps({'action': a.icon_action, 'file': ICON_PATH, 'format': kind, 'side': size[1],
+                          'bytes': len(raw), 'generated': generated,
+                          'kustomization': f'{DEPLOY}/base/kustomization.yaml' if new is not None else None,
+                          'next': step}, indent=1))
+        return
+    print(f'wrote {ICON_PATH}: {"a generated " if generated else ""}{kind.upper()} {size[1]} px, '
+          f'{max(1, len(raw) // 1024)} KiB')
+    if new is not None:
+        print(f'added it to {DEPLOY}/base/kustomization.yaml')
+    elif not kustomization.is_file():
+        print(f"warning: no {DEPLOY}/base/kustomization.yaml: list {path.name} in the base's resources",
+              file=sys.stderr)
+    print(next_line(step))
+
+
 def cmd_job(a):
     app = job_app(a.app_flag)
     base = pathlib.Path(app['root']) / DEPLOY / 'base'
@@ -6296,7 +6514,7 @@ def cmd_job(a):
 
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
-GROUPS = (('start an app', ('new',)),
+GROUPS = (('start an app', ('new', 'icon')),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check')),
           ('ship an app', ('pr', 'release', 'job')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
@@ -6498,6 +6716,22 @@ def build_parser():
     q.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read dev with kubectl (this checkout's files only)")
     q.add_argument('--json', action='store_true', help='print JSON')
+    p = command('icon', cmd_icon, "set the app's icon (its tile in the app library)", "set the app's icon: its tile in the homelab's app library",
+                'The icon is deploy/base/app-icon.yaml, a ConfigMap holding the image, deployed with the rest of\n'
+                'deploy/ (dev and production share it); the platform copies it to the app library within minutes.\n'
+                '`set` takes the app\'s own art: a square PNG or WebP, 128 px is best (64 to 512), at most 48 KiB\n'
+                '(on a Mac: sips -s format png -Z 128 art.png --out icon.png). `generate` makes one from the app\'s\n'
+                'name (new apps start with it) and never replaces an icon you set unless --force. Both list the\n'
+                "file in the base's kustomization.\n\n"
+                'examples:\n  magehand icon set brand/icon-128.png\n  magehand icon generate\n'
+                '  magehand icon set icon.webp --json')
+    isub = p.add_subparsers(dest='icon_action', metavar='ACTION', required=True, parser_class=Parser)
+    q = isub.add_parser('set', help="write the app's own image as its icon")
+    q.add_argument('file', metavar='FILE', help='a square PNG or WebP, 128 px, at most 48 KiB')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
+    q = isub.add_parser('generate', help="write an icon made from the app's name")
+    q.add_argument('--force', action='store_true', help='replace an icon that was set (not generated)')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     p = command('check', cmd_check, "check an app against the platform's rules (before every push)", "check an app's code and deployment against the platform's rules",
                 'Run it before every push; CI runs the same check. Each finding names the guide section\n'
                 'that explains it. Exit status 1 when there are errors; fix warnings or explain them in the PR.\n'
