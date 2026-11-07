@@ -1,4 +1,5 @@
 """Unit tests for magehand (no network, no Docker)."""
+import base64
 import contextlib
 import datetime
 import errno
@@ -5205,6 +5206,11 @@ SELECTED = ('apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: demo}\nspec
             '            - name: KEY\n              valueFrom: {secretKeyRef: {name: ai-connection, key: api_key}}\n')
 
 
+# Real WebP files, made and decoded by Pillow (8 px): a lossy still, a lossless still, two animated frames.
+STILL_LOSSY = base64.b64decode("UklGRmYAAABXRUJQVlA4IFoAAAAQAgCdASoIAAgAAUAmJagCdG1/Ast8xDsQAP78D7xVdFu14RtVqY1CzQSUJWRRtde1VYbxYXkL9sIoLxU8dNzomRRoTAosP/kt6/cB9+EtUfv3z//KebYAAAA=")
+STILL_LOSSLESS = base64.b64decode("UklGRiYAAABXRUJQVlA4TBkAAAAvB8ABAA8wMoM8MvMfeBAIJJFPP0RE/0MDAA==")
+ANIMATED = base64.b64decode("UklGRowAAABXRUJQVlA4WAoAAAASAAAABwAABwAAQU5JTQYAAAAAAAAAAABBTk1GLAAAAAAAAAAAAAYAAAYAAGQAAAJWUDhMFAAAAC8GgAEQDzAygzwy8x/wGL+I/ocfQU5NRiwAAAAAAAAAAAAGAAAGAABkAAAAVlA4TBQAAAAvBoABEA8wMiMzyPMf8Bi/iP6HHw==")
+
 class Icon(unittest.TestCase):
     """`magehand icon set/generate`, the scaffold's icon and the icon rules of `check`."""
 
@@ -5270,6 +5276,77 @@ class Icon(unittest.TestCase):
         anmf = [(b'ANMF', (0).to_bytes(6, 'little') + (127).to_bytes(3, 'little') * 2 + (100).to_bytes(3, 'little')
                  + b'\0' + frame) for frame in frames]
         return self.webp(canvas, (b'ANIM', b'\0' * 6), *anmf)
+
+    def test_real_webp_files(self):
+        for name, data in (('lossy', STILL_LOSSY), ('lossless', STILL_LOSSLESS), ('animated', ANIMATED)):
+            with self.subTest(name):
+                self.assertEqual(magehand.image_size(data), ('webp', 8, 8))
+                self.assertIsNone(magehand.image_size(data[:-1]))
+                self.assertIsNone(magehand.image_size(data[:len(data) // 2]))
+
+    def test_png_pixels_must_decode_to_the_header_size(self):
+        def chunk(kind, body):
+            return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body) & 0xffffffff)
+
+        def png(idat, side=4, color=2):
+            return (magehand.PNG_MAGIC + chunk(b'IHDR', struct.pack('>IIBBBBB', side, side, 8, color, 0, 0, 0))
+                    + chunk(b'IDAT', idat) + chunk(b'IEND', b''))
+        rows = b''.join(b'\0' + b'\7\7\7' * 4 for _ in range(4))
+        self.assertEqual(magehand.image_size(png(zlib.compress(rows))), ('png', 4, 4))
+        for name, idat in (('not zlib', b'not zlib'), ('too few rows', zlib.compress(rows[:-13])),
+                           ('too many', zlib.compress(rows + b'\0')), ('cut stream', zlib.compress(rows)[:-3]),
+                           ('trailing bytes', zlib.compress(rows) + b'xx'), ('empty', b'')):
+            self.assertIsNone(magehand.image_size(png(idat)), name)
+        self.assertIsNone(magehand.image_size(self.png() + b'after IEND'))
+        bomb = png(zlib.compress(b'\0' * (64 * 1024 * 1024)), side=4096, color=6)
+        self.assertIsNone(magehand.image_size(bomb))  # over the cap: refused before inflating
+
+    @staticmethod
+    def adam7_png(width, height, pixel):
+        """An interlaced (Adam7) RGB8 PNG: seven passes, each its own rows with a filter byte; empty passes have
+        none. Pillow decodes these to the same pixels (checked when the test was written)."""
+        def chunk(kind, body):
+            return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body) & 0xffffffff)
+        raw = b''
+        for x0, y0, dx, dy in magehand.PNG_ADAM7:
+            xs, ys = range(x0, width, dx), range(y0, height, dy)
+            if len(xs) and len(ys):
+                raw += b''.join(b'\0' + bytes(c for x in xs for c in pixel(x, y)) for y in ys)
+        return (magehand.PNG_MAGIC + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 1))
+                + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+    def test_interlaced_png(self):
+        pixel = lambda x, y: (x * 7 % 256, y * 11 % 256, (x + y) % 256)  # noqa: E731
+        icon = self.adam7_png(128, 128, pixel)
+        self.assertEqual(magehand.image_size(icon), ('png', 128, 128))
+        self.assertIsNone(magehand.icon_problem(icon))
+        self.assertEqual(magehand.png_raw_size(128, 128, 24, 1), 49392)  # more than 128 rows of 1 + 384 bytes
+        self.assertEqual(magehand.png_raw_size(128, 128, 24, 0), 49280)
+        for width, height in ((5, 3), (1, 1), (9, 17)):  # passes left empty by small or odd sizes
+            self.assertEqual(magehand.image_size(self.adam7_png(width, height, pixel)), ('png', width, height))
+        cut = self.adam7_png(9, 17, pixel)
+        rows = zlib.decompress(cut[33 + 8:-12 - 4])
+        def png(raw):  # noqa: E306
+            body = zlib.compress(raw)
+            idat = struct.pack('>I', len(body)) + b'IDAT' + body + struct.pack('>I', zlib.crc32(b'IDAT' + body) & 0xffffffff)
+            return cut[:33] + idat + cut[-12:]
+        self.assertEqual(magehand.image_size(png(rows)), ('png', 9, 17))
+        self.assertIsNone(magehand.image_size(png(rows[:-1])))        # a pass short by a byte
+        self.assertIsNone(magehand.image_size(png(rows + b'\0')))     # a byte too many
+
+    def test_riff_chunks_must_fill_the_container(self):
+        body = b'\x2f' + (3 | 3 << 14).to_bytes(4, 'little') + b'pixels'  # 11 bytes: padded to 12
+        whole = self.webp((b'VP8L', body))
+        self.assertEqual(magehand.image_size(whole), ('webp', 4, 4))
+
+        def resized(data):
+            return b'RIFF' + struct.pack('<I', len(data) - 8) + data[8:]
+        self.assertIsNone(magehand.image_size(resized(whole[:-1])))       # the pad byte missing
+        self.assertIsNone(magehand.image_size(resized(whole + b'ALP')))   # a partial chunk header after the image
+        frame = b'VP8L' + struct.pack('<I', 11) + body + b'\0'
+        self.assertEqual(magehand.image_size(self.animated(frame)), ('webp', 128, 128))
+        self.assertIsNone(magehand.image_size(self.animated(frame[:-1])))
+        self.assertIsNone(magehand.image_size(self.animated(frame + b'AL')))
 
     def test_animated_webp(self):
         bits = (128 - 1) | (128 - 1) << 14

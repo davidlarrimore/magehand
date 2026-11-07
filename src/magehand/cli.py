@@ -6309,11 +6309,49 @@ ICON_SEE = 'recipes "Give the app its icon"'
 PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
 
 
+PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}  # by color type
+PNG_MAX_PIXEL_BYTES = 4 * 1024 * 1024       # inflated image data at most (512 px RGBA16 is 2 MiB); the registrar's
+
+
+PNG_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def png_raw_size(width, height, bits, interlace):
+    """Bytes a PNG's image data inflates to: each row a filter byte and its pixels padded to a byte; an interlaced
+    image is the seven Adam7 passes, each with rows of its own (an empty pass has none)."""
+    total = 0
+    for x0, y0, dx, dy in PNG_ADAM7 if interlace else ((0, 0, 1, 1),):
+        columns = (width - x0 + dx - 1) // dx if width > x0 else 0
+        rows = (height - y0 + dy - 1) // dy if height > y0 else 0
+        if columns and rows:
+            total += rows * (1 + (columns * bits + 7) // 8)
+    return total
+
+
+def png_pixels_ok(header, compressed):
+    """Whether the image data inflates, within PNG_MAX_PIXEL_BYTES (checked against the header first), to exactly
+    the size IHDR implies, interlaced (Adam7) or not."""
+    width, height = struct.unpack('>II', header[:8])
+    depth, color, interlace = header[8], header[9], header[12]
+    if not width or not height or color not in PNG_CHANNELS or depth not in (1, 2, 4, 8, 16) or interlace > 1:
+        return False
+    expected = png_raw_size(width, height, PNG_CHANNELS[color] * depth, interlace)
+    if expected > PNG_MAX_PIXEL_BYTES:
+        return False
+    inflate = zlib.decompressobj()
+    try:
+        pixels = inflate.decompress(compressed, PNG_MAX_PIXEL_BYTES + 1)
+    except zlib.error:
+        return False
+    return inflate.eof and not inflate.unconsumed_tail and not inflate.unused_data and len(pixels) == expected
+
+
 def png_size(data):
-    """(width, height) of a whole PNG, or None: IHDR first, every chunk complete with its CRC, image data, IEND."""
+    """(width, height) of a whole PNG, or None: IHDR first, every chunk complete with its CRC, image data that
+    inflates to the header's size, IEND at the very end."""
     if data[:8] != PNG_MAGIC:
         return None
-    pos, size, pixels = 8, None, False
+    pos, header, idat = 8, None, []
     while pos + 12 <= len(data):
         length, kind = int.from_bytes(data[pos:pos + 4], 'big'), data[pos + 4:pos + 8]
         end = pos + 12 + length
@@ -6322,20 +6360,22 @@ def png_size(data):
         body = data[pos + 8:end - 4]
         if zlib.crc32(kind + body) & 0xffffffff != int.from_bytes(data[end - 4:end], 'big'):
             return None
-        if size is None:
+        if header is None:
             if kind != b'IHDR' or length != 13:
                 return None
-            size = struct.unpack('>II', body[:8])
-        elif kind == b'IDAT' and length:
-            pixels = True
+            header = body
+        elif kind == b'IDAT':
+            idat.append(body)
         elif kind == b'IEND':
-            return size if pixels and all(size) else None
+            if end != len(data) or not png_pixels_ok(header, b''.join(idat)):
+                return None
+            return struct.unpack('>II', header[:8])
         pos = end
     return None  # cut off before IEND
 
 
 def riff_chunks(data, pos, end):
-    """[(kind, body)] of the chunks in data[pos:end], or None when one is cut off."""
+    """[(kind, body)] of the chunks in data[pos:end], or None unless they fill it exactly (each padded to even)."""
     chunks = []
     while pos + 8 <= end:
         kind, length = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], 'little')
@@ -6343,7 +6383,7 @@ def riff_chunks(data, pos, end):
             return None
         chunks.append((kind, data[pos + 8:pos + 8 + length]))
         pos += 8 + length + (length & 1)
-    return chunks
+    return chunks if pos == end else None
 
 
 def webp_bitstream_size(kind, body):
