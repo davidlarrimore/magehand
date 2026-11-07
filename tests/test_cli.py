@@ -5301,6 +5301,39 @@ class Icon(unittest.TestCase):
         bomb = png(zlib.compress(b'\0' * (64 * 1024 * 1024)), side=4096, color=6)
         self.assertIsNone(magehand.image_size(bomb))  # over the cap: refused before inflating
 
+    @staticmethod
+    def adam7_png(width, height, pixel):
+        """An interlaced (Adam7) RGB8 PNG: seven passes, each its own rows with a filter byte; empty passes have
+        none. Pillow decodes these to the same pixels (checked when the test was written)."""
+        def chunk(kind, body):
+            return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body) & 0xffffffff)
+        raw = b''
+        for x0, y0, dx, dy in magehand.PNG_ADAM7:
+            xs, ys = range(x0, width, dx), range(y0, height, dy)
+            if len(xs) and len(ys):
+                raw += b''.join(b'\0' + bytes(c for x in xs for c in pixel(x, y)) for y in ys)
+        return (magehand.PNG_MAGIC + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 1))
+                + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+    def test_interlaced_png(self):
+        pixel = lambda x, y: (x * 7 % 256, y * 11 % 256, (x + y) % 256)  # noqa: E731
+        icon = self.adam7_png(128, 128, pixel)
+        self.assertEqual(magehand.image_size(icon), ('png', 128, 128))
+        self.assertIsNone(magehand.icon_problem(icon))
+        self.assertEqual(magehand.png_raw_size(128, 128, 24, 1), 49392)  # more than 128 rows of 1 + 384 bytes
+        self.assertEqual(magehand.png_raw_size(128, 128, 24, 0), 49280)
+        for width, height in ((5, 3), (1, 1), (9, 17)):  # passes left empty by small or odd sizes
+            self.assertEqual(magehand.image_size(self.adam7_png(width, height, pixel)), ('png', width, height))
+        cut = self.adam7_png(9, 17, pixel)
+        rows = zlib.decompress(cut[33 + 8:-12 - 4])
+        def png(raw):  # noqa: E306
+            body = zlib.compress(raw)
+            idat = struct.pack('>I', len(body)) + b'IDAT' + body + struct.pack('>I', zlib.crc32(b'IDAT' + body) & 0xffffffff)
+            return cut[:33] + idat + cut[-12:]
+        self.assertEqual(magehand.image_size(png(rows)), ('png', 9, 17))
+        self.assertIsNone(magehand.image_size(png(rows[:-1])))        # a pass short by a byte
+        self.assertIsNone(magehand.image_size(png(rows + b'\0')))     # a byte too many
+
     def test_riff_chunks_must_fill_the_container(self):
         body = b'\x2f' + (3 | 3 << 14).to_bytes(4, 'little') + b'pixels'  # 11 bytes: padded to 12
         whole = self.webp((b'VP8L', body))

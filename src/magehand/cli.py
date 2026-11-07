@@ -6313,14 +6313,29 @@ PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}  # by color type
 PNG_MAX_PIXEL_BYTES = 4 * 1024 * 1024       # inflated image data at most (512 px RGBA16 is 2 MiB); the registrar's
 
 
+PNG_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def png_raw_size(width, height, bits, interlace):
+    """Bytes a PNG's image data inflates to: each row a filter byte and its pixels padded to a byte; an interlaced
+    image is the seven Adam7 passes, each with rows of its own (an empty pass has none)."""
+    total = 0
+    for x0, y0, dx, dy in PNG_ADAM7 if interlace else ((0, 0, 1, 1),):
+        columns = (width - x0 + dx - 1) // dx if width > x0 else 0
+        rows = (height - y0 + dy - 1) // dy if height > y0 else 0
+        if columns and rows:
+            total += rows * (1 + (columns * bits + 7) // 8)
+    return total
+
+
 def png_pixels_ok(header, compressed):
     """Whether the image data inflates, within PNG_MAX_PIXEL_BYTES (checked against the header first), to exactly
-    the size IHDR implies (any size when interlaced)."""
+    the size IHDR implies, interlaced (Adam7) or not."""
     width, height = struct.unpack('>II', header[:8])
     depth, color, interlace = header[8], header[9], header[12]
-    if not width or not height or color not in PNG_CHANNELS or depth not in (1, 2, 4, 8, 16):
+    if not width or not height or color not in PNG_CHANNELS or depth not in (1, 2, 4, 8, 16) or interlace > 1:
         return False
-    expected = height * (1 + (width * PNG_CHANNELS[color] * depth + 7) // 8)
+    expected = png_raw_size(width, height, PNG_CHANNELS[color] * depth, interlace)
     if expected > PNG_MAX_PIXEL_BYTES:
         return False
     inflate = zlib.decompressobj()
@@ -6328,9 +6343,7 @@ def png_pixels_ok(header, compressed):
         pixels = inflate.decompress(compressed, PNG_MAX_PIXEL_BYTES + 1)
     except zlib.error:
         return False
-    if not inflate.eof or inflate.unconsumed_tail or inflate.unused_data:
-        return False
-    return 0 < len(pixels) <= expected if interlace else len(pixels) == expected
+    return inflate.eof and not inflate.unconsumed_tail and not inflate.unused_data and len(pixels) == expected
 
 
 def png_size(data):
