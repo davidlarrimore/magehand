@@ -1628,6 +1628,62 @@ class DeployDir(unittest.TestCase):
         public_bad = self.ingress(f'demo.{domain}', lab, 'demo')
         self.assertIn('a public host needs', texts(self.rendered(good, prod=[public_bad]))[0])
 
+    @staticmethod
+    def sized(request, limit, strategy=None, replicas=None, rolling=None):
+        """DEV_DEPLOYMENT with its `app` container's memory request and limit (and a strategy, its rollingUpdate
+        settings or a replica count)."""
+        spec = {'template': {'spec': {'containers': [
+            {'name': 'app', 'resources': {'requests': {'memory': request}, 'limits': {'memory': limit}}}]}}}
+        if strategy or rolling:
+            spec['strategy'] = {'type': strategy or 'RollingUpdate', **({'rollingUpdate': rolling} if rolling else {})}
+        if replicas is not None:
+            spec['replicas'] = replicas
+        return {**DeployDir.DEV_DEPLOYMENT, 'spec': spec}
+
+    def test_a_rolling_update_must_fit_the_quota_beside_the_blocks(self):
+        # nlp-playground (homelab-apps#304): 512Mi/1Gi beside a postgres block (128Mi/512Mi) rolls out to
+        # 1152Mi of requests, over dev's 1024Mi, so dev stayed on the old image until it used Recreate.
+        postgres = 'services:\n  db: {type: postgres}\n'
+        def warnings(deployment, prod=None, app_yaml=postgres):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = deploy_repo(tmp)
+                (root / 'deploy/app.yaml').write_text(app_yaml)
+                if prod is not None:
+                    (root / 'deploy/prod').mkdir()
+                    (root / 'deploy/prod/kustomization.yaml').write_text('namespace: demo\nresources: [../base]\n')
+                answers = {'dev': [deployment], 'prod': prod}
+                with mock.patch.object(magehand, 'render_overlay', lambda local, overlay: (answers[overlay], None)), \
+                        mock.patch.object(magehand, 'check_admission', lambda name, rendered: ([], [])), \
+                        mock.patch.object(magehand, 'check_schemas', lambda rendered: ([], [])):
+                    found, _ = magehand.check_rendered(root, 'demo')
+            return [(f['level'], f['where'], f['text']) for f in found]
+        big = self.sized('512Mi', '1Gi')
+        [(level, where, text)] = warnings(big)
+        self.assertEqual((level, where), ('warning', 'deploy/dev: Deployment demo'))
+        self.assertIn('needs 1152Mi of memory requests', text)
+        self.assertIn('1024Mi dev quota', text)
+        self.assertIn('Recreate', text)
+        self.assertEqual(warnings(self.sized('512Mi', '1Gi', strategy='Recreate')), [])   # the fix
+        self.assertEqual(warnings(big, app_yaml='services: {}\n'), [])                    # 1024Mi fits exactly
+        self.assertEqual(warnings(self.sized('128Mi', '256Mi')), [])                       # the usual web app
+        # limits too: 768Mi twice plus postgres's 512Mi is 2048Mi, at dev's limit; 1Gi twice is over it
+        self.assertEqual(warnings(self.sized('128Mi', '768Mi')), [])
+        self.assertIn('memory limits', warnings(self.sized('128Mi', '1Gi'))[0][2])
+        # production's quota is twice dev's: the same app rolls out there
+        prod = {**big, 'metadata': {'name': 'demo', 'namespace': 'demo'}}
+        self.assertEqual([w[1] for w in warnings(big, prod=[prod])], ['deploy/dev: Deployment demo'])
+        # replicas: two 384Mi pods (25% unavailable of 2 rounds down to 0) and one new pod is 1152Mi
+        self.assertIn('1152Mi', warnings(self.sized('384Mi', '512Mi', replicas=2), app_yaml='services: {}\n')[0][2])
+        # a bigger maxSurge only needs one new pod to fit to make progress: 2 x 300Mi + 300Mi is 900Mi
+        self.assertEqual(warnings(self.sized('300Mi', '400Mi', replicas=2,
+                                             rolling={'maxSurge': 2, 'maxUnavailable': 0}),
+                                  app_yaml='services: {}\n'), [])
+        # maxUnavailable 1 (or 25% of 4 replicas) stops an old pod first: no extra room needed
+        self.assertEqual(warnings(self.sized('512Mi', '1Gi', rolling={'maxUnavailable': 1})), [])
+        self.assertEqual(warnings(self.sized('200Mi', '256Mi', replicas=4), app_yaml='services: {}\n'), [])
+        # both 0 resolves to 1 unavailable, as Kubernetes does
+        self.assertEqual(warnings(self.sized('512Mi', '1Gi', rolling={'maxSurge': 0, 'maxUnavailable': '0%'})), [])
+
     def test_a_prod_directory_without_its_kustomization_is_an_error(self):
         # CI renders deploy/prod whenever the directory exists: a patch alone fails there.
         with tempfile.TemporaryDirectory() as tmp:
