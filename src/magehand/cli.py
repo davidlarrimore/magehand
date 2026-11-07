@@ -6309,21 +6309,77 @@ ICON_SEE = 'recipes "Give the app its icon"'
 PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
 
 
+def png_size(data):
+    """(width, height) of a whole PNG, or None: IHDR first, every chunk complete with its CRC, image data, IEND."""
+    if data[:8] != PNG_MAGIC:
+        return None
+    pos, size, pixels = 8, None, False
+    while pos + 12 <= len(data):
+        length, kind = int.from_bytes(data[pos:pos + 4], 'big'), data[pos + 4:pos + 8]
+        end = pos + 12 + length
+        if end > len(data):
+            return None
+        body = data[pos + 8:end - 4]
+        if zlib.crc32(kind + body) & 0xffffffff != int.from_bytes(data[end - 4:end], 'big'):
+            return None
+        if size is None:
+            if kind != b'IHDR' or length != 13:
+                return None
+            size = struct.unpack('>II', body[:8])
+        elif kind == b'IDAT' and length:
+            pixels = True
+        elif kind == b'IEND':
+            return size if pixels and all(size) else None
+        pos = end
+    return None  # cut off before IEND
+
+
+def webp_size(data):
+    """(width, height) of a whole WebP, or None: the RIFF length matches, every chunk is complete, and the
+    image chunk (VP8, VP8L, or one after VP8X) holds more than its header."""
+    if len(data) < 20 or data[:4] != b'RIFF' or data[8:12] != b'WEBP':
+        return None
+    riff = int.from_bytes(data[4:8], 'little')
+    if riff < 12 or riff + 8 > len(data):
+        return None  # cut off
+    data, pos, chunks = data[:riff + 8], 12, []
+    while pos + 8 <= len(data):
+        kind, length = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], 'little')
+        if pos + 8 + length > len(data):
+            return None
+        chunks.append((kind, data[pos + 8:pos + 8 + length]))
+        pos += 8 + length + (length & 1)
+    if not chunks:
+        return None
+    image = next(((k, b) for k, b in chunks if k in (b'VP8 ', b'VP8L')), None)
+    if not image:
+        return None
+    kind, body = image
+    if kind == b'VP8 ' and len(body) > 10 and body[3:6] == b'\x9d\x01\x2a':
+        width, height = struct.unpack('<HH', body[6:10])
+        size = (width & 0x3fff, height & 0x3fff)
+    elif kind == b'VP8L' and len(body) > 5 and body[0] == 0x2f:
+        bits = int.from_bytes(body[1:5], 'little')
+        size = ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+    else:
+        return None
+    first, head = chunks[0]
+    if first == b'VP8X':  # the extended format's canvas is the image's size
+        if len(head) < 10:
+            return None
+        size = (int.from_bytes(head[4:7], 'little') + 1, int.from_bytes(head[7:10], 'little') + 1)
+    elif first != kind:
+        return None
+    return size if all(size) else None
+
+
 def image_size(data):
-    """('png' or 'webp', width, height) of image bytes, or None for anything else (SVG, JPEG, GIF, ...)."""
-    if data[:8] == PNG_MAGIC and len(data) >= 24 and data[12:16] == b'IHDR':
-        width, height = struct.unpack('>II', data[16:24])
-        return 'png', width, height
-    if len(data) >= 30 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
-        kind = data[12:16]
-        if kind == b'VP8 ' and data[23:26] == b'\x9d\x01\x2a':
-            width, height = struct.unpack('<HH', data[26:30])
-            return 'webp', width & 0x3fff, height & 0x3fff
-        if kind == b'VP8L' and data[20:21] == b'\x2f':
-            bits = int.from_bytes(data[21:25], 'little')
-            return 'webp', (bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1
-        if kind == b'VP8X':
-            return 'webp', int.from_bytes(data[24:27], 'little') + 1, int.from_bytes(data[27:30], 'little') + 1
+    """('png' or 'webp', width, height) of a whole, well-formed image, or None for anything else (SVG, JPEG,
+    GIF, a truncated download, a header without image data)."""
+    for kind, read in (('png', png_size), ('webp', webp_size)):
+        size = read(data)
+        if size:
+            return (kind,) + tuple(size)
     return None
 
 
@@ -6443,6 +6499,18 @@ def check_icon(app):
     return found
 
 
+def generated_icon_file(path):
+    """Whether the file at `path` is, for certain, an icon `icon generate` wrote: it reads as YAML and carries the
+    generated annotation. Anything unreadable counts as the app's own, so it is never replaced without --force."""
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return False
+    meta = doc.get('metadata') if isinstance(doc, dict) else None
+    notes = meta.get('annotations') if isinstance(meta, dict) else None
+    return isinstance(notes, dict) and str(notes.get(ICON_GENERATED)) == 'true'
+
+
 def cmd_icon(a):
     here = app_repo_here()
     if not here:
@@ -6466,9 +6534,9 @@ def cmd_icon(a):
             die(f'{a.file}: {problem}')
         kind, generated = image_size(raw)[0], False
     else:
-        if docs and not ((docs[0][1].get('metadata') or {}).get('annotations') or {}).get(ICON_GENERATED) \
-                and not a.force:
-            die(f"{ICON_PATH} is the app's own icon: keep it, or --force to replace it with a generated one")
+        if path.exists() and not a.force and not generated_icon_file(path):
+            die(f"{ICON_PATH} is the app's own icon (or can't be read as a generated one): keep it, or --force to "
+                'replace it with a generated one')
         raw, kind, generated = generated_icon(here), 'png', True
     kustomization = local / 'base' / 'kustomization.yaml'
     new = None
