@@ -11,6 +11,7 @@ import pathlib
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import time
 import unittest
 import urllib.error
 import urllib.parse
+import zlib
 import urllib.request
 from unittest import mock
 
@@ -2986,7 +2988,7 @@ class Scaffold(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             written = magehand.scaffold(root, 'demo', 'demo')
-            self.assertEqual(sorted(written), sorted(magehand.SCAFFOLD_FILES))
+            self.assertEqual(sorted(written), sorted(list(magehand.SCAFFOLD_FILES) + [magehand.ICON_PATH]))
             self.assertNotIn('app:', (root / 'deploy/app.yaml').read_text().split('services')[0].split('\n', 2)[-1])
             argv = ['check', 'demo', '--code', str(root), '--json']
             with mock.patch.object(magehand, 'github_file', lambda *a, **k: ''), \
@@ -5201,6 +5203,203 @@ SELECTED = ('apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: demo}\nspec
             '      containers:\n        - name: app\n          image: ghcr.io/davidlarrimore/homelab-apps/demo\n'
             '          env:\n            - {name: PORT, value: "8000"}\n'
             '            - name: KEY\n              valueFrom: {secretKeyRef: {name: ai-connection, key: api_key}}\n')
+
+
+class Icon(unittest.TestCase):
+    """`magehand icon set/generate`, the scaffold's icon and the icon rules of `check`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = deploy_repo(self.tmp.name, extra={
+            'deploy/base/kustomization.yaml': '# the base\nresources:\n  - deployment.yaml  # the app\n  - es.yaml\n'})
+        (self.root / 'deploy/base/deployment.yaml').write_text(SELECTED)
+        self.cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, self.cwd)
+        for p in (mock.patch.object(magehand, 'app_repo_here', lambda: 'demo'),
+                  mock.patch.object(magehand, 'app_here', lambda name=None: magehand.try_load_app('demo', self.root))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_main(self, *argv):
+        """(exit code, stdout, stderr with die()'s message, which is the SystemExit's code)."""
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                magehand.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else 1
+                if isinstance(exit_.code, str):
+                    err.write(exit_.code)
+        return code, out.getvalue(), err.getvalue()
+
+    def png(self, side=128, height=None):
+        return magehand.png_image(side, height or side, lambda x, y: (x % 256, y % 256, 90))
+
+    def findings(self):
+        return magehand.check_icon(magehand.try_load_app('demo', self.root))
+
+    def icon(self):
+        docs = magehand.icon_documents(self.root / 'deploy')
+        return magehand.icon_bytes(docs[0][1]) if docs else None
+
+    @staticmethod
+    def webp(*chunks):
+        """A RIFF WEBP file of (kind, body) chunks, each padded to an even length."""
+        body = b''.join(k + struct.pack('<I', len(b)) + b + b'\0' * (len(b) & 1) for k, b in chunks)
+        return b'RIFF' + struct.pack('<I', 4 + len(body)) + b'WEBP' + body
+
+    def test_image_sizes(self):
+        self.assertEqual(magehand.image_size(self.png(128)), ('png', 128, 128))
+        self.assertEqual(magehand.image_size(self.png(200, 100)), ('png', 200, 100))
+        lossy = (b'VP8 ', b'\0\0\0\x9d\x01\x2a' + struct.pack('<HH', 128, 96) + b'frame data')
+        self.assertEqual(magehand.image_size(self.webp(lossy)), ('webp', 128, 96))
+        bits = (128 - 1) | (128 - 1) << 14
+        lossless = (b'VP8L', b'\x2f' + bits.to_bytes(4, 'little') + b'pixels')
+        self.assertEqual(magehand.image_size(self.webp(lossless)), ('webp', 128, 128))
+        canvas = (b'VP8X', b'\x10\0\0\0' + (255).to_bytes(3, 'little') + (255).to_bytes(3, 'little'))
+        self.assertEqual(magehand.image_size(self.webp(canvas, (b'ALPH', b'alpha'), lossless)), ('webp', 256, 256))
+        for other in (b'<svg xmlns="http://www.w3.org/2000/svg"/>', b'\xff\xd8\xff\xe0JFIF', b'GIF89a', b''):
+            self.assertIsNone(magehand.image_size(other), other)
+
+    def animated(self, *frames):
+        """An animated WebP (VP8X, ANIM, one ANMF per frame body), 128 px canvas."""
+        canvas = (b'VP8X', b'\x02\0\0\0' + (127).to_bytes(3, 'little') * 2)
+        anmf = [(b'ANMF', (0).to_bytes(6, 'little') + (127).to_bytes(3, 'little') * 2 + (100).to_bytes(3, 'little')
+                 + b'\0' + frame) for frame in frames]
+        return self.webp(canvas, (b'ANIM', b'\0' * 6), *anmf)
+
+    def test_animated_webp(self):
+        bits = (128 - 1) | (128 - 1) << 14
+        lossless = b'VP8L' + struct.pack('<I', 11) + b'\x2f' + bits.to_bytes(4, 'little') + b'pixels' + b'\0'
+        self.assertEqual(magehand.image_size(self.animated(lossless, lossless)), ('webp', 128, 128))
+        self.assertIsNone(magehand.icon_problem(self.animated(lossless, lossless)))
+        header_only = b'VP8L' + struct.pack('<I', 5) + b'\x2f' + bits.to_bytes(4, 'little') + b'\0'
+        for name, data in (('a frame without its bitstream', self.animated(lossless, b'ALPH\x02\0\0\0ab')),
+                           ('a frame with only a header', self.animated(lossless, header_only)),
+                           ('a frame cut off', self.animated(lossless, lossless[:-4])),
+                           ('no frames', self.webp((b'VP8X', b'\x02\0\0\0' + (127).to_bytes(3, 'little') * 2),
+                                                  (b'ANIM', b'\0' * 6)))):
+            self.assertIsNone(magehand.image_size(data), name)
+
+    def test_truncated_or_empty_images_are_refused(self):
+        whole = self.png(128)
+        header_only = whole[:24]  # the signature and IHDR's dimensions, nothing after
+        no_iend = whole[:-12]
+        bad_crc = whole[:29] + bytes([whole[29] ^ 1]) + whole[30:]
+        no_idat = whole[:33] + whole[-12:]
+        for name, data in (('header only', header_only), ('cut before IEND', no_iend), ('cut mid-chunk', whole[:60]),
+                           ('bad IHDR CRC', bad_crc), ('no image data', no_idat)):
+            self.assertIsNone(magehand.image_size(data), name)
+            self.assertIn('not a PNG or WebP', magehand.icon_problem(data), name)
+        lossy = self.webp((b'VP8 ', b'\0\0\0\x9d\x01\x2a' + struct.pack('<HH', 128, 128) + b'frame data'))
+        bits = (128 - 1) | (128 - 1) << 14
+        for name, data in (('cut off', lossy[:-4]), ('header only', lossy[:30]),
+                           ('VP8 header without a frame', self.webp((b'VP8 ', b'\0\0\0\x9d\x01\x2a' + struct.pack('<HH', 128, 128)))),
+                           ('VP8L header without pixels', self.webp((b'VP8L', b'\x2f' + bits.to_bytes(4, 'little')))),
+                           ('VP8X without an image', self.webp((b'VP8X', b'\0' * 10)))):
+            self.assertIsNone(magehand.image_size(data), name)
+
+    def test_problems(self):
+        self.assertIsNone(magehand.icon_problem(self.png(128)))
+        self.assertIn('not a PNG or WebP', magehand.icon_problem(b'<svg/>'))
+        self.assertIn('square', magehand.icon_problem(self.png(128, 64)))
+        self.assertIn('64 to 512', magehand.icon_problem(self.png(32)))
+        noisy = magehand.png_image(512, 512, lambda x, y: tuple(magehand.hashlib.sha256(f'{x},{y}'.encode()).digest()[:3]))
+        self.assertIn('more than 48 KiB', magehand.icon_problem(noisy))
+
+    def test_generated_icons_differ_by_app_and_pass(self):
+        a, b = magehand.generated_icon('demo'), magehand.generated_icon('other')
+        self.assertEqual(a, magehand.generated_icon('demo'))
+        self.assertNotEqual(a, b)
+        for icon in (a, b):
+            self.assertEqual(magehand.image_size(icon), ('png', 128, 128))
+            self.assertIsNone(magehand.icon_problem(icon))
+        rows = zlib.decompress(a[33 + 8:-12 - 4])  # IHDR ends at 33; one IDAT: a filter byte + 128 RGB pixels a row
+        self.assertEqual(len(rows), 128 * (1 + 128 * 3))
+
+    def test_set_writes_the_configmap_and_lists_it(self):
+        art = self.root / 'art.png'
+        art.write_bytes(self.png())
+        code, out, err = self.run_main('icon', 'set', 'art.png')
+        self.assertEqual(code, 0, err)
+        self.assertIn('wrote deploy/base/app-icon.yaml: PNG 128 px', out)
+        self.assertIn('next: `magehand check`', out)
+        self.assertEqual(self.icon(), ('png', self.png(), None))
+        doc = magehand.yaml.safe_load((self.root / magehand.ICON_PATH).read_text())
+        self.assertEqual((doc['kind'], doc['metadata']['name']), ('ConfigMap', 'app-icon'))
+        self.assertNotIn('annotations', doc['metadata'])
+        self.assertEqual(magehand.kustomization_resources((self.root / 'deploy/base/kustomization.yaml').read_text()),
+                         ['deployment.yaml', 'es.yaml', 'app-icon.yaml'])
+        self.assertEqual(self.findings(), [])
+        code, out, _ = self.run_main('icon', 'set', 'art.png', '--json')  # again: replaced, listed once
+        self.assertEqual((code, json.loads(out)['kustomization']), (0, None))
+        self.assertEqual(magehand.kustomization_resources((self.root / 'deploy/base/kustomization.yaml').read_text()),
+                         ['deployment.yaml', 'es.yaml', 'app-icon.yaml'])
+
+    def test_set_refuses_what_the_platform_would_not_serve(self):
+        for name, data, why in (('a.svg', b'<svg xmlns="http://www.w3.org/2000/svg"/>', 'not a PNG or WebP'),
+                                ('wide.png', self.png(128, 64), 'square')):
+            (self.root / name).write_bytes(data)
+            code, _, err = self.run_main('icon', 'set', name)
+            self.assertEqual(code, 1)
+            self.assertIn(why, err)
+        code, _, err = self.run_main('icon', 'set', 'missing.png')
+        self.assertEqual(code, 1)
+        self.assertFalse((self.root / magehand.ICON_PATH).exists())
+
+    def test_generate_never_replaces_a_set_icon_without_force(self):
+        code, out, err = self.run_main('icon', 'generate')
+        self.assertEqual(code, 0, err)
+        self.assertIn('a generated PNG', out)
+        self.assertEqual(self.icon()[1], magehand.generated_icon('demo'))
+        self.assertEqual(self.findings(), [])
+        (self.root / 'art.png').write_bytes(self.png())
+        self.assertEqual(self.run_main('icon', 'set', 'art.png')[0], 0)
+        code, _, err = self.run_main('icon', 'generate')
+        self.assertEqual(code, 1)
+        self.assertIn("the app's own icon", err)
+        self.assertEqual(self.icon()[1], self.png())
+        self.assertEqual(self.run_main('icon', 'generate', '--force')[0], 0)
+        self.assertEqual(self.icon()[1], magehand.generated_icon('demo'))
+
+    def test_generate_never_replaces_an_unreadable_icon_without_force(self):
+        path = self.root / magehand.ICON_PATH
+        for broken in ('apiVersion: v1\nkind: ConfigMap\nmetadata: {name: app-icon\nbinaryData:\n  icon.png: abc\n',
+                       'metadata: [not, a, mapping]\n',
+                       f'metadata:\n  annotations: "{magehand.ICON_GENERATED}: true"\n'):
+            path.write_text(broken)
+            code, _, err = self.run_main('icon', 'generate')
+            self.assertEqual(code, 1, broken)
+            self.assertTrue("the app's own icon" in err or 'not valid YAML' in err, err)  # refused either way
+            self.assertEqual(path.read_text(), broken)
+        self.assertEqual(self.run_main('icon', 'generate', '--force')[0], 0)
+        self.assertEqual(self.icon()[1], magehand.generated_icon('demo'))
+        self.assertEqual(self.run_main('icon', 'generate')[0], 0)  # a generated one may be regenerated
+
+    def test_check_findings(self):
+        self.assertIn('no icon', self.findings()[0]['text'])
+        path = self.root / magehand.ICON_PATH
+        path.write_text(magehand.icon_manifest('png', self.png()))
+        self.assertIn('not in deploy/base/kustomization.yaml', self.findings()[0]['text'])
+        kustomization = self.root / 'deploy/base/kustomization.yaml'
+        kustomization.write_text(kustomization.read_text() + '  - app-icon.yaml\n')
+        self.assertEqual(self.findings(), [])
+        path.write_text(magehand.icon_manifest('png', self.png(128, 64)))
+        self.assertIn('square', self.findings()[0]['text'])
+        path.write_text(magehand.icon_manifest('png', self.png()).replace('icon.png', 'icon.webp'))
+        self.assertIn('is not a WEBP image', self.findings()[0]['text'])
+        path.write_text('apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-icon\ndata:\n  icon.png: x\n')
+        self.assertIn('under binaryData', self.findings()[0]['text'])
+        self.assertTrue(all(f['level'] == 'warning' and f['see'] == magehand.ICON_SEE for f in self.findings()))
+
+    def test_icon_needs_the_apps_checkout(self):
+        with mock.patch.object(magehand, 'app_repo_here', lambda: None):
+            code, _, err = self.run_main('icon', 'generate')
+        self.assertEqual(code, 1)
+        self.assertIn("inside the app's repo", err)
 
 
 class Jobs(unittest.TestCase):
