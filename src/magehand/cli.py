@@ -3619,7 +3619,7 @@ def check_rollout_room(where, overlay, docs, services):
                                      f'a rolling update needs {need}Mi of memory {kind} (its new pod beside the old '
                                      f'one, the rest of the app and its blocks), more than the {quota[i]}Mi {overlay} '
                                      f'quota: the new pod is refused and the old image keeps running. Lower the '
-                                     f'{kind}, or set spec.strategy.type: Recreate (one replica; about a minute of '
+                                     f'{kind}, or use spec.strategy.type: Recreate (one replica; about a minute of '
                                      f'downtime per deploy)', 'homelab-apps AGENTS.md "Storage and resources"'))
                 break
     return found
