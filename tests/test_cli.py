@@ -5264,6 +5264,26 @@ class Icon(unittest.TestCase):
         for other in (b'<svg xmlns="http://www.w3.org/2000/svg"/>', b'\xff\xd8\xff\xe0JFIF', b'GIF89a', b''):
             self.assertIsNone(magehand.image_size(other), other)
 
+    def animated(self, *frames):
+        """An animated WebP (VP8X, ANIM, one ANMF per frame body), 128 px canvas."""
+        canvas = (b'VP8X', b'\x02\0\0\0' + (127).to_bytes(3, 'little') * 2)
+        anmf = [(b'ANMF', (0).to_bytes(6, 'little') + (127).to_bytes(3, 'little') * 2 + (100).to_bytes(3, 'little')
+                 + b'\0' + frame) for frame in frames]
+        return self.webp(canvas, (b'ANIM', b'\0' * 6), *anmf)
+
+    def test_animated_webp(self):
+        bits = (128 - 1) | (128 - 1) << 14
+        lossless = b'VP8L' + struct.pack('<I', 11) + b'\x2f' + bits.to_bytes(4, 'little') + b'pixels' + b'\0'
+        self.assertEqual(magehand.image_size(self.animated(lossless, lossless)), ('webp', 128, 128))
+        self.assertIsNone(magehand.icon_problem(self.animated(lossless, lossless)))
+        header_only = b'VP8L' + struct.pack('<I', 5) + b'\x2f' + bits.to_bytes(4, 'little') + b'\0'
+        for name, data in (('a frame without its bitstream', self.animated(lossless, b'ALPH\x02\0\0\0ab')),
+                           ('a frame with only a header', self.animated(lossless, header_only)),
+                           ('a frame cut off', self.animated(lossless, lossless[:-4])),
+                           ('no frames', self.webp((b'VP8X', b'\x02\0\0\0' + (127).to_bytes(3, 'little') * 2),
+                                                  (b'ANIM', b'\0' * 6)))):
+            self.assertIsNone(magehand.image_size(data), name)
+
     def test_truncated_or_empty_images_are_refused(self):
         whole = self.png(128)
         header_only = whole[:24]  # the signature and IHDR's dimensions, nothing after

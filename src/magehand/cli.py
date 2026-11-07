@@ -6334,42 +6334,58 @@ def png_size(data):
     return None  # cut off before IEND
 
 
+def riff_chunks(data, pos, end):
+    """[(kind, body)] of the chunks in data[pos:end], or None when one is cut off."""
+    chunks = []
+    while pos + 8 <= end:
+        kind, length = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], 'little')
+        if pos + 8 + length > end:
+            return None
+        chunks.append((kind, data[pos + 8:pos + 8 + length]))
+        pos += 8 + length + (length & 1)
+    return chunks
+
+
+def webp_bitstream_size(kind, body):
+    """(width, height) of a VP8 or VP8L chunk that holds more than its header, else None."""
+    if kind == b'VP8 ' and len(body) > 10 and body[3:6] == b'\x9d\x01\x2a':
+        width, height = struct.unpack('<HH', body[6:10])
+        return width & 0x3fff, height & 0x3fff
+    if kind == b'VP8L' and len(body) > 5 and body[0] == 0x2f:
+        bits = int.from_bytes(body[1:5], 'little')
+        return (bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1
+    return None
+
+
 def webp_size(data):
-    """(width, height) of a whole WebP, or None: the RIFF length matches, every chunk is complete, and the
-    image chunk (VP8, VP8L, or one after VP8X) holds more than its header."""
+    """(width, height) of a whole WebP, or None: the RIFF length matches, every chunk is complete, and its image
+    data is there: the simple format's VP8 or VP8L chunk, or after VP8X (the extended format, whose canvas is the
+    size) a VP8/VP8L chunk or animation frames (ANMF), each with its own bitstream (libwebp's container spec)."""
     if len(data) < 20 or data[:4] != b'RIFF' or data[8:12] != b'WEBP':
         return None
     riff = int.from_bytes(data[4:8], 'little')
     if riff < 12 or riff + 8 > len(data):
         return None  # cut off
-    data, pos, chunks = data[:riff + 8], 12, []
-    while pos + 8 <= len(data):
-        kind, length = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], 'little')
-        if pos + 8 + length > len(data):
-            return None
-        chunks.append((kind, data[pos + 8:pos + 8 + length]))
-        pos += 8 + length + (length & 1)
+    chunks = riff_chunks(data, 12, riff + 8)
     if not chunks:
         return None
-    image = next(((k, b) for k, b in chunks if k in (b'VP8 ', b'VP8L')), None)
-    if not image:
-        return None
-    kind, body = image
-    if kind == b'VP8 ' and len(body) > 10 and body[3:6] == b'\x9d\x01\x2a':
-        width, height = struct.unpack('<HH', body[6:10])
-        size = (width & 0x3fff, height & 0x3fff)
-    elif kind == b'VP8L' and len(body) > 5 and body[0] == 0x2f:
-        bits = int.from_bytes(body[1:5], 'little')
-        size = ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
-    else:
-        return None
     first, head = chunks[0]
-    if first == b'VP8X':  # the extended format's canvas is the image's size
-        if len(head) < 10:
-            return None
-        size = (int.from_bytes(head[4:7], 'little') + 1, int.from_bytes(head[7:10], 'little') + 1)
-    elif first != kind:
+    if first in (b'VP8 ', b'VP8L'):
+        size = webp_bitstream_size(first, head)
+        return size if size and all(size) else None
+    if first != b'VP8X' or len(head) < 10:
         return None
+    bitstreams = [(k, b) for k, b in chunks if k in (b'VP8 ', b'VP8L')]
+    for kind, body in chunks:
+        if kind == b'ANMF':  # 16 bytes of frame header, then the frame's own chunks
+            frame = riff_chunks(body, 16, len(body)) if len(body) >= 16 else None
+            images = [(k, b) for k, b in frame or () if k in (b'VP8 ', b'VP8L')]
+            if not images:
+                return None
+            bitstreams += images
+    if not bitstreams or not all(webp_bitstream_size(k, b) for k, b in bitstreams):
+        return None
+    size = (int.from_bytes(head[4:7], 'little') + 1, int.from_bytes(head[7:10], 'little') + 1)
     return size if all(size) else None
 
 
