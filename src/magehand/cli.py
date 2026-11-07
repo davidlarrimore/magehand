@@ -3579,17 +3579,26 @@ def pod_memory_mi(pod):
                  for kind in ('requests', 'limits'))
 
 
-def surge_pods(spec, replicas):
-    """How many extra pods a Deployment's RollingUpdate starts (maxSurge, Kubernetes' default 25%, rounded up)."""
-    surge = str(((spec.get('strategy') or {}).get('rollingUpdate') or {}).get('maxSurge', '25%'))
-    if surge.endswith('%') and surge[:-1].isdigit():
-        return -(-replicas * int(surge[:-1]) // 100)
-    return int(surge) if surge.isdigit() else 1
+def rollout_pods(spec, replicas):
+    """(maxSurge, maxUnavailable) of a Deployment's RollingUpdate as pod counts, as Kubernetes resolves them: a
+    percentage of the replicas (default 25% each), surge rounded up and unavailable rounded down; both 0 means 1
+    unavailable."""
+    rolling = (spec.get('strategy') or {}).get('rollingUpdate') or {}
+    def resolve(key, round_up):
+        value = str(rolling.get(key, '25%'))
+        if value.endswith('%') and value[:-1].isdigit():
+            scaled = replicas * int(value[:-1])
+            return -(-scaled // 100) if round_up else scaled // 100
+        return int(value) if value.isdigit() else 1
+    surge, unavailable = resolve('maxSurge', True), resolve('maxUnavailable', False)
+    return surge, (1 if surge == 0 and unavailable == 0 else unavailable)
 
 
 def check_rollout_room(where, overlay, docs, services):
-    """A Deployment's default RollingUpdate starts its new pods beside the old ones, so the namespace quota must hold
-    both, with the blocks' pods. When it can't, the new pod is refused and the old image keeps running."""
+    """A RollingUpdate that may not stop an old pod first (maxUnavailable 0, the default for fewer than 4 replicas)
+    must start a new pod beside the old ones, so the namespace quota has to hold one more pod, with the blocks'.
+    When it can't, every new pod is refused and the old image keeps running. With maxUnavailable 1 or more the
+    controller frees room first, and a larger surge only slows it down, so neither warns."""
     quota = NAMESPACE_MEMORY_MI.get(overlay)
     if not quota:
         return []
@@ -3608,19 +3617,19 @@ def check_rollout_room(where, overlay, docs, services):
         for i in (0, 1):
             steady[i] += pod[i] * replicas
         if doc.get('kind') == 'Deployment' and (spec.get('strategy') or {}).get('type', 'RollingUpdate') == 'RollingUpdate':
-            extra = surge_pods(spec, replicas)
-            rolling.append(((doc.get('metadata') or {}).get('name', '?'), [m * extra for m in pod]))
+            if rollout_pods(spec, replicas)[1] == 0:
+                rolling.append(((doc.get('metadata') or {}).get('name', '?'), list(pod)))
     found = []
     for name, extra in rolling:
         for i, kind in enumerate(('requests', 'limits')):
             need = steady[i] + extra[i]
             if extra[i] and need > quota[i]:
                 found.append(finding('warning', f'{where}: Deployment {name}',
-                                     f'a rolling update needs {need}Mi of memory {kind} (its new pod beside the old '
-                                     f'one, the rest of the app and its blocks), more than the {quota[i]}Mi {overlay} '
+                                     f'a rolling update needs {need}Mi of memory {kind} (one new pod beside the old '
+                                     f'ones, the rest of the app and its blocks), more than the {quota[i]}Mi {overlay} '
                                      f'quota: the new pod is refused and the old image keeps running. Lower the '
-                                     f'{kind}, or use spec.strategy.type: Recreate (one replica; about a minute of '
-                                     f'downtime per deploy)', 'homelab-apps AGENTS.md "Storage and resources"'))
+                                     f'{kind}, allow the rollout to stop an old pod first (rollingUpdate.maxUnavailable: 1), '
+                                     f'or use spec.strategy.type: Recreate (about a minute of downtime per deploy)', 'homelab-apps AGENTS.md "Storage and resources"'))
                 break
     return found
 

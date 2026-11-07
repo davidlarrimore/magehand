@@ -1629,12 +1629,13 @@ class DeployDir(unittest.TestCase):
         self.assertIn('a public host needs', texts(self.rendered(good, prod=[public_bad]))[0])
 
     @staticmethod
-    def sized(request, limit, strategy=None, replicas=None):
-        """DEV_DEPLOYMENT with its `app` container's memory request and limit (and a strategy or replica count)."""
+    def sized(request, limit, strategy=None, replicas=None, rolling=None):
+        """DEV_DEPLOYMENT with its `app` container's memory request and limit (and a strategy, its rollingUpdate
+        settings or a replica count)."""
         spec = {'template': {'spec': {'containers': [
             {'name': 'app', 'resources': {'requests': {'memory': request}, 'limits': {'memory': limit}}}]}}}
-        if strategy:
-            spec['strategy'] = {'type': strategy}
+        if strategy or rolling:
+            spec['strategy'] = {'type': strategy or 'RollingUpdate', **({'rollingUpdate': rolling} if rolling else {})}
         if replicas is not None:
             spec['replicas'] = replicas
         return {**DeployDir.DEV_DEPLOYMENT, 'spec': spec}
@@ -1671,8 +1672,17 @@ class DeployDir(unittest.TestCase):
         # production's quota is twice dev's: the same app rolls out there
         prod = {**big, 'metadata': {'name': 'demo', 'namespace': 'demo'}}
         self.assertEqual([w[1] for w in warnings(big, prod=[prod])], ['deploy/dev: Deployment demo'])
-        # replicas: two 384Mi pods and a surge pod is 1152Mi
+        # replicas: two 384Mi pods (25% unavailable of 2 rounds down to 0) and one new pod is 1152Mi
         self.assertIn('1152Mi', warnings(self.sized('384Mi', '512Mi', replicas=2), app_yaml='services: {}\n')[0][2])
+        # a bigger maxSurge only needs one new pod to fit to make progress: 2 x 300Mi + 300Mi is 900Mi
+        self.assertEqual(warnings(self.sized('300Mi', '400Mi', replicas=2,
+                                             rolling={'maxSurge': 2, 'maxUnavailable': 0}),
+                                  app_yaml='services: {}\n'), [])
+        # maxUnavailable 1 (or 25% of 4 replicas) stops an old pod first: no extra room needed
+        self.assertEqual(warnings(self.sized('512Mi', '1Gi', rolling={'maxUnavailable': 1})), [])
+        self.assertEqual(warnings(self.sized('200Mi', '256Mi', replicas=4), app_yaml='services: {}\n'), [])
+        # both 0 resolves to 1 unavailable, as Kubernetes does
+        self.assertEqual(warnings(self.sized('512Mi', '1Gi', rolling={'maxSurge': 0, 'maxUnavailable': '0%'})), [])
 
     def test_a_prod_directory_without_its_kustomization_is_an_error(self):
         # CI renders deploy/prod whenever the directory exists: a patch alone fails there.
