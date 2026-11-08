@@ -2066,6 +2066,38 @@ class BucketAccess(unittest.TestCase):
         self.assertEqual(len(skipped), 2)
         self.assertTrue(all('bucket access not compared' in s and 'gh failed' in s for s in skipped), skipped)
 
+    def test_an_unreadable_copy_is_skipped_not_a_crash(self):
+        self.register('services:\n  files: {type: bucket}\n')
+        release = pathlib.Path(self.apps.name) / 'apps/demo/release/app.yaml'
+        release.parent.mkdir(parents=True)
+        release.write_bytes(b'\xff\xfe not utf-8')
+        found, skipped = magehand.check_bucket_access(self.app({'files': {'type': 'bucket'}}))
+        self.assertEqual(found, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn('bucket access not compared with production', skipped[0])
+        self.assertIn('UnicodeDecodeError', skipped[0])
+        with mock.patch.object(pathlib.Path, 'read_text', side_effect=PermissionError('denied')):
+            self.assertEqual(magehand.registration_lookup('demo'),
+                             (None, f'cannot read {pathlib.Path(self.apps.name) / "apps/demo/app.yaml"} '
+                                    '(PermissionError)'))
+
+    def test_strict_check_fails_on_an_unreadable_copy(self):
+        self.register('source: {repo: demo}\nservices:\n  files: {type: bucket}\n')
+        release = pathlib.Path(self.apps.name) / 'apps/demo/release/app.yaml'
+        release.parent.mkdir(parents=True)
+        release.write_bytes(b'\xff\xfe')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = git_checkout(deploy_repo(tmp, 'services:\n  files: {type: bucket}\n'),
+                                'git@github.com:davidlarrimore/demo.git')
+            args = ('check', 'demo', '--code', str(root), '--apps-dir', self.apps.name, '--manifests-only', '--json')
+            code, out, _ = CommandLine.run_main(self, *args)
+            self.assertTrue(any('bucket access not compared with production' in s
+                                for s in json.loads(out)['skipped']), out)
+            code, out, _ = CommandLine.run_main(self, *args, '--strict')
+        self.assertEqual(code, 1)
+        self.assertTrue(any(f['level'] == 'error' and 'bucket access not compared with production' in f['text']
+                            for f in json.loads(out)['findings']), out)
+
     def test_check_reports_it(self):
         self.register('source: {repo: demo}\nservices:\n  files: {type: bucket}\n')
         with tempfile.TemporaryDirectory() as tmp:
