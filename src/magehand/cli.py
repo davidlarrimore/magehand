@@ -2093,16 +2093,53 @@ FROM {python} AS base
 WORKDIR /app
 COPY app.py /app/app.py
 
-# The build runs this stage's tests before it builds the image (homelab-apps build-app.yaml).
+# Test-only tools (coverage.py, hash-locked), installed apart so the runtime image never has them.
+FROM {python} AS test-tools
+COPY requirements-test.txt /tmp/requirements-test.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: --target /test-tools \\
+    -r /tmp/requirements-test.txt
+
+# The build runs this stage's tests before it builds the image (homelab-apps build-app.yaml), under
+# coverage.py: its report is what the platform's quality check reads.
 FROM base AS test
+COPY --from=test-tools /test-tools /test-tools
+COPY .coveragerc /app/.coveragerc
 COPY tests/ /app/tests/
-RUN python -B -m unittest discover -s tests
+ENV PYTHONPATH=/test-tools
+RUN mkdir -p /coverage \\
+    && python -B -m coverage run -m unittest discover -s tests \\
+    && python -B -m coverage xml -o /coverage/python.xml \\
+    && python -B -m coverage report
+
+# The test stage's coverage report, for the platform's quality check (homelab-apps quality.yaml).
+FROM scratch AS coverage
+COPY --from=test /coverage/ /
 
 FROM base AS runtime
 USER 65532
 CMD ["python", "-B", "/app/app.py"]
 """,
     '.dockerignore': '.git\n.github\n.venv\n__pycache__\n**/__pycache__\n.env\n.env.*\n',
+    # coverage.py for the test stage: the wheels for the scaffold's Python on arm64 (the build) and amd64.
+    'requirements-test.txt': """\
+# Test-only tools (the Dockerfile's test stage; never in the runtime image), hash-locked.
+coverage==7.17.2 \\
+    --hash=sha256:df0a34d445eea64f3766e9ca2ff57bcde600a89c7c0330434a7a37e8d6e2549f \\
+    --hash=sha256:460ba2139866e758c3a8e9d9422fdc889942bcbc5ccaf710dc4fbd8707d14aa8
+""",
+    '.coveragerc': """\
+# coverage.py for the Dockerfile's test stage: paths relative to the repo root
+# so the platform's quality check (diff-cover) can match them to the PR.
+[run]
+branch = true
+relative_files = true
+source = .
+omit =
+    tests/*
+
+[report]
+skip_empty = true
+""",
     'app.py': '''\
 """{app}: a starting point written by `magehand new`. Replace it freely; keep /healthz (the pod's probes)."""
 import html
@@ -2306,7 +2343,7 @@ resources:
 }
 # Every app-name scalar above is quoted: true, null and 123 are valid app names, and not YAML strings bare.
 # The code files belong together: written only into a repo with no code of its own yet (another stack keeps its own).
-SCAFFOLD_CODE = ('Dockerfile', '.dockerignore', 'app.py', 'tests/test_app.py')
+SCAFFOLD_CODE = ('Dockerfile', '.dockerignore', 'requirements-test.txt', '.coveragerc', 'app.py', 'tests/test_app.py')
 OWN_CODE = ('Dockerfile', 'app.py', 'main.py', 'tests', 'src', 'package.json', 'pyproject.toml', 'requirements.txt',
             'go.mod', 'Cargo.toml', 'Gemfile', 'pom.xml')
 SCAFFOLD_BASE = tuple(f for f in SCAFFOLD_FILES if f.startswith('deploy/base/'))
@@ -4181,6 +4218,14 @@ def check_dockerfile(root):
     elif froms and froms[-1][0] in tests:
         found.append(finding('error', f'Dockerfile:{froms[-1][0]}', 'the test stage must come before the final '
                              '(runtime) stage', see))
+    covers = [n for n, words in froms if len(words) >= 4 and words[-2].upper() == 'AS' and words[-1].lower() == 'coverage']
+    if not covers:
+        found.append(finding('warning', 'Dockerfile', "add a stage `FROM scratch AS coverage` holding the test "
+                             "stages' coverage reports (*.xml from coverage.py, *.lcov): the platform's quality "
+                             'check reads them', QUALITY_SEE))
+    elif froms[-1][0] in covers:
+        found.append(finding('error', f'Dockerfile:{froms[-1][0]}', 'the coverage stage must come before the final '
+                             '(runtime) stage: the build ships the last stage as the app', QUALITY_SEE))
     for n, command in dockerfile_runs(text):
         for part in re.split(r'&&|\|\||;', command):  # one locked install doesn't excuse another
             for match, required, advice in LOCKED_INSTALLS:
@@ -4215,6 +4260,19 @@ def final_user(text):
     return stage[2] if stage else None
 
 
+QUALITY_SEE = 'homelab-apps docs/development/quality.md "Quality check"'
+
+
+def check_quality_job(root):
+    """The Build workflow calls the platform's quality check (homelab-app-template's `quality` job). Workflows
+    are owner-maintained, so this is a warning naming who fixes it."""
+    path = root / BUILD_WORKFLOW
+    if not path.is_file() or 'workflows/quality.yaml@' in path.read_text(errors='replace'):
+        return []
+    return [finding('warning', BUILD_WORKFLOW, "doesn't call the platform's quality check: ask the owner to add "
+                    "homelab-app-template's `quality` job (agents can't change workflows)", QUALITY_SEE)]
+
+
 def check_code(root, app, catalog=None):
     """Rules for the app's code (the repo checkout); `app` is None before it has a deployment."""
     found = []
@@ -4227,7 +4285,7 @@ def check_code(root, app, catalog=None):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
                                  'homelab-apps AGENTS.md "Apps with their own repo"'))
-    found += check_dockerfile(root) + check_dotenv(root, app)
+    found += check_dockerfile(root) + check_quality_job(root) + check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
         try:

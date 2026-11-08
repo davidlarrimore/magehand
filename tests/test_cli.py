@@ -1374,12 +1374,15 @@ class CheckManifests(unittest.TestCase):
             self.assertIn(part, errors)
 
 
-# A Dockerfile the build accepts: pinned bases, a test stage before the final one, locked installs, non-root.
+# A Dockerfile the build accepts: pinned bases, test and coverage stages before the final one, locked installs,
+# non-root.
 GOOD_DOCKERFILE = (f"FROM python:3.13-slim@sha256:{'a' * 64} AS base\n"
                    'COPY requirements.txt .\n'
                    'RUN pip install --no-cache-dir --require-hashes -r requirements.txt\n'
                    'FROM base AS test\n'
                    'RUN python -m unittest\n'
+                   'FROM scratch AS coverage\n'
+                   'COPY --from=test /coverage/ /\n'
                    'FROM base\n'
                    'USER 65532\n')
 
@@ -1406,18 +1409,44 @@ class CheckCode(unittest.TestCase):
             self.assertEqual(found(good), [])
             self.assertIn("base image 'python:3.13-slim' must be pinned", found(good.replace(f"@sha256:{'a' * 64}", ''))[0])
             self.assertEqual(found(good.replace('FROM python', 'FROM --platform=$BUILDPLATFORM python')), [])
-            self.assertEqual(found('FROM scratch AS test\nFROM scratch\nUSER 1\n'), [])
+            self.assertEqual(found('FROM scratch AS test\nFROM scratch AS coverage\nFROM scratch\nUSER 1\n'), [])
             self.assertIn('add a stage named test', found(good.replace(' AS test', ' AS checks'))[0])
             self.assertIn('must come before the final', found(good + 'FROM base AS test\n')[0])
             self.assertIn('needs USER', found(good.replace('USER 65532', 'USER root'))[0])
             self.assertIn('needs USER', found(good.replace('USER 65532', 'USER 0:0'))[0])
             self.assertIn('needs USER', found(good.replace('USER 65532\n', ''))[0])
             # The final stage's own user, not the last USER anywhere (a gap in CI's version of this rule).
-            self.assertIn('needs USER', found('FROM scratch AS test\nUSER 65532\nFROM scratch\n')[0])
+            self.assertIn('needs USER', found('FROM scratch AS test\nUSER 65532\nFROM scratch AS coverage\n'
+                                              'FROM scratch\n')[0])
             inherited = (f"FROM python@sha256:{'a' * 64} AS base\nUSER 65532\nFROM base AS test\n"
-                         'FROM base\n')
+                         'FROM scratch AS coverage\nFROM base\n')
             self.assertEqual(found(inherited), [])
             self.assertIn('needs USER', found(inherited.replace('USER 65532', 'USER 65532\nUSER root'))[0])
+
+    def test_coverage_stage_for_the_quality_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+
+            def found(text):
+                (root / 'Dockerfile').write_text(text)
+                return [(f['level'], f['text']) for f in magehand.check_dockerfile(root)]
+            without = found(GOOD_DOCKERFILE.replace('FROM scratch AS coverage\nCOPY --from=test /coverage/ /\n', ''))
+            self.assertEqual([level for level, _ in without], ['warning'])
+            self.assertIn('FROM scratch AS coverage', without[0][1])
+            # Last, it would be the image the build ships: an error.
+            last = found(GOOD_DOCKERFILE + 'FROM scratch AS coverage\n')
+            self.assertEqual(last[0][0], 'error')
+            self.assertIn('coverage stage must come before the final', last[0][1])
+
+    def test_build_workflow_calls_the_quality_check(self):
+        flow = 'jobs:\n  image:\n    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n'
+        quality = '  quality:\n    uses: davidlarrimore/homelab-apps/.github/workflows/quality.yaml@main\n'
+        texts = [f['text'] for f in self.run_check({'.github/workflows/build.yaml': flow}) if f['where'] ==
+                 '.github/workflows/build.yaml']
+        self.assertTrue(texts and "doesn't call the platform's quality check" in texts[0])
+        self.assertFalse([f for f in self.run_check({'.github/workflows/build.yaml': flow + quality})
+                          if f['where'] == '.github/workflows/build.yaml'])
+        self.assertFalse([f for f in self.run_check({}) if f['where'] == '.github/workflows/build.yaml'])
 
     def test_dependencies_only_from_a_lockfile(self):
         with tempfile.TemporaryDirectory() as tmp:
