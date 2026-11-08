@@ -1299,6 +1299,7 @@ def lifecycle_stages(repo, name):
         (state['bot'] == 'missing', f'{BOT} is not a collaborator, so its review can\'t be requested'),
         (state['bot'] == 'read', f'{BOT} can only read'),
         (state['ruleset'] == 'missing', f"no ruleset '{RULESET['name']}'"),
+        (state['checks'] == 'missing', f"no ruleset '{CHECKS_RULESET['name']}' (failing checks don't stop a merge)"),
         (state['private'] is False, 'it is public')) if bad]
     if state['archived']:
         repo_stage = {'state': 'unknown', 'text': 'archived (a retired app)'}
@@ -1311,14 +1312,18 @@ def lifecycle_stages(repo, name):
     elif state['ruleset'] == 'weak':
         repo_stage = {'state': 'failed', 'text': f"ruleset '{RULESET['name']}' would not pause a merge "
                       f"({state['ruleset_detail']})", 'next': "ask the owner to fix the ruleset in the repo's Settings > Rules"}
+    elif state['checks'] == 'weak':
+        repo_stage = {'state': 'failed', 'text': f"failing checks could still be merged ({state['checks_detail']})",
+                      'next': "ask the owner to fix the required checks in the repo's Settings > Rules"}
     elif state['bot'] == 'invited':
         repo_stage = {'state': 'pending', 'text': f'{BOT} is invited; OpenClaw accepts within about 5 minutes',
                       'next': 'wait, then `magehand pr ready N` on open PRs'}
-    elif None in (state['bot'], state['ruleset'], state['private']):
+    elif None in (state['bot'], state['ruleset'], state['checks'], state['private']):
         repo_stage = {'state': 'unknown', 'text': 'setup not fully readable from this account (the ruleset and '
                       'invitations need admin)'}
     else:
-        repo_stage = {'state': 'ok', 'text': f'set up: private, {BOT} can write, approval ruleset on main'}
+        repo_stage = {'state': 'ok', 'text': f'set up: private, {BOT} can write, main needs an approval and '
+                      'green checks'}
     spec, unregistered_why = registration_lookup(name)
     listings = {path: github_listing(repo, path) for path in (DEPLOY, f'{DEPLOY}/base', f'{DEPLOY}/dev')}
     unread = next((f'{path}: {why}' for path, (_, why) in listings.items() if why), None)
@@ -1857,6 +1862,22 @@ RULESET = {
 }
 
 
+# The checks every app PR must pass before it merges, from the template's .github/workflows/build.yaml: its
+# `security` and `image` jobs call homelab-apps' shared workflows, and `image / result` passes only when every
+# job of the image build did. The ruleset requiring them has no bypass (as homelab's own "main: checks must
+# pass"): the owner's bypass of the approval never skips CI.
+REQUIRED_CHECKS = ('security / scan', 'image / result')
+CHECKS_RULESET = {
+    'name': 'main: checks must pass', 'target': 'branch', 'enforcement': 'active',
+    'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH'], 'exclude': []}},
+    'rules': [{'type': 'deletion'}, {'type': 'non_fast_forward'},
+              {'type': 'required_status_checks', 'parameters': {
+                  'required_status_checks': [{'context': check} for check in REQUIRED_CHECKS],
+                  'strict_required_status_checks_policy': False, 'do_not_enforce_on_create': False}}],
+    'bypass_actors': [],
+}
+
+
 def ruleset_problems(ruleset):
     """Why a ruleset named like ours would not give the approval pause (a list, empty when it would): not
     active, or no approving review. Whether it applies to the default branch is asked of GitHub
@@ -1919,6 +1940,51 @@ def ruleset_status(repo):
     applied = [r for r in rules if r.get('ruleset_id') == listed[0]['id']]
     if not any(r.get('type') == 'pull_request' for r in applied):
         problems.append(f'it does not apply to the default branch ({branch})')
+    return ('weak', '; '.join(problems)) if problems else ('ok', '')
+
+
+def default_branch_rules(repo):
+    """(branch, rules, None) with the rules GitHub applies to the repo's default branch (any ruleset's, includes
+    and excludes resolved), or (None, None, reason) when they can't be read."""
+    code, out, err = gh_probe('api', f'repos/{repo}', '--jq', '.default_branch')
+    branch = out.strip()
+    if code != 0 or not branch:
+        return None, None, err or 'could not read the default branch'
+    rules, err = gh_json_pages(f'repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe="")}')
+    return (branch, rules, None) if rules is not None else (None, None, err)
+
+
+def checks_status(repo):
+    """(state, detail) of the checks a merge waits for: 'ok' when the default branch requires every
+    REQUIRED_CHECKS context through rulesets nobody can bypass, 'missing' when it requires none of them, 'weak'
+    (detail says why) otherwise, or None when it could not be read (detail has the reason). Any ruleset counts,
+    whatever its name: it is what GitHub enforces that matters."""
+    branch, rules, err = default_branch_rules(repo)
+    if rules is None:
+        return None, err
+    required = {}  # context -> the ruleset that requires it
+    for rule in rules:
+        if rule.get('type') == 'required_status_checks':
+            for check in (rule.get('parameters') or {}).get('required_status_checks') or []:
+                required.setdefault(check.get('context'), rule.get('ruleset_id'))
+    missing = [check for check in REQUIRED_CHECKS if check not in required]
+    if len(missing) == len(REQUIRED_CHECKS):
+        return 'missing', ''
+    problems = [f"{', '.join(missing)} not required on {branch}"] if missing else []
+    for ruleset_id in sorted({required[check] for check in REQUIRED_CHECKS if check in required}, key=str):
+        code, out, err = gh_probe('api', f'repos/{repo}/rulesets/{ruleset_id}')
+        if code != 0:
+            return None, err or 'gh api failed'
+        try:
+            ruleset = json.loads(out)
+        except ValueError:
+            return None, 'unreadable answer from GitHub'
+        # GitHub sends bypass_actors only to callers who can edit the ruleset: without it, a bypass can't be
+        # ruled out (unknown, as for the approval ruleset), never taken as an empty list.
+        if 'bypass_actors' not in ruleset:
+            return None, f"ruleset '{ruleset.get('name')}': its bypass list needs admin to read"
+        if ruleset['bypass_actors']:
+            problems.append(f"ruleset '{ruleset.get('name')}' lets someone merge past the checks (bypass list)")
     return ('weak', '; '.join(problems)) if problems else ('ok', '')
 
 
@@ -1986,6 +2052,30 @@ def ensure_ruleset(repo):
             return 'created'
     print(f"{repo}: could not add the ruleset '{RULESET['name']}' ({detail or 'gh api failed'}); "
           'PRs can merge without a review until it exists', file=sys.stderr)
+    return 'failed'
+
+
+def ensure_checks(repo):
+    """Make sure a merge waits for the required checks: 'exists', 'created', 'weak' or 'failed' (a warning, as
+    for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes one."""
+    state, detail = checks_status(repo)
+    name = CHECKS_RULESET['name']
+    if state == 'ok':
+        print(f"{repo}: the checks {' and '.join(REQUIRED_CHECKS)} are already required", file=sys.stderr)
+        return 'exists'
+    if state == 'weak':
+        print(f"{repo}: required checks are incomplete ({detail}); fix it in the repo's Settings > Rules "
+              "(magehand leaves an existing ruleset alone)", file=sys.stderr)
+        return 'weak'
+    if state == 'missing':
+        code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-',
+                                 stdin=json.dumps(CHECKS_RULESET))
+        if code == 0:
+            print(f"{repo}: ruleset '{name}' added (a PR merges only when {' and '.join(REQUIRED_CHECKS)} pass; "
+                  'nobody can bypass it)', file=sys.stderr)
+            return 'created'
+    print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
+          'checks until it exists', file=sys.stderr)
     return 'failed'
 
 
@@ -2390,6 +2480,7 @@ def cmd_new(a):
         print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
+    checks = ensure_checks(repo)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
     here = not a.dir and current_repo() == repo  # repairing the checkout you are in: no second copy inside it
     cloned = None if a.no_clone or here else clone_repo(repo, dest)
@@ -2432,18 +2523,18 @@ def cmd_new(a):
     if named == 'differs' and work:
         print(f'{work}: no scaffold written: deploy/app.yaml on main names another app', file=sys.stderr)
     steps = (new_steps(repo, name, app, dest, named, cloned, wrote) if created else
-             repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote))
+             repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote, checks))
     if pull:
         steps.insert(0, f'run:   git -C {shell_path(work)} pull   # new committed deploy/app.yaml (`app: {app}`) to main')
     if a.json:
         print(json.dumps({'repo': repo, 'app': app, 'created': created, 'private': private, 'bot': bot,
-                          'ruleset': ruleset, 'app_name': named, 'clone': cloned,
+                          'ruleset': ruleset, 'checks': checks, 'app_name': named, 'clone': cloned,
                           'dir': str(work or dest) if work or cloned in ('cloned', 'exists') else None, 'wrote': wrote,
                           'next': step_text(steps[0]) if steps else None}, indent=1))
     elif created:
         print(new_summary(repo, name, app, dest, named, cloned, wrote, steps))
     else:
-        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named, wrote, steps))
+        print(repair_summary(repo, private, bot, ruleset, cloned, dest, app, named, wrote, steps, checks))
     if unnamed:  # everything else is set up; a script must not carry on as if the app were named
         sys.exit(1)
 
@@ -2495,7 +2586,7 @@ def new_summary(repo, name, app, dest, named, cloned, wrote=(), steps=None):
     return '\n'.join(lines)
 
 
-def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=()):
+def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=(), checks=None):
     """The steps `new` on an existing repo leaves you: only what it could not do itself."""
     steps = []
     if named in ('failed', 'differs'):
@@ -2512,6 +2603,12 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     elif ruleset == 'failed':
         steps.append(f"do:    add the ruleset '{RULESET['name']}' (only an admin can): run `magehand new "
                      f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
+    if checks == 'weak':
+        steps.append(f"do:    require the checks {' and '.join(REQUIRED_CHECKS)} on main with no bypass in the repo's "
+                     'Settings > Rules (magehand leaves an existing ruleset alone)')
+    elif checks == 'failed':
+        steps.append(f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
+                     f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
     if cloned == 'failed':
         steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
     if wrote:
@@ -2519,12 +2616,14 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     return steps
 
 
-def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=(), steps=None):
+def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=(), steps=None,
+                   checks=None):
     """What `new` on an existing repo leaves for you (its changes went to stderr as it made them)."""
     if steps is None:
-        steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote)
+        steps = repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote, checks)
     if not steps:
-        return (f'{repo}: set up (private, {BOT} can write, the approval ruleset is on main); nothing left for you\n'
+        return (f'{repo}: set up (private, {BOT} can write, main needs an approval and green checks); nothing '
+                'left for you\n'
                 + next_line(None))
     return '\n'.join(['You:'] + [f'  {i}. {step}' for i, step in enumerate(steps, 1)]
                      + [next_line(step_text(steps[0]))])
@@ -3170,7 +3269,8 @@ def gh_probe(*args):
 
 
 def repo_state(repo):
-    """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'bot': 'write'|'read'|'invited'|'missing'|None,
+    """{'ruleset': 'ok'|'missing'|'weak'|None, 'ruleset_detail': str, 'checks' and 'checks_detail' (the same,
+    for the required checks), 'bot': 'write'|'read'|'invited'|'missing'|None,
     'private': True|False|None, 'archived': bool}: the repo's approval ruleset, whether OpenClaw's bot can write
     to it, and whether it is private (an archived repo, a retired app, is not checked further). None means unknown (no gh, no admin, rate limit, a server or network error), which is not
     the same as a confirmed 'missing' (HTTP 404)."""
@@ -3178,10 +3278,13 @@ def repo_state(repo):
     flags = out.split() if code == 0 else []
     private = {'true': True, 'false': False}.get(flags[0]) if flags else None
     if flags[1:2] == ['true']:  # archived: a retired app, nothing to check or repair
-        return {'ruleset': None, 'ruleset_detail': '', 'bot': None, 'private': private, 'archived': True}
+        return {'ruleset': None, 'ruleset_detail': '', 'checks': None, 'checks_detail': '', 'bot': None,
+                'private': private, 'archived': True}
     ruleset, detail = ruleset_status(repo)
+    checks, checks_detail = checks_status(repo)
     bot, _ = bot_access(repo)
-    return {'ruleset': ruleset, 'ruleset_detail': detail, 'bot': bot, 'private': private, 'archived': False}
+    return {'ruleset': ruleset, 'ruleset_detail': detail, 'checks': checks, 'checks_detail': checks_detail,
+            'bot': bot, 'private': private, 'archived': False}
 
 
 def cmd_doctor(a):
@@ -3254,6 +3357,10 @@ def cmd_doctor(a):
                  if bot == 'invited' else unread),
                 (f"{repo}: ruleset '{RULESET['name']}'", None if state['ruleset'] is None else state['ruleset'] == 'ok',
                  weak if state['ruleset'] == 'weak' else fix, unread),
+                (f"{repo}: merges wait for {' and '.join(REQUIRED_CHECKS)}",
+                 None if state['checks'] is None else state['checks'] == 'ok',
+                 f'{state["checks_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
+                 if state['checks'] == 'weak' else fix, unread),
                 (f'{repo}: private', state['private'],
                  f'app repos are private: gh repo edit {repo} --visibility private '
                  '--accept-visibility-change-consequences', unread)):
@@ -6832,7 +6939,8 @@ def build_parser():
     # start an app
     p = command('new', cmd_new, "create an app's repo for the platform, or repair one",
                 "create an app's private repo from homelab-app-template, invite OpenClaw's bot (write) and add\n"
-                "the approval ruleset 'main: owner approves'; on an existing repo, add whichever is missing",
+                "the rulesets 'main: owner approves' (an approval) and 'main: checks must pass' (green\n"
+                "security / scan and image / result, no bypass); on an existing repo, add whichever is missing",
                 'Uses gh as you (only the owner can create the repo).\n\n'
                 'Repair: run it again on a repo made without it (`magehand doctor` says when one is). It\n'
                 'invites a missing bot, gives a read-only one write, renews a pending invitation and adds a\n'
@@ -6877,7 +6985,8 @@ def build_parser():
                 "show where an app is: its repo's setup, deploy/ on main, registration, then its latest main "
                 "commit's build, dev deploy and prod release",
                 'One line per stage, each ok or saying what blocks it, then `next:`. First the lifecycle, from GitHub:\n'
-                "repo (private, OpenClaw's bot can write, the approval ruleset), config (deploy/ on main) and\n"
+                "repo (private, OpenClaw's bot can write, the approval and required-checks rulesets), config\n"
+                "(deploy/ on main) and\n"
                 "register (the platform registered it). Then main's build, dev deploy and prod, and, when kubectl has\n"
                 'a context, the dev pods and Argo application (read-only `kubectl get`; --no-cluster skips it).\n'
                 '--watch waits until the dev deploy (and, when readable, the pods) is done and nothing in the\n'
@@ -7113,8 +7222,9 @@ def build_parser():
     p = command('doctor', cmd_doctor, "check this machine, sign-in and this app repo's setup",
                 "check GitHub access, homelab reach, sign-in, the app repo's setup and the container runtime",
                 'In an app repo it also checks that OpenClaw\'s bot can write to it (a pending invitation is\n'
-                "a note), that it is private, and that the ruleset 'main: owner approves' is active on the\n"
-                'default branch. Each failure names its fix (`magehand new REPO` repairs the repo). What\n'
+                "a note), that it is private, that the ruleset 'main: owner approves' is active on the\n"
+                'default branch, and that merges wait for security / scan and image / result with no bypass.\n'
+                'Each failure names its fix (`magehand new REPO` repairs the repo). What\n'
                 'needs admin to read (the ruleset, invitations) is a note when unreadable, not a failure;\n'
                 'an archived repo is not checked. Run it at the start of a session. Exit 1 on a failure.\n\n'
                 'examples:\n  magehand doctor\n  magehand doctor --json')

@@ -2216,10 +2216,13 @@ class New(unittest.TestCase):
         self.calls = []
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
-    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None, invited=False):
-        """`existing` is the ruleset already on the repo (default: ours when `ruleset`); `collaborator` is True
-        (write), 'read' or False, and `invited` says an invitation for the bot is pending."""
+    def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None, invited=False,
+             checks=None):
+        """`existing` is the ruleset already on the repo (default: ours when `ruleset`); `checks` is the
+        required-checks ruleset on it (default: ours when `ruleset`); `collaborator` is True (write), 'read' or
+        False, and `invited` says an invitation for the bot is pending."""
         existing = existing if existing is not None else (dict(magehand.RULESET, id=7) if ruleset else None)
+        checks = checks if checks is not None else (dict(magehand.CHECKS_RULESET, id=8) if ruleset else None)
 
         def gh(*args, **kw):
             self.calls.append(args)
@@ -2228,11 +2231,15 @@ class New(unittest.TestCase):
                 return ruleset_status, json.dumps(listed), 'HTTP 403' if ruleset_status else ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets/7'):
                 return 0, json.dumps(existing), ''
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets/8'):
+                return 0, json.dumps(checks), ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis') and '.default_branch' in args:
                 return 0, 'main\n', ''
             if args[0] == 'api' and args[1].startswith('repos/davidlarrimore/elvis/rules/branches/main'):
                 covered = existing and existing.get('conditions', {}).get('ref_name', {}).get('include') == ['~DEFAULT_BRANCH']
-                return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}] if covered else []), ''
+                applied = [{'type': 'pull_request', 'ruleset_id': 7}] if covered else []
+                applied += [dict(rule, ruleset_id=8) for rule in (checks or {}).get('rules', [])]
+                return 0, json.dumps(applied), ''
             if args[:3] == ('api', '-X', 'POST'):
                 return ruleset_status, '', 'HTTP 403' if ruleset_status else ''
             if args[:2] == ('api', 'repos/davidlarrimore/elvis'):
@@ -2272,7 +2279,7 @@ class New(unittest.TestCase):
                           (dict(magehand.RULESET, id=7, conditions={'ref_name': {'include': ['refs/heads/x']}}), 'default branch'),
                           (dict(magehand.RULESET, id=7, rules=[]), 'approving review')):
             self.calls.clear()
-            self.fake(exists='true', collaborator=True, existing=weak)
+            self.fake(exists='true', collaborator=True, existing=weak, checks=dict(magehand.CHECKS_RULESET, id=8))
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.run_new('elvis')
@@ -2288,6 +2295,31 @@ class New(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.run_new('elvis')
         self.assertIn('without a review', err.getvalue())
+
+    def test_adds_the_required_checks_ruleset_with_no_bypass(self):
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
+        self.run_new('elvis')
+        posted = [c for c in self.calls if c[:3] == ('api', '-X', 'POST')]
+        self.assertEqual(posted, [('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-')])
+        self.assertEqual(magehand.CHECKS_RULESET['bypass_actors'], [])
+        rule = next(r for r in magehand.CHECKS_RULESET['rules'] if r['type'] == 'required_status_checks')
+        self.assertEqual([c['context'] for c in rule['parameters']['required_status_checks']],
+                         ['security / scan', 'image / result'])
+
+    def test_checks_a_merge_could_skip_are_reported_not_changed(self):
+        import contextlib
+        import io
+        bypass = dict(magehand.CHECKS_RULESET, id=8, bypass_actors=magehand.RULESET['bypass_actors'])
+        one = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
+            'required_status_checks': [{'context': 'security / scan'}]}}])
+        for weak, why in ((bypass, 'bypass'), (one, 'image / result not required')):
+            self.calls.clear()
+            self.fake(exists='true', collaborator=True, ruleset=True, checks=weak)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.run_new('elvis')
+            self.assertIn(why, err.getvalue())
+            self.assertFalse([c for c in self.calls if '-X' in c], why)
 
     def test_ruleset_matches_homelabs_approval_rule(self):
         rule = magehand.RULESET['rules'][0]['parameters']
@@ -2904,8 +2936,45 @@ class RepoConformance(unittest.TestCase):
         ok = self.with_gh(self.answers())
         self.assertEqual((ok['ruleset'], ok['bot'], ok['private']), ('ok', 'write', True))
         gone = (1, '', 'gh: Not Found (HTTP 404)')
-        none = self.with_gh({'/rulesets': (0, '[]', ''), BOT_PATH: gone, '': (0, 'false\n', '')})
-        self.assertEqual((none['ruleset'], none['bot'], none['private']), ('missing', 'missing', False))
+        none = self.with_gh({'/rulesets': (0, '[]', ''), '/rules/branches/main': (0, '[]', ''), BOT_PATH: gone,
+                             '': lambda args: (0, 'main\n' if '.default_branch' in args else 'false\n', '')})
+        self.assertEqual((none['ruleset'], none['checks'], none['bot'], none['private']),
+                         ('missing', 'missing', 'missing', False))
+
+    def test_merges_wait_for_the_required_checks(self):
+        def required(*contexts, ruleset_id=8):
+            return {'type': 'required_status_checks', 'ruleset_id': ruleset_id,
+                    'parameters': {'required_status_checks': [{'context': c} for c in contexts]}}
+        both = [{'type': 'pull_request', 'ruleset_id': 7}, required('security / scan', 'image / result')]
+        theirs = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8)), '')
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': theirs}))
+        self.assertEqual((state['checks'], state['checks_detail']), ('ok', ''))
+        # Any ruleset's rule counts, split over two rulesets too.
+        split = [required('security / scan', ruleset_id=8), required('image / result', ruleset_id=9)]
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(split), '')),
+                                  **{'/rulesets/8': theirs, '/rulesets/9': theirs}))
+        self.assertEqual(state['checks'], 'ok')
+        # One of the two: weak, saying which.
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps([required('security / scan')]), '')),
+                                  **{'/rulesets/8': theirs}))
+        self.assertEqual(state['checks'], 'weak')
+        self.assertIn('image / result not required on main', state['checks_detail'])
+        # A bypass list lets the owner merge red: weak.
+        bypass = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8, bypass_actors=[{'actor_id': 5}])), '')
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': bypass}))
+        self.assertEqual(state['checks'], 'weak')
+        self.assertIn('bypass', state['checks_detail'])
+        # A caller who can't edit the ruleset gets no bypass_actors at all: unknown, not ok (an empty list is ok).
+        hidden = dict(magehand.CHECKS_RULESET, id=8)
+        del hidden['bypass_actors']
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')),
+                                  **{'/rulesets/8': (0, json.dumps(hidden), '')}))
+        self.assertIsNone(state['checks'])
+        self.assertIn('needs admin', state['checks_detail'])
+        # Another check required, not ours: missing. Unreadable rules: unknown.
+        state = self.with_gh(self.answers(applied=(0, json.dumps([required('build')]), '')))
+        self.assertEqual(state['checks'], 'missing')
+        self.assertIsNone(self.with_gh(self.answers(applied=(1, '', 'HTTP 502')))['checks'])
 
     def test_an_archived_repo_is_not_checked(self):
         state = self.with_gh({'': (0, 'true\ntrue\n', '')})  # any other call would raise
@@ -3009,7 +3078,7 @@ class RepoConformance(unittest.TestCase):
                 setattr(magehand, n, f)
             magehand.urllib.request.urlopen = saved_urlopen
         report = json.loads(out.getvalue())
-        self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None, None, None])
+        self.assertEqual([c['ok'] for c in report['checks'] if 'elvis' in c['check']], [None] * 4)
         self.assertEqual(len(calls), 1)  # only the (mocked, failing) OpenBao health probe was attempted
 
 
@@ -3229,8 +3298,11 @@ class Scaffold(unittest.TestCase):
                 return 0, json.dumps(dict(magehand.RULESET, id=7)), ''
             if args[:2] == ('api', f'repos/davidlarrimore/{name}') and '.default_branch' in args:
                 return 0, 'main\n', ''
+            if args[:2] == ('api', f'repos/davidlarrimore/{name}/rulesets/8'):
+                return 0, json.dumps(dict(magehand.CHECKS_RULESET, id=8)), ''
             if args[0] == 'api' and args[1].startswith(f'repos/davidlarrimore/{name}/rules/branches/main'):
-                return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]), ''
+                return 0, json.dumps([{'type': 'pull_request', 'ruleset_id': 7}]
+                                     + [dict(r, ruleset_id=8) for r in magehand.CHECKS_RULESET['rules']]), ''
             return 0, '', ''
         return gh
 
@@ -4838,7 +4910,8 @@ class Status(unittest.TestCase):
 
     def lifecycle(self, repo=None, files=('app.yaml', 'base', 'dev'), registered=True, unreadable=None):
         """REAL_LIFECYCLE for demo, with its repo's setup, the deploy/ files on main and registration given."""
-        state = dict({'bot': 'write', 'ruleset': 'ok', 'ruleset_detail': '', 'private': True, 'archived': False},
+        state = dict({'bot': 'write', 'ruleset': 'ok', 'ruleset_detail': '', 'checks': 'ok', 'checks_detail': '',
+                      'private': True, 'archived': False},
                      **(repo or {}))
         main = {'deploy': ['app.yaml'] if 'app.yaml' in files else [],
                 'deploy/base': ['deployment.yaml'] if 'base' in files else [],
@@ -4866,6 +4939,13 @@ class Status(unittest.TestCase):
         weak = self.lifecycle({'ruleset': 'weak', 'ruleset_detail': "enforcement is 'disabled'"})['repo']
         self.assertEqual((weak['state'], weak['next']), ('failed', "ask the owner to fix the ruleset in the repo's Settings > Rules"))
         self.assertEqual(self.lifecycle({'bot': 'invited'})['repo']['state'], 'pending')
+        unchecked = self.lifecycle({'checks': 'missing'})['repo']
+        self.assertEqual(unchecked['state'], 'failed')
+        self.assertIn("failing checks don't stop a merge", unchecked['text'])
+        bypass = self.lifecycle({'checks': 'weak', 'checks_detail': 'bypass list'})['repo']
+        self.assertEqual((bypass['state'], bypass['next']),
+                         ('failed', "ask the owner to fix the required checks in the repo's Settings > Rules"))
+        self.assertEqual(self.lifecycle({'checks': None})['repo']['state'], 'unknown')
         # OpenClaw's bot can't read the ruleset: unknown, never failed
         self.assertEqual(self.lifecycle({'ruleset': None})['repo']['state'], 'unknown')
         self.assertEqual(self.lifecycle({'archived': True, 'bot': None})['repo']['state'], 'unknown')
