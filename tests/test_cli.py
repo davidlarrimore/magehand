@@ -1993,6 +1993,92 @@ class AppNameOverride(unittest.TestCase):
         self.assertTrue(any('registered as the app lab' in e and 'restore `app: lab`' in e for e in errors), errors)
 
 
+class BucketAccess(unittest.TestCase):
+    """A bucket's access can't change in place: deploy/app.yaml against homelab-apps' dev and release copies."""
+
+    def setUp(self):
+        self.saved = magehand.APPS_DIR
+        self.apps = tempfile.TemporaryDirectory()
+        magehand.APPS_DIR = self.apps.name
+        self.addCleanup(setattr, magehand, 'APPS_DIR', self.saved)
+        self.addCleanup(self.apps.cleanup)
+
+    def register(self, text, path='apps/demo/app.yaml'):
+        f = pathlib.Path(self.apps.name) / path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+
+    @staticmethod
+    def app(services, where='deploy'):
+        return {'name': 'demo', 'where': where, 'services': services}
+
+    def test_a_changed_access_is_an_error(self):
+        self.register('services:\n  files: {type: bucket, access: private}\n')
+        found, skipped = magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'public'}}))
+        errors = texts(found, 'error')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('block files: access is private in dev', errors[0])
+        self.assertIn('add a new service under another name with access: public', errors[0])
+        self.assertIn('magehand bucket sync', errors[0])
+        self.assertEqual(skipped, [])
+
+    def test_the_default_private_counts_on_both_sides(self):
+        self.register('services:\n  files: {type: bucket}\n')
+        self.assertEqual(magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'private'}})),
+                         ([], []))
+        self.register('services:\n  files: {type: bucket, access: private}\n')
+        self.assertEqual(magehand.check_bucket_access(self.app({'files': {'type': 'bucket'}})), ([], []))
+        found, _ = magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'internal'}}))
+        self.assertIn('access is private in dev', texts(found, 'error')[0])
+
+    def test_a_new_service_the_same_access_or_an_unregistered_app_pass(self):
+        self.assertEqual(magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'public'}})),
+                         ([], []))                                       # not registered yet
+        self.register('services:\n  files: {type: bucket, access: public}\n  db: {type: postgres}\n')
+        services = {'files': {'type': 'bucket', 'access': 'public'}, 'site': {'type': 'bucket', 'access': 'internal'}}
+        self.assertEqual(magehand.check_bucket_access(self.app(services)), ([], []))
+
+    def test_a_service_that_was_another_type_is_not_compared(self):
+        self.register('services:\n  files: {type: postgres}\n')
+        self.assertEqual(magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'public'}})),
+                         ([], []))
+
+    def test_production_is_compared_too(self):
+        self.register('services:\n  files: {type: bucket, access: public}\n')
+        self.register('services:\n  files: {type: bucket}\n', 'apps/demo/release/app.yaml')
+        found, _ = magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'public'}}))
+        errors = texts(found, 'error')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('access is private in production', errors[0])
+
+    def test_only_a_checkouts_deploy_and_only_buckets(self):
+        self.register('services:\n  files: {type: bucket}\n')
+        self.assertEqual(magehand.check_bucket_access(self.app({'files': {'type': 'bucket', 'access': 'public'}},
+                                                               where='homelab-apps apps/demo')), ([], []))
+        self.assertEqual(magehand.check_bucket_access(None), ([], []))
+        with mock.patch.object(magehand, 'registration_lookup', side_effect=AssertionError('read')):
+            self.assertEqual(magehand.check_bucket_access(self.app({'db': {'type': 'postgres'}})), ([], []))
+
+    def test_unreadable_main_is_skipped_with_a_note(self):
+        with mock.patch.object(magehand, 'registration_lookup', lambda name, path=None: (None, 'gh failed')):
+            found, skipped = magehand.check_bucket_access(self.app({'files': {'type': 'bucket'}}))
+        self.assertEqual(found, [])
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(all('bucket access not compared' in s and 'gh failed' in s for s in skipped), skipped)
+
+    def test_check_reports_it(self):
+        self.register('source: {repo: demo}\nservices:\n  files: {type: bucket}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = git_checkout(deploy_repo(tmp, 'services:\n  files: {type: bucket, access: public}\n'),
+                                'git@github.com:davidlarrimore/demo.git')
+            code, out, _ = CommandLine.run_main(self, 'check', 'demo', '--code', str(root), '--apps-dir',
+                                                self.apps.name, '--manifests-only', '--json')
+        result = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertTrue(any(f['level'] == 'error' and 'access is private in dev' in f['text']
+                            for f in result['findings']), result['findings'])
+
+
 class ModelRule(unittest.TestCase):
     def run_check(self, code, services):
         with tempfile.TemporaryDirectory() as tmp:

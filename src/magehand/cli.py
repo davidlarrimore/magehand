@@ -187,17 +187,19 @@ def github_listing(repo, path, ref='main'):
     return (sorted(item['name'] for item in got if isinstance(item, dict)), None) if isinstance(got, list) else ([], None)
 
 
-def registration_lookup(name):
-    """(spec, None) of the app's homelab-apps apps/<name>/app.yaml on main; (None, None) when it isn't registered
-    (HTTP 404); (None, why) when it couldn't be read. registration() exits on that, which status can't afford."""
+def registration_lookup(name, path=None):
+    """(spec, None) of the app's homelab-apps apps/<name>/app.yaml on main (or `path` there, such as its
+    release/app.yaml); (None, None) when it doesn't exist (HTTP 404); (None, why) when it couldn't be read.
+    registration() exits on that, which status and check's skippable rules can't afford."""
+    path = path or f'apps/{name}/app.yaml'
     if APPS_DIR:
-        local = pathlib.Path(APPS_DIR) / 'apps' / name / 'app.yaml'
+        local = pathlib.Path(APPS_DIR) / path
         if not local.is_file():
             return None, None
         out = local.read_text()
     else:
         code, out, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
-                                  f'repos/{APPS_REPO}/contents/apps/{name}/app.yaml')
+                                  f'repos/{APPS_REPO}/contents/{path}')
         if code != 0:
             if code is None or 'HTTP 404' not in err:
                 return None, err or 'gh failed'
@@ -207,8 +209,8 @@ def registration_lookup(name):
     try:
         spec = yaml.safe_load(out) or {}
     except yaml.YAMLError:
-        return None, f'apps/{name}/app.yaml is not valid YAML'
-    return (spec, None) if isinstance(spec, dict) else (None, f'apps/{name}/app.yaml is not a mapping')
+        return None, f'{path} is not valid YAML'
+    return (spec, None) if isinstance(spec, dict) else (None, f'{path} is not a mapping')
 
 
 # --- The app ------------------------------------------------------------------
@@ -3486,6 +3488,44 @@ def check_manifests(app, catalog):
     return found + env_findings(app, container, deployment_file, catalog)
 
 
+def bucket_access(svc):
+    """A bucket block's `access`, with the platform's default."""
+    return str((svc or {}).get('access') or 'private')
+
+
+def check_bucket_access(app):
+    """A checkout's deploy/app.yaml against what the platform already made: a bucket's `access` decides where
+    its data lives, so the bucket broker refuses to change it on an existing bucket (the app would keep the old
+    bucket while its code expects the new kind). Compared with homelab-apps apps/<app>/app.yaml (dev) and
+    release/app.yaml (production). (findings, skipped)."""
+    found, skipped = [], []
+    if not app or app.get('where') != DEPLOY:
+        return found, skipped
+    buckets = {name: bucket_access(svc) for name, svc in app['services'].items()
+               if isinstance(svc, dict) and svc.get('type') == 'bucket'}
+    if not buckets:
+        return found, skipped
+    for env, path in (('dev', f"apps/{app['name']}/app.yaml"), ('production', f"apps/{app['name']}/release/app.yaml")):
+        spec, why = registration_lookup(app['name'], path)
+        if why:
+            skipped.append(f'{DEPLOY}/app.yaml: bucket access not compared with {env} (cannot read homelab-apps '
+                           f'{path}: {why}); CI compares it')
+            continue
+        services = (spec or {}).get('services') or {}
+        if not isinstance(services, dict):
+            continue
+        for name, access in sorted(buckets.items()):
+            old = services.get(name)
+            if not isinstance(old, dict) or old.get('type') != 'bucket' or bucket_access(old) == access:
+                continue
+            found.append(finding('error', f'{DEPLOY}/app.yaml', f'block {name}: access is {bucket_access(old)} in '
+                                 f'{env} and can\'t change on an existing bucket (the platform refuses it, and the app '
+                                 f'would keep the {bucket_access(old)} bucket): add a new service under another name '
+                                 f'with access: {access}, copy the data (`magehand bucket sync`), then remove {name}',
+                                 'blocks "Object storage"'))
+    return found, skipped
+
+
 def env_findings(app, container, deployment_file, catalog):
     """Rules for a container's env (the Deployment's, or a CronJob's): each Secret it maps is a block's or the
     app's own, a block key exists with the block's options, and nothing is optional or bulk-mapped."""
@@ -4593,6 +4633,8 @@ def cmd_check(a):
                            else seeded_name_findings(name, root)) + check_deploy_files(root, name)
     rendered, skipped = check_rendered(root, name)
     found += rendered
+    access, missed = check_bucket_access(app)
+    found, skipped = found + access, skipped + missed
     # CI must check everything a merge deploys: there a render that was skipped is a failure, and with --strict
     # (CI, once it installs kyverno and kubeconform) so is any rule that couldn't run.
     hard = skipped if a.strict else [s for s in skipped if ': not rendered (' in s] if os.environ.get('CI') else []
