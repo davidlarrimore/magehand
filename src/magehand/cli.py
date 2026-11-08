@@ -196,7 +196,10 @@ def registration_lookup(name, path=None):
         local = pathlib.Path(APPS_DIR) / path
         if not local.is_file():
             return None, None
-        out = local.read_text()
+        try:
+            out = local.read_text()
+        except (OSError, UnicodeDecodeError) as error:
+            return None, f'cannot read {local} ({error.__class__.__name__})'
     else:
         code, out, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
                                   f'repos/{APPS_REPO}/contents/{path}')
