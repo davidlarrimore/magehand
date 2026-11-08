@@ -1979,7 +1979,11 @@ def checks_status(repo):
             ruleset = json.loads(out)
         except ValueError:
             return None, 'unreadable answer from GitHub'
-        if ruleset.get('bypass_actors'):
+        # GitHub sends bypass_actors only to callers who can edit the ruleset: without it, a bypass can't be
+        # ruled out (unknown, as for the approval ruleset), never taken as an empty list.
+        if 'bypass_actors' not in ruleset:
+            return None, f"ruleset '{ruleset.get('name')}': its bypass list needs admin to read"
+        if ruleset['bypass_actors']:
             problems.append(f"ruleset '{ruleset.get('name')}' lets someone merge past the checks (bypass list)")
     return ('weak', '; '.join(problems)) if problems else ('ok', '')
 

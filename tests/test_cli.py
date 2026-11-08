@@ -2964,6 +2964,13 @@ class RepoConformance(unittest.TestCase):
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': bypass}))
         self.assertEqual(state['checks'], 'weak')
         self.assertIn('bypass', state['checks_detail'])
+        # A caller who can't edit the ruleset gets no bypass_actors at all: unknown, not ok (an empty list is ok).
+        hidden = dict(magehand.CHECKS_RULESET, id=8)
+        del hidden['bypass_actors']
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')),
+                                  **{'/rulesets/8': (0, json.dumps(hidden), '')}))
+        self.assertIsNone(state['checks'])
+        self.assertIn('needs admin', state['checks_detail'])
         # Another check required, not ours: missing. Unreadable rules: unknown.
         state = self.with_gh(self.answers(applied=(0, json.dumps([required('build')]), '')))
         self.assertEqual(state['checks'], 'missing')
