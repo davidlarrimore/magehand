@@ -1387,6 +1387,74 @@ GOOD_DOCKERFILE = (f"FROM python:3.13-slim@sha256:{'a' * 64} AS base\n"
                    'USER 65532\n')
 
 
+class AppMetricsChecks(unittest.TestCase):
+    """The metrics opt-in on rendered manifests, and identity-like metric label names in code."""
+
+    @staticmethod
+    def deploy(labels=None, ports=(('http', 8000), ('metrics', 9100)), kind='Deployment'):
+        template = {'metadata': {'labels': {'app': 'demo', **(labels or {})}},
+                    'spec': {'containers': [{'name': 'app', 'ports': [{'name': n, 'containerPort': c} for n, c in ports]}]}}
+        if kind == 'CronJob':
+            return {'kind': kind, 'metadata': {'name': 'job'}, 'spec': {'jobTemplate': {'spec': {'template': template}}}}
+        return {'kind': kind, 'metadata': {'name': 'demo'}, 'spec': {'template': template}}
+
+    @staticmethod
+    def service(target, name='http', port=80, selector=None):
+        return {'kind': 'Service', 'metadata': {'name': 'demo'},
+                'spec': {'selector': selector or {'app': 'demo'}, 'ports': [{'name': name, 'port': port, 'targetPort': target}]}}
+
+    def found(self, docs):
+        return [(f['level'], f['text']) for f in magehand.check_metrics_exposure('deploy/dev', docs)]
+
+    def test_opted_in_with_its_port_and_an_internal_service_is_clean(self):
+        on = {magehand.METRICS_LABEL: 'true'}
+        self.assertEqual(self.found([self.deploy(on), self.service('http')]), [])
+        self.assertEqual(self.found([self.deploy(on), self.service(8000)]), [])
+        self.assertEqual(self.found([self.deploy(on, kind='CronJob')]), [])
+
+    def test_label_without_true_or_without_the_port(self):
+        for labels, ports in (({magehand.METRICS_LABEL: 'yes'}, (('metrics', 9100),)),
+                              ({magehand.METRICS_LABEL: 'true'}, (('http', 8000),))):
+            levels = [lvl for lvl, text in self.found([self.deploy(labels, ports)]) if 'needs the value "true"' in text]
+            self.assertEqual(levels, ['error'], (labels, ports))
+
+    def test_a_metrics_port_without_the_label_is_a_warning(self):
+        found = self.found([self.deploy()])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][0], 'warning')
+        self.assertIn('nothing collects those metrics', found[0][1])
+
+    def test_a_service_may_not_reach_the_metrics_port(self):
+        on = {magehand.METRICS_LABEL: 'true'}
+        for svc in (self.service(9100), self.service('metrics'), self.service(9100, name='metrics', port=9100)):
+            errors = [t for lvl, t in self.found([self.deploy(on), svc]) if lvl == 'error']
+            self.assertEqual(len(errors), 1, svc)
+            self.assertIn('reaches the metrics port', errors[0])
+        # a Service of other pods may use that number
+        self.assertEqual(self.found([self.deploy(on), self.service(9100, selector={'app': 'other'})]), [])
+
+    def test_identity_like_metric_labels_warn(self):
+        py = ("from prometheus_client import Counter\n"
+              "CALLS = Counter('nlp_llm_calls_total', 'calls', ['lab', 'model'])\n"
+              "BAD = Counter('logins_total', 'logins', ['user_id', 'outcome'])\n"
+              "HIST = Histogram('x_seconds', 'x',\n    labelnames=('url',))\n")
+        js = "new client.Counter({ name: 'visits_total', help: 'h', labelNames: ['visitor', 'page_kind'] });\n"
+        found = magehand.metric_label_findings('app/metrics.py', py) + magehand.metric_label_findings('web/m.js', js)
+        named = sorted(f['text'].split("'")[1] for f in found)
+        self.assertEqual(named, ['url', 'user_id', 'visitor'])
+        self.assertTrue(all(f['level'] == 'warning' for f in found))
+        self.assertEqual(found[0]['where'], 'app/metrics.py:3')
+
+    def test_check_code_runs_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
+            (root / 'ui-check.yaml').write_text('x')
+            (root / 'app.py').write_text("X = Gauge('q', 'q', ['email'])\n")
+            texts = [f['text'] for f in magehand.check_code(root, check_app([]))]
+        self.assertTrue(any("metric label 'email'" in t for t in texts), texts)
+
+
 class CheckCode(unittest.TestCase):
     def run_check(self, files, env=()):
         with tempfile.TemporaryDirectory() as tmp:
