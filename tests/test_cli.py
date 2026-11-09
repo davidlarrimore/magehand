@@ -1445,6 +1445,18 @@ class AppMetricsChecks(unittest.TestCase):
         self.assertTrue(all(f['level'] == 'warning' for f in found))
         self.assertEqual(found[0]['where'], 'app/metrics.py:3')
 
+    def test_names_and_help_text_are_not_labels(self):
+        """Review: only the label list is read, never the metric's name or help."""
+        safe = ("Q = Counter('query', 'query', ['model'])\n"
+                "U = Gauge('user', 'user')\n"
+                "S = Summary('session_seconds', 'per session', labelnames=['outcome'])\n"
+                "new client.Histogram({ name: 'url_fetch_seconds', help: 'url', labelNames: ['status'] });\n"
+                'v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "token_uses", Help: "token"}, []string{"kind"})\n')
+        self.assertEqual(magehand.metric_label_findings('app/m.py', safe), [])
+        go = 'v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "x", Help: "x"}, []string{"kind", "email"})\n'
+        found = magehand.metric_label_findings('main.go', go)
+        self.assertEqual([f['text'].split("'")[1] for f in found], ['email'])
+
     def test_check_code_runs_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

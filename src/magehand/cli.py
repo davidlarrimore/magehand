@@ -4331,7 +4331,12 @@ def check_quality_job(root):
 
 # A Prometheus metric definition (Python prometheus_client, JS prom-client, Go client_golang) and the label names
 # that would put a person or a document into a series label (homelab-apps docs/platform/metrics.md "Labels").
-METRIC_DEFINITION = re.compile(r'\b(?:Counter|Gauge|Histogram|Summary)(?:Vec)?\s*\(|\blabel_?[nN]ames\b')
+METRIC_DEFINITION = re.compile(r'\b(?:New)?(?:Counter|Gauge|Histogram|Summary)(?:Vec)?\s*\(|\blabel_?[nN]ames\b')
+# Where a definition lists its label names: Python `labelnames=[...]`/`(...)`, JS `labelNames: [...]`, Go
+# `[]string{...}`; and Python's positional form `Counter('name', 'help', ['a', 'b'])`.
+LABEL_LISTS = re.compile(r'\blabel_?[nN]ames\s*[=:]\s*[\[(]([^\])]*)[\])]|\[\]string\s*\{([^}]*)\}')
+PY_POSITIONAL_LABELS = re.compile(r'(?:Counter|Gauge|Histogram|Summary)\s*\(\s*(?:"[^"]*"|\'[^\']*\')\s*,\s*'
+                                  r'(?:"[^"]*"|\'[^\']*\')\s*,\s*[\[(]([^\])]*)[\])]')
 IDENTITY_LABELS = {'user', 'user_id', 'userid', 'username', 'email', 'visitor', 'visitor_id', 'customer',
                    'customer_id', 'account', 'account_id', 'url', 'query', 'session', 'session_id', 'ip',
                    'client_ip', 'token', 'document'}
@@ -4339,17 +4344,24 @@ IDENTITY_LABELS = {'user', 'user_id', 'userid', 'username', 'email', 'visitor', 
 
 def metric_label_findings(rel, text):
     """Warnings for metric label names that identify a person or carry content (a scrape can't tell an ID from
-    a category, so this reads the code)."""
-    found, read_to = [], 0
-    for match in METRIC_DEFINITION.finditer(text):
-        if match.start() < read_to:
+    a category, so this reads the code). Only the label list is read, never the metric's name or help text:
+    Python's third positional argument or `labelnames=`, JS's `labelNames:`, Go's `[]string{...}`."""
+    found = []
+    starts = [m.start() for m in METRIC_DEFINITION.finditer(text)]
+    read_to = 0
+    for i, begin in enumerate(starts):
+        if begin < read_to:
             continue  # inside a definition already read (`Histogram(... labelnames=...)`)
-        span = text[match.start():match.start() + 400]
-        span = span[:span.find(')') + 1] if ')' in span else span
-        read_to = match.start() + len(span)
-        for name in dict.fromkeys(re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']', span)):
+        stop = min([s for s in starts[i + 1:] if s > begin + 1] + [begin + 600, len(text)])
+        span = text[begin:stop]
+        read_to = stop
+        lists = [m.group(1) or m.group(2) or "" for m in LABEL_LISTS.finditer(span)]
+        positional = PY_POSITIONAL_LABELS.match(span)
+        if positional:
+            lists.append(positional.group(1))
+        for name in dict.fromkeys(n for chunk in lists for n in re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']', chunk)):
             if name.lower() in IDENTITY_LABELS:
-                found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'metric label {name!r}: '
+                found.append(finding('warning', f'{rel}:{line_of(text, begin)}', f'metric label {name!r}: '
                                      'a label is a bounded category (a lab, a model, an outcome), never a person, a '
                                      'URL, a query or a token. Each value makes a new series, and series are kept '
                                      'for days; keep per-person detail in the database', 'metrics "Labels"'))
