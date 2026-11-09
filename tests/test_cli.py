@@ -1457,6 +1457,17 @@ class AppMetricsChecks(unittest.TestCase):
         found = magehand.metric_label_findings('main.go', go)
         self.assertEqual([f['text'].split("'")[1] for f in found], ['email'])
 
+    def test_code_after_a_constructor_is_not_its_labels(self):
+        """Review: an unrelated string slice or list after a constructor is not its label list."""
+        go = ('requests := prometheus.NewCounter(prometheus.CounterOpts{Name: "requests_total", Help: "Requests"})\n'
+              'columns := []string{"email", "username"}\n')
+        py = "C = Counter('calls_total', 'calls', ['model'])\nFIELDS = ['email', 'user']\nX = ('url',)\n"
+        self.assertEqual(magehand.metric_label_findings('main.go', go), [])
+        self.assertEqual(magehand.metric_label_findings('app.py', py), [])
+        nested = 'v := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "q", Help: "(x)"}, []string{"session"})\n'
+        self.assertEqual([f['text'].split("'")[1] for f in magehand.metric_label_findings('m.go', nested)],
+                         ['session'])
+
     def test_check_code_runs_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

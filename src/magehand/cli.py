@@ -4342,26 +4342,54 @@ IDENTITY_LABELS = {'user', 'user_id', 'userid', 'username', 'email', 'visitor', 
                    'client_ip', 'token', 'document'}
 
 
+def call_arguments(text, start, limit=2000):
+    """The text of the call whose `(` is the first one at or after `start`, through its matching `)`: brackets
+    and braces are counted and quoted strings skipped. '' when there is no `(` close by."""
+    open_at = text.find('(', start, start + 200)
+    if open_at == -1:
+        return ''
+    depth, quote, i = 0, None, open_at
+    while i < min(len(text), open_at + limit):
+        ch = text[i]
+        if quote:
+            if ch == '\\':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in '"\'`':
+            quote = ch
+        elif ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+        i += 1
+    return text[open_at:i]
+
+
 def metric_label_findings(rel, text):
     """Warnings for metric label names that identify a person or carry content (a scrape can't tell an ID from
-    a category, so this reads the code). Only the label list is read, never the metric's name or help text:
-    Python's third positional argument or `labelnames=`, JS's `labelNames:`, Go's `[]string{...}`."""
-    found = []
-    starts = [m.start() for m in METRIC_DEFINITION.finditer(text)]
-    read_to = 0
-    for i, begin in enumerate(starts):
-        if begin < read_to:
-            continue  # inside a definition already read (`Histogram(... labelnames=...)`)
-        stop = min([s for s in starts[i + 1:] if s > begin + 1] + [begin + 600, len(text)])
-        span = text[begin:stop]
-        read_to = stop
-        lists = [m.group(1) or m.group(2) or "" for m in LABEL_LISTS.finditer(span)]
+    a category, so this reads the code). Only a metric constructor's own label list is read, never its name or
+    help text nor the code after it: Python's third positional argument or `labelnames=`, JS's `labelNames:`,
+    Go's `[]string{...}` argument."""
+    found, read_to = [], 0
+    for match in METRIC_DEFINITION.finditer(text):
+        if match.start() < read_to:
+            continue  # inside a constructor already read (`Histogram(... labelnames=...)`)
+        if match.group(0).rstrip().endswith('('):
+            args = call_arguments(text, match.start())
+            span = match.group(0).rstrip('(').rstrip() + args
+            read_to = match.start() + len(match.group(0)) + len(args)
+        else:  # a bare labelnames/labelNames (outside a recognised constructor): only the list after it
+            span = text[match.start():match.start() + 300]
+        lists = [m.group(1) or m.group(2) or '' for m in LABEL_LISTS.finditer(span)]
         positional = PY_POSITIONAL_LABELS.match(span)
         if positional:
             lists.append(positional.group(1))
         for name in dict.fromkeys(n for chunk in lists for n in re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']', chunk)):
             if name.lower() in IDENTITY_LABELS:
-                found.append(finding('warning', f'{rel}:{line_of(text, begin)}', f'metric label {name!r}: '
+                found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'metric label {name!r}: '
                                      'a label is a bounded category (a lab, a model, an outcome), never a person, a '
                                      'URL, a query or a token. Each value makes a new series, and series are kept '
                                      'for days; keep per-person detail in the database', 'metrics "Labels"'))
