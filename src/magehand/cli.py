@@ -3860,6 +3860,7 @@ def check_rendered(root, name):
             continue
         rendered.append((overlay, docs))
         found += check_rollout_room(where, overlay, docs, app_services(local))
+        found += check_metrics_exposure(where, docs)
         lab, public = f'{namespace}.{LAB}', f'{namespace}.{domain}'
         for doc in docs:
             meta = doc.get('metadata') or {}
@@ -3898,6 +3899,61 @@ def check_rendered(root, name):
         more, missed = check_schemas(rendered)
         found, skipped = found + more, skipped + missed
     return found, skipped
+
+
+# App metrics (homelab docs/app-metrics-plan.md): a pod opts in with this label and a container port named
+# `metrics`; the platform's PodMonitor scrapes that port for the apps' own Prometheus, which alone may reach it.
+METRICS_LABEL = 'homelab.davidlarrimore.com/metrics'
+METRICS_SEE = 'metrics "Opting in"'
+POD_KINDS = ('Deployment', 'StatefulSet', 'DaemonSet', 'ReplicaSet', 'Job')
+
+
+def pod_templates(docs):
+    """(doc, pod template) for each workload in a rendered overlay (a CronJob's through its jobTemplate)."""
+    for doc in docs:
+        spec = doc.get('spec') or {}
+        if doc.get('kind') in POD_KINDS:
+            yield doc, spec.get('template') or {}
+        elif doc.get('kind') == 'CronJob':
+            yield doc, ((spec.get('jobTemplate') or {}).get('spec') or {}).get('template') or {}
+
+
+def check_metrics_exposure(where, docs):
+    """The metrics opt-in on a rendered overlay: the label needs the value "true" and a container port named
+    `metrics`; a `metrics` port without the label is never scraped (a warning); and no Service may reach the
+    metrics port, by its name or its number (the cluster's Kyverno sees only the name)."""
+    found, exposed = [], []  # exposed: (pod labels, metrics container port numbers)
+    for doc, template in pod_templates(docs):
+        label = f'{where}: {doc.get("kind")} {(doc.get("metadata") or {}).get("name", "?")}'
+        labels = (template.get('metadata') or {}).get('labels') or {}
+        ports = [port for c in (template.get('spec') or {}).get('containers') or [] for port in c.get('ports') or []]
+        numbers = [port.get('containerPort') for port in ports if port.get('name') == 'metrics']
+        if METRICS_LABEL in labels:
+            if str(labels[METRICS_LABEL]) != 'true' or not numbers:
+                found.append(finding('error', label, f'the pod label {METRICS_LABEL} needs the value "true" and a '
+                                     'container port named `metrics` (the port Prometheus scrapes, path /metrics)',
+                                     METRICS_SEE))
+        elif numbers:
+            found.append(finding('warning', label, f'has a container port named `metrics` but its pods lack the label '
+                                 f'{METRICS_LABEL}: "true", so nothing collects those metrics. Add the label to the '
+                                 'pod template, or rename the port', METRICS_SEE))
+        if numbers:
+            exposed.append((labels, set(numbers)))
+    for doc in docs:
+        if doc.get('kind') != 'Service':
+            continue
+        spec = doc.get('spec') or {}
+        selector = spec.get('selector') or {}
+        for port in spec.get('ports') or []:
+            target = port.get('targetPort', port.get('port'))
+            for labels, numbers in exposed:
+                if selector and all(labels.get(k) == v for k, v in selector.items()) and \
+                        (port.get('name') == 'metrics' or target == 'metrics' or target in numbers):
+                    found.append(finding('error', f'{where}: Service {(doc.get("metadata") or {}).get("name", "?")}',
+                                         f'reaches the metrics port (port {port.get("port")} → {target}): metrics are '
+                                         'scraped inside the cluster only, never served through a Service or Ingress. '
+                                         'Remove that port from the Service', METRICS_SEE))
+    return found
 
 
 def tool_missing(tool, what):
@@ -4273,6 +4329,92 @@ def check_quality_job(root):
                     "homelab-app-template's `quality` job (agents can't change workflows)", QUALITY_SEE)]
 
 
+# A Prometheus metric definition (Python prometheus_client, JS prom-client, Go client_golang) and the label names
+# that would put a person or a document into a series label (homelab-apps docs/platform/metrics.md "Labels").
+METRIC_DEFINITION = re.compile(r'\b(?:New)?(?:Counter|Gauge|Histogram|Summary)(?:Vec)?\s*\(|\blabel_?[nN]ames\b')
+# Where a definition lists its label names: Python `labelnames=[...]`/`(...)`, JS `labelNames: [...]`, Go
+# `[]string{...}`; and Python's positional form `Counter('name', 'help', ['a', 'b'])`.
+LABEL_LISTS = re.compile(r'\blabel_?[nN]ames\s*[=:]\s*[\[(]([^\])]*)[\])]|\[\]string\s*\{([^}]*)\}')
+PY_POSITIONAL_LABELS = re.compile(r'(?:Counter|Gauge|Histogram|Summary)\s*\(\s*(?:"[^"]*"|\'[^\']*\')\s*,\s*'
+                                  r'(?:"[^"]*"|\'[^\']*\')\s*,\s*[\[(]([^\])]*)[\])]')
+PROMETHEUS_CLIENT = re.compile(r'prometheus|prom-client', re.I)  # files that use a Prometheus client
+IDENTITY_LABELS = {'user', 'user_id', 'userid', 'username', 'email', 'visitor', 'visitor_id', 'customer',
+                   'customer_id', 'account', 'account_id', 'url', 'query', 'session', 'session_id', 'ip',
+                   'client_ip', 'token', 'document'}
+
+
+def call_arguments(text, start, limit=2000):
+    """The text of the call whose `(` is the first one at or after `start`, through its matching `)`, with its
+    comments (`//`, `/* */`, `#`) removed: brackets and braces are counted, quoted strings and comments skipped.
+    None when the call doesn't close within `limit` characters: an unfinished span is never read as a call."""
+    open_at = text.find('(', start, start + 200)
+    if open_at == -1:
+        return None
+    depth, quote, i, stop, kept = 0, None, open_at, min(len(text), open_at + limit), []
+    while i < stop:
+        ch = text[i]
+        if quote:
+            kept.append(ch)
+            if ch == '\\' and i + 1 < stop:
+                kept.append(text[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif text.startswith('//', i) or ch == '#':
+            newline = text.find('\n', i)
+            i = stop if newline == -1 else newline
+            continue
+        elif text.startswith('/*', i):
+            close = text.find('*/', i + 2)
+            i = stop if close == -1 else close + 2
+            continue
+        else:
+            kept.append(ch)
+            if ch in '"\'`':
+                quote = ch
+            elif ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth -= 1
+                if depth == 0:
+                    return ''.join(kept), i + 1 - open_at
+        i += 1
+    return None
+
+
+def metric_label_findings(rel, text):
+    """Warnings for metric label names that identify a person or carry content (a scrape can't tell an ID from
+    a category, so this reads the code). Only a metric constructor's own label list is read, never its name or
+    help text nor the code after it: Python's third positional argument or `labelnames=`, JS's `labelNames:`,
+    Go's `[]string{...}` argument."""
+    found, read_to = [], 0
+    if not PROMETHEUS_CLIENT.search(text):
+        return found  # a Counter() or Summary() of another library is not a metric
+    for match in METRIC_DEFINITION.finditer(text):
+        if match.start() < read_to:
+            continue  # inside a constructor already read (`Histogram(... labelnames=...)`)
+        if match.group(0).rstrip().endswith('('):
+            call = call_arguments(text, match.start())
+            if call is None:
+                continue  # no matching `)` close by: nothing certain to read
+            args, length = call
+            span = match.group(0).rstrip('(').rstrip() + args
+            read_to = text.find('(', match.start()) + length
+        else:  # a bare labelnames/labelNames (outside a recognised constructor): only the list after it
+            span = text[match.start():match.start() + 300]
+        lists = [m.group(1) or m.group(2) or '' for m in LABEL_LISTS.finditer(span)]
+        positional = PY_POSITIONAL_LABELS.match(span)
+        if positional:
+            lists.append(positional.group(1))
+        for name in dict.fromkeys(n for chunk in lists for n in re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']', chunk)):
+            if name.lower() in IDENTITY_LABELS:
+                found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'metric label {name!r}: '
+                                     'a label is a bounded category (a lab, a model, an outcome), never a person, a '
+                                     'URL, a query or a token. Each value makes a new series, and series are kept '
+                                     'for days; keep per-person detail in the database', 'metrics "Labels"'))
+    return found
+
+
 def check_code(root, app, catalog=None):
     """Rules for the app's code (the repo checkout); `app` is None before it has a deployment."""
     found = []
@@ -4321,6 +4463,7 @@ def check_code(root, app, catalog=None):
                                  f'/app.yaml (requested: {", ".join(sorted(requested)) or "none"}): LiteLLM refuses '
                                  'it (403) if the code calls it. Add it to the block\'s models'
                                  + (', or drop this fallback' if fallback else ''), 'blocks "Models"'))
+        found += metric_label_findings(rel, text)
         for host in PROVIDER_HOSTS:
             for match in re.finditer(re.escape(host), text):
                 found.append(finding('error', f'{rel}:{line_of(text, match.start())}', f'calls {host} directly: '
