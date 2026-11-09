@@ -1438,7 +1438,7 @@ class AppMetricsChecks(unittest.TestCase):
               "CALLS = Counter('nlp_llm_calls_total', 'calls', ['lab', 'model'])\n"
               "BAD = Counter('logins_total', 'logins', ['user_id', 'outcome'])\n"
               "HIST = Histogram('x_seconds', 'x',\n    labelnames=('url',))\n")
-        js = "new client.Counter({ name: 'visits_total', help: 'h', labelNames: ['visitor', 'page_kind'] });\n"
+        js = "const client = require('prom-client');\nnew client.Counter({ name: 'visits_total', help: 'h', labelNames: ['visitor', 'page_kind'] });\n"
         found = magehand.metric_label_findings('app/metrics.py', py) + magehand.metric_label_findings('web/m.js', js)
         named = sorted(f['text'].split("'")[1] for f in found)
         self.assertEqual(named, ['url', 'user_id', 'visitor'])
@@ -1468,12 +1468,35 @@ class AppMetricsChecks(unittest.TestCase):
         self.assertEqual([f['text'].split("'")[1] for f in magehand.metric_label_findings('m.go', nested)],
                          ['session'])
 
+    def test_comments_inside_a_constructor_are_skipped(self):
+        """Review: a `(` in a comment must not carry the scan past the constructor."""
+        go = ('requests := prometheus.NewCounter(prometheus.CounterOpts{\n'
+              '    Name: "requests_total", // count requests (including retries\n'
+              '    Help: "Requests", /* also ( here */\n'
+              '})\n'
+              'columns := []string{"email", "username"}\n')
+        self.assertEqual(magehand.metric_label_findings('main.go', go), [])
+        py = ("C = Counter('calls_total', 'calls (all)',  # count calls (including retries\n"
+              "            ['model'])\nFIELDS = ['email']\n")
+        self.assertEqual(magehand.metric_label_findings('app.py', py), [])
+        commented_label = ("import prometheus_client\nB = Counter('logins_total', 'logins',  # by outcome (and who\n"
+                           "            ['outcome', 'user_id'])\n")
+        self.assertEqual([f['text'].split("'")[1] for f in magehand.metric_label_findings('a.py', commented_label)],
+                         ['user_id'])
+        self.assertEqual(magehand.metric_label_findings('x.go', 'c := prometheus.NewCounter(\n'), [])  # unfinished
+
+    def test_only_files_using_a_prometheus_client(self):
+        other = "from collections import Counter\nC = Counter('a', 'b', ['user'])\n"
+        self.assertEqual(magehand.metric_label_findings('util.py', other), [])
+        prom = "from prometheus_client import Counter\nC = Counter('a', 'b', ['user'])\n"
+        self.assertEqual(len(magehand.metric_label_findings('m.py', prom)), 1)
+
     def test_check_code_runs_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
             (root / 'ui-check.yaml').write_text('x')
-            (root / 'app.py').write_text("X = Gauge('q', 'q', ['email'])\n")
+            (root / 'app.py').write_text("from prometheus_client import Gauge\nX = Gauge('q', 'q', ['email'])\n")
             texts = [f['text'] for f in magehand.check_code(root, check_app([]))]
         self.assertTrue(any("metric label 'email'" in t for t in texts), texts)
 

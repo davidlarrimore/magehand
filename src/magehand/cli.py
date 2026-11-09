@@ -4337,35 +4337,49 @@ METRIC_DEFINITION = re.compile(r'\b(?:New)?(?:Counter|Gauge|Histogram|Summary)(?
 LABEL_LISTS = re.compile(r'\blabel_?[nN]ames\s*[=:]\s*[\[(]([^\])]*)[\])]|\[\]string\s*\{([^}]*)\}')
 PY_POSITIONAL_LABELS = re.compile(r'(?:Counter|Gauge|Histogram|Summary)\s*\(\s*(?:"[^"]*"|\'[^\']*\')\s*,\s*'
                                   r'(?:"[^"]*"|\'[^\']*\')\s*,\s*[\[(]([^\])]*)[\])]')
+PROMETHEUS_CLIENT = re.compile(r'prometheus|prom-client', re.I)  # files that use a Prometheus client
 IDENTITY_LABELS = {'user', 'user_id', 'userid', 'username', 'email', 'visitor', 'visitor_id', 'customer',
                    'customer_id', 'account', 'account_id', 'url', 'query', 'session', 'session_id', 'ip',
                    'client_ip', 'token', 'document'}
 
 
 def call_arguments(text, start, limit=2000):
-    """The text of the call whose `(` is the first one at or after `start`, through its matching `)`: brackets
-    and braces are counted and quoted strings skipped. '' when there is no `(` close by."""
+    """The text of the call whose `(` is the first one at or after `start`, through its matching `)`, with its
+    comments (`//`, `/* */`, `#`) removed: brackets and braces are counted, quoted strings and comments skipped.
+    None when the call doesn't close within `limit` characters: an unfinished span is never read as a call."""
     open_at = text.find('(', start, start + 200)
     if open_at == -1:
-        return ''
-    depth, quote, i = 0, None, open_at
-    while i < min(len(text), open_at + limit):
+        return None
+    depth, quote, i, stop, kept = 0, None, open_at, min(len(text), open_at + limit), []
+    while i < stop:
         ch = text[i]
         if quote:
-            if ch == '\\':
+            kept.append(ch)
+            if ch == '\\' and i + 1 < stop:
+                kept.append(text[i + 1])
                 i += 1
             elif ch == quote:
                 quote = None
-        elif ch in '"\'`':
-            quote = ch
-        elif ch in '([{':
-            depth += 1
-        elif ch in ')]}':
-            depth -= 1
-            if depth == 0:
-                return text[open_at:i + 1]
+        elif text.startswith('//', i) or ch == '#':
+            newline = text.find('\n', i)
+            i = stop if newline == -1 else newline
+            continue
+        elif text.startswith('/*', i):
+            close = text.find('*/', i + 2)
+            i = stop if close == -1 else close + 2
+            continue
+        else:
+            kept.append(ch)
+            if ch in '"\'`':
+                quote = ch
+            elif ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth -= 1
+                if depth == 0:
+                    return ''.join(kept), i + 1 - open_at
         i += 1
-    return text[open_at:i]
+    return None
 
 
 def metric_label_findings(rel, text):
@@ -4374,13 +4388,18 @@ def metric_label_findings(rel, text):
     help text nor the code after it: Python's third positional argument or `labelnames=`, JS's `labelNames:`,
     Go's `[]string{...}` argument."""
     found, read_to = [], 0
+    if not PROMETHEUS_CLIENT.search(text):
+        return found  # a Counter() or Summary() of another library is not a metric
     for match in METRIC_DEFINITION.finditer(text):
         if match.start() < read_to:
             continue  # inside a constructor already read (`Histogram(... labelnames=...)`)
         if match.group(0).rstrip().endswith('('):
-            args = call_arguments(text, match.start())
+            call = call_arguments(text, match.start())
+            if call is None:
+                continue  # no matching `)` close by: nothing certain to read
+            args, length = call
             span = match.group(0).rstrip('(').rstrip() + args
-            read_to = match.start() + len(match.group(0)) + len(args)
+            read_to = text.find('(', match.start()) + length
         else:  # a bare labelnames/labelNames (outside a recognised constructor): only the list after it
             span = text[match.start():match.start() + 300]
         lists = [m.group(1) or m.group(2) or '' for m in LABEL_LISTS.finditer(span)]
