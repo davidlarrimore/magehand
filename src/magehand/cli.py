@@ -2091,7 +2091,7 @@ def ensure_checks(repo):
 # server (stdlib only) with /healthz, laid out like the platform's other apps; replace it freely.
 
 SCAFFOLD_PYTHON = ('python:3.14-alpine@sha256:'
-                   '9e9fde4d32eedce0b661d9ab91e826b62dddf28e928c230ec55f1866cac66b01')
+                   'a18b20ad69e74df6cf6d2e1b1a260d7a1ecf5380fd83b310f83ba88c461cf894')
 
 SCAFFOLD_FILES = {
     'Dockerfile': """\
@@ -2122,6 +2122,10 @@ FROM scratch AS coverage
 COPY --from=test /coverage/ /
 
 FROM base AS runtime
+# The app installs nothing at run time: drop pip and its vendored libraries (certifi, urllib3, ...), which
+# the image scan flags (a fixable CRITICAL in pip's certifi failed egress-canary's first build).
+RUN rm -rf /usr/local/lib/python3.14/site-packages/pip /usr/local/lib/python3.14/site-packages/pip-* \\
+    /usr/local/lib/python3.14/site-packages/setuptools* /usr/local/bin/pip*
 USER 65532
 CMD ["python", "-B", "/app/app.py"]
 """,
