@@ -727,6 +727,7 @@ def cmd_app(a):
         print(json.dumps({'name': name, 'code': f'davidlarrimore/{source}' if source or app['root'] else f'homelab-apps apps/{name}/image',
                           'deployment': app['where'], 'dev_url': f'https://{name}-dev.{LAB}',
                           'port': app_port(app), 'registered': deployed is not None, 'blocks': app['services'],
+                          'fetch_zone': fetch_zone_summary(app, deployed),
                           'llm_keys': keys, 'env': env,
                           'signin_seconds_left': left if left != UNREACHABLE else None, 'next': step}, indent=1))
         return
@@ -760,6 +761,10 @@ def cmd_app(a):
         if (svc or {}).get('type') == 'bucket':
             for line in bucket_summary(name, block, svc):
                 print('      ' + line)
+    zone = fetch_zone_summary(app, deployed)
+    if zone:
+        print(f"Fetch zone (`magehand guide fetch`): {zone['namespace']} (production {zone['prod_namespace']}), "
+              f"queue: redis{'' if zone['deployed'] else '  not deployed yet: merge deploy/'}")
     print(f'Env (the pod spec; locally: magehand run, app port {app_port(app)}):')
     for entry in env_plan(app):
         if entry[1] == 'value':
@@ -1358,7 +1363,8 @@ def lifecycle_stages(repo, name):
             'next': f'`magehand status {name} --watch`' if on_main else None}
     else:
         blocks = ', '.join(f'{b} ({(svc or {}).get("type")})' for b, svc in (spec.get('services') or {}).items())
-        register = {'state': 'ok', 'text': f'registered; blocks: {blocks or "none"}'}
+        zone = f'; fetch zone {name}-fetch-dev' if spec.get('fetch') is True else ''
+        register = {'state': 'ok', 'text': f'registered; blocks: {blocks or "none"}{zone}'}
     return [{'stage': 'repo', **repo_stage}, {'stage': 'config', **config}, {'stage': 'register', **register}]
 
 
@@ -7176,6 +7182,165 @@ def cmd_icon(a):
     print(next_line(step))
 
 
+# `magehand fetch`: the scaffold of an app's fetch zone (homelab docs/restricted-egress-plan.md; guide: fetch).
+FETCH_BLOCK = ('\n# The fetch zone (magehand guide fetch): its own namespace, reaching only the public web on 80/443\n'
+               '# and this queue; deploy/fetch/ holds the fetcher.\n'
+               'fetch:\n  services:\n    queue: {type: redis}\n')
+FETCH_MEMORY = '256Mi'
+FETCH_MAX_MEMORY_MI = 512   # the zone's LimitRange (homelab platform/agent-apps-baseline-fetch/limit-range.yaml)
+FETCH_QUEUE_FILE = 'fetch-queue.yaml'
+FETCH_HEADER = '# Written by `magehand fetch init`. Edit it freely; `magehand check` checks it.\n'
+
+
+def fetch_zone_summary(app, deployed):
+    """The app's fetch zone, or None: its namespaces and whether the platform has it (`fetch: true` in the
+    registered app.yaml)."""
+    if 'fetch' not in (app.get('spec') or {}) and not (deployed or {}).get('fetch'):
+        return None
+    return {'namespace': f"{app['name']}-fetch-dev", 'prod_namespace': f"{app['name']}-fetch",
+            'deployed': (deployed or {}).get('fetch') is True}
+
+
+def fetch_zone_name(app, overlay):
+    return f"{app['name']}-fetch-dev" if overlay == 'dev' else f"{app['name']}-fetch"
+
+
+def fetcher_manifest(app, command, memory):
+    """The fetcher: a Deployment running the app's image with `command`, the app pod's security settings, and only
+    the queue's connection (QUEUE_URL from the zone's Secret queue-connection): none of the app's env, which may
+    name its other Secrets."""
+    container, pod = app['container'], app['pod']
+    labels = {'app.kubernetes.io/name': 'fetcher', 'app.kubernetes.io/part-of': app['name'],
+              'app.kubernetes.io/component': 'fetcher'}
+    fetcher = {'name': 'fetcher', 'image': container.get('image') or f'ghcr.io/davidlarrimore/homelab-apps/{app["name"]}',
+               'command': list(command),
+               'env': [{'name': 'QUEUE_URL', 'valueFrom': {'secretKeyRef': {'name': FETCH_SECRET, 'key': 'uri'}}}],
+               'resources': {'requests': {'cpu': '10m', 'memory': f'{min(memory_mi(memory), 128)}Mi'},
+                             'limits': {'memory': memory}},
+               'securityContext': json.loads(json.dumps(container.get('securityContext') or {
+                   'allowPrivilegeEscalation': False, 'readOnlyRootFilesystem': True,
+                   'capabilities': {'drop': ['ALL']}})),
+               'volumeMounts': [{'name': 'tmp', 'mountPath': '/tmp'}]}  # nosec B108  # an emptyDir
+    spec = {'automountServiceAccountToken': False,
+            'securityContext': json.loads(json.dumps(pod.get('securityContext') or {
+                'runAsNonRoot': True, 'seccompProfile': {'type': 'RuntimeDefault'}})),
+            'containers': [fetcher], 'volumes': [{'name': 'tmp', 'emptyDir': {'sizeLimit': '128Mi'}}]}
+    return {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'fetcher', 'labels': dict(labels)},
+            'spec': {'replicas': 1, 'selector': {'matchLabels': {'app.kubernetes.io/name': 'fetcher'}},
+                     'template': {'metadata': {'labels': labels}, 'spec': spec}}}
+
+
+def fetch_queue_secret(zone):
+    """The app's copy of the queue's connection, read from the zone through the platform's store fetch-queue, with
+    the queue's full name (the zone's Secret names it `queue`, which resolves only inside the zone)."""
+    host = f'queue.{zone}.svc'
+    return {'apiVersion': 'external-secrets.io/v1', 'kind': 'ExternalSecret', 'metadata': {'name': 'fetch-queue'},
+            'spec': {'refreshInterval': '1h', 'secretStoreRef': {'kind': 'SecretStore', 'name': 'fetch-queue'},
+                     'target': {'name': 'fetch-queue', 'template': {'data': {
+                         'host': host, 'port': '6379', 'password': '{{ .password }}',
+                         'uri': f'redis://:{{{{ .password }}}}@{host}:6379/0'}}},
+                     'data': [{'secretKey': 'password',
+                               'remoteRef': {'key': FETCH_SECRET, 'property': 'password'}}]}}
+
+
+def cmd_fetch(a):
+    app = job_app(getattr(a, 'app_flag', None))
+    local = pathlib.Path(app['root']) / DEPLOY
+    if a.fetch_action == 'init':
+        fetch_init(a, app, local)
+    else:
+        fetch_rm(a, app, local)
+
+
+def fetch_init(a, app, local):
+    command = list(getattr(a, 'cmd', None) or [])
+    if not command:
+        usage('fetch', 'give the fetcher\'s command after --, e.g. magehand fetch init -- python -m app.fetcher')
+    mi = memory_mi(a.memory)
+    if not mi or mi > FETCH_MAX_MEMORY_MI:
+        usage('fetch', f'--memory {a.memory!r}: Mi or Gi, at most {FETCH_MAX_MEMORY_MI}Mi (the zone\'s limit)')
+    app_yaml = local / 'app.yaml'
+    text = app_yaml.read_text()
+    if re.search(r'(?m)^fetch:', text) or (local / FETCH_DIR).exists():
+        die(f'{DEPLOY}/app.yaml or {DEPLOY}/{FETCH_DIR}/ already has a fetch zone: edit it, or '
+            '`magehand fetch rm` first')
+    overlays = [o for o in ('dev', 'prod') if (local / o / 'kustomization.yaml').is_file()]
+    if 'dev' not in overlays:
+        die(f'no {DEPLOY}/dev/kustomization.yaml: the app needs its dev overlay first (`magehand check` says how)')
+    # Every check before any write: the overlays' kustomization edits are made (and verified) first.
+    edits = {}
+    for overlay in overlays:
+        if (local / overlay / FETCH_QUEUE_FILE).exists():
+            die(f'{DEPLOY}/{overlay}/{FETCH_QUEUE_FILE} exists: remove it first')
+        new = edit_kustomization((local / overlay / 'kustomization.yaml').read_text(), FETCH_QUEUE_FILE)
+        if new is None:
+            die(f'could not add {FETCH_QUEUE_FILE} to {DEPLOY}/{overlay}/kustomization.yaml without changing its '
+                'other resources: nothing written. Write resources as a block list and try again')
+        edits[overlay] = new
+    dump = lambda doc: yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)  # noqa: E731
+    written = []
+
+    def write(rel, content):
+        path = local / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        written.append(f'{DEPLOY}/{rel}')
+    write(f'{FETCH_DIR}/base/fetcher.yaml', FETCH_HEADER + '# The fetcher: the app\'s image with another command, '
+          'reaching only the public web and its queue (QUEUE_URL).\n' + dump(fetcher_manifest(app, command, a.memory)))
+    write(f'{FETCH_DIR}/base/kustomization.yaml', 'resources:\n  - fetcher.yaml\n')
+    for overlay in overlays:
+        zone = fetch_zone_name(app, overlay)
+        write(f'{FETCH_DIR}/{overlay}/kustomization.yaml', f'namespace: {zone}\nresources:\n  - ../base\n')
+        write(f'{overlay}/{FETCH_QUEUE_FILE}', FETCH_HEADER + f'# The fetch queue\'s connection for the app: Secret '
+              f'fetch-queue (host, port, password, uri), reaching {zone}.\n' + dump(fetch_queue_secret(zone)))
+        (local / overlay / 'kustomization.yaml').write_text(edits[overlay])
+    app_yaml.write_text(text + ('' if text.endswith('\n') else '\n') + FETCH_BLOCK)
+    written.append(f'{DEPLOY}/app.yaml')
+    step = ('map the queue into the app: an env var from Secret fetch-queue key uri in deploy/base/deployment.yaml; '
+            'then `magehand check`, commit and merge')
+    if a.json:
+        print(json.dumps({'action': 'init', 'files': written, 'command': command, 'memory': a.memory, 'next': step},
+                         indent=1))
+        return
+    print(f'wrote {len(written)} files: ' + ', '.join(written))
+    print(f'the fetcher runs {shlex.join(command)} (memory {a.memory}) with QUEUE_URL; pop URLs from it, push results')
+    print(next_line(step))
+
+
+def fetch_rm(a, app, local):
+    removed = []
+    for overlay in ('dev', 'prod'):
+        k = local / overlay / 'kustomization.yaml'
+        if k.is_file() and FETCH_QUEUE_FILE in (kustomization_resources(k.read_text()) or []):
+            new = edit_kustomization(k.read_text(), FETCH_QUEUE_FILE, add=False)
+            if new is None:
+                die(f'could not remove {FETCH_QUEUE_FILE} from {DEPLOY}/{overlay}/kustomization.yaml: remove it by hand')
+            k.write_text(new)
+        if (local / overlay / FETCH_QUEUE_FILE).is_file():
+            (local / overlay / FETCH_QUEUE_FILE).unlink()
+            removed.append(f'{DEPLOY}/{overlay}/{FETCH_QUEUE_FILE}')
+    zone = local / FETCH_DIR
+    if zone.is_dir():
+        shutil.rmtree(zone)
+        removed.append(f'{DEPLOY}/{FETCH_DIR}/')
+    app_yaml = local / 'app.yaml'
+    text = app_yaml.read_text()
+    kept = text.replace(FETCH_BLOCK, '') if FETCH_BLOCK in text else re.sub(
+        r'(?m)^fetch:[ \t]*(?:#.*)?\n(?:(?:[ \t]+.*|[ \t]*)\n)*', '', text)
+    if kept != text:
+        app_yaml.write_text(kept)
+        removed.append(f'{DEPLOY}/app.yaml fetch:')
+    if not removed:
+        die('no fetch zone in this checkout')
+    step = 'remove the app\'s use of Secret fetch-queue, then `magehand check`, commit and merge: dev\'s zone goes ' \
+           'with the next deploy'
+    if a.json:
+        print(json.dumps({'action': 'rm', 'removed': removed, 'next': step}, indent=1))
+        return
+    print('removed ' + ', '.join(removed))
+    print(next_line(step))
+
+
 def cmd_job(a):
     app = job_app(a.app_flag)
     base = pathlib.Path(app['root']) / DEPLOY / 'base'
@@ -7191,7 +7356,7 @@ def cmd_job(a):
 # command's short help).
 GROUPS = (('start an app', ('new', 'icon')),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check')),
-          ('ship an app', ('pr', 'release', 'job')),
+          ('ship an app', ('pr', 'release', 'job', 'fetch')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade')))
 # Working, but not what a person needs to learn: -V and -h do version's and help's jobs, setup and upgrade
@@ -7393,6 +7558,33 @@ def build_parser():
     q.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read dev with kubectl (this checkout's files only)")
     q.add_argument('--json', action='store_true', help='print JSON')
+
+    p = command('fetch', cmd_fetch, "scaffold the app's fetch zone (fetching URLs nobody vouches for)",
+                "write (or remove) the app's fetch zone: a second namespace whose pods reach only the public web on\n"
+                "80/443 and their queue, for work that fetches URLs a user or a crawled page supplies\n"
+                '(magehand guide fetch).',
+                'init writes deploy/app.yaml\'s `fetch:` block (one redis queue named queue), the fetcher in\n'
+                'deploy/fetch/base (a Deployment: the app\'s image with COMMAND, its pod\'s security settings,\n'
+                'QUEUE_URL from the zone\'s Secret queue-connection and nothing else), the overlays\n'
+                'deploy/fetch/dev (and prod, when deploy/prod exists), and the app\'s copy of the queue\'s\n'
+                'connection: Secret fetch-queue (an ExternalSecret in each of the app\'s overlays, listed in its\n'
+                'kustomization). The app pushes URLs, the fetcher pops them and pushes results back; treat\n'
+                'every result as untrusted. rm removes all of it.\n\n'
+                'examples:\n'
+                '  magehand fetch init -- python -m app.fetcher\n'
+                '  magehand fetch init --memory 384Mi -- node fetcher.js\n'
+                '  magehand fetch rm')
+    p.add_argument('-a', '--app', dest='app_flag', metavar='APP',
+                   help='the app of this checkout (another app is refused)')
+    fsub = p.add_subparsers(dest='fetch_action', metavar='ACTION', required=True, parser_class=Parser)
+    q = fsub.add_parser('init', help='write the fetch zone',
+                        usage='magehand fetch init [--memory SIZE] [--json] -- COMMAND...')
+    q.add_argument('--memory', default=FETCH_MEMORY, metavar='SIZE',
+                   help=f'the fetcher\'s memory limit, at most {FETCH_MAX_MEMORY_MI}Mi (default: %(default)s)')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
+    q.set_defaults(cmd=[])
+    q = fsub.add_parser('rm', help='remove what `fetch init` wrote')
+    q.add_argument('--json', action='store_true', help='print a JSON object')
     p = command('icon', cmd_icon, "set the app's icon (its tile in the app library)", "set the app's icon: its tile in the homelab's app library",
                 'The icon is deploy/base/app-icon.yaml, a ConfigMap holding the image, deployed with the rest of\n'
                 'deploy/ (dev and production share it); the platform copies it to the app library within minutes.\n'
@@ -7571,7 +7763,7 @@ def main(argv=None):
     if argv[:2] == ['runtime', 'use']:  # the 0.4.0 form keeps working
         del argv[1]
     command = None
-    if argv[:1] == ['job'] and '--' in argv:  # `job add NAME --schedule ... -- COMMAND`: argparse can't take a
+    if argv[:1] in (['job'], ['fetch']) and '--' in argv:  # `job add NAME --schedule ... -- COMMAND`: argparse can't take a
         cut = argv.index('--')                 # positional, then options, then everything after --
         argv, command = argv[:cut], argv[cut + 1:]
     parser = build_parser()
