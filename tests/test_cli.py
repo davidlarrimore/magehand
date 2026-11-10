@@ -3548,6 +3548,22 @@ class PrWatch(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn('approved', what)
 
+    def test_a_re_request_on_the_same_head_waits_for_the_new_review(self):
+        H = self.HEAD
+        memory = {}
+        old = [('COMMENTED', H)]
+        for pr in (self.pr(review=old, requested=True), self.pr(review=old, assigned=True)):
+            self.assertIsNone(self.step(pr, memory)[0])
+        # posted, then handed back: the new review decides
+        self.assertIsNone(self.step(self.pr(review=old + [('APPROVED', H)]), dict(memory))[0])  # waits for the merge
+        # handed back without posting: failed, never the old review's findings
+        self.assertEqual(self.step(self.pr(review=old), memory)[0], 'failed')
+        # posted while still assigned, then handed back: not a failure
+        memory = {}
+        self.assertIsNone(self.step(self.pr(review=old, assigned=True), memory)[0])
+        self.assertIsNone(self.step(self.pr(review=old + [('APPROVED', H)], assigned=True), memory)[0])
+        self.assertIsNone(self.step(self.pr(review=old + [('APPROVED', H)]), memory)[0])  # waits for the merge
+
     def test_a_review_the_bot_handed_back_without_posting_failed(self):
         memory = {}
         self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])
@@ -3624,12 +3640,11 @@ class PrWatch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             (pathlib.Path(d) / 'deploy').mkdir()
             (pathlib.Path(d) / 'deploy' / 'app.yaml').write_text('app: demo\n')
-            with mock.patch.object(magehand, 'checkout_root', lambda *a: pathlib.Path(d)), \
-                    mock.patch.object(magehand, 'checkout_app', lambda *a: 'demo'):
+            with mock.patch.object(magehand, 'app_repo_here', lambda: 'demo'):
                 code, out, _ = self.run_watch([self.pr(state='MERGED')])
             self.assertEqual(code, 0)
             self.assertIn('`magehand status demo --watch`', out.splitlines()[-1])
-        with mock.patch.object(magehand, 'checkout_root', lambda *a: None):
+        with mock.patch.object(magehand, 'app_repo_here', lambda: None):
             self.assertEqual(self.run_watch([self.pr(state='MERGED')])[1].splitlines()[-1], 'next: nothing')
 
 

@@ -6874,7 +6874,7 @@ def cmd_pr(a):
 # Exit 0: done (`result` merged, held, green, reviewed); 1: something to do, `next:` says what (findings,
 # failed, closed, stalled, unrequested, timeout). Usage errors exit 2, as everywhere.
 
-WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels,mergedAt'
+WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels'
 WATCH_POLL = 30           # seconds between reads
 WATCH_TIMEOUT = 60        # minutes, by default
 WATCH_UNPICKED = 15 * 60  # seconds a requested review may wait unqueued before it is reported
@@ -6939,6 +6939,22 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
                  f'then `magehand pr watch {n}`')
         return None, ("OpenClaw's own PR: approved, waiting for the owner to merge it" if state == 'APPROVED' else
                       "OpenClaw's own PR: waiting for the owner's review"), None
+    # A review in progress first: a head re-requested without a push already has the old review (GitHub drops the
+    # request, and OpenClaw its assignment, when the review is posted)
+    if any(login_of(a) == BOT.lower() for a in pr.get('assignees') or []):
+        # the reviews there were when it first had the PR (not later: it posts, then hands the PR back)
+        memory.setdefault('taken', len(pr.get('reviews') or []))
+        return None, 'OpenClaw is reviewing it (or has it queued)', None
+    if 'taken' in memory and len(pr.get('reviews') or []) == memory['taken']:  # handed back without posting (the request
+        # stays): failed
+        return 'failed', f"OpenClaw's review of {head[:7]} ended without a review (it failed)", \
+            f'{again}; if it fails twice, tell the owner'
+    if requested(pr):
+        memory.setdefault('requested', now)
+        if now - memory['requested'] > WATCH_UNPICKED:
+            return 'stalled', f'review requested, not picked up after {WATCH_UNPICKED // 60} minutes', \
+                'tell the owner: OpenClaw has not taken the review (is it running?)'
+        return None, 'review requested; waiting for OpenClaw to take it', None
     review = bot_review_of(pr, head)
     if review and review.get('state') == 'APPROVED':
         if held:
@@ -6958,18 +6974,6 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
         return 'findings', f"OpenClaw's review of {head[:7]} has findings", \
             (f'fix each finding: `gh pr ready {n} --undo`, push until green, answer and resolve each thread '
              f'(AGENTS.md, "Review comments"), then {again}')
-    if any(login_of(a) == BOT.lower() for a in pr.get('assignees') or []):
-        memory['taken'] = True
-        return None, 'OpenClaw is reviewing it (or has it queued)', None
-    if memory.get('taken'):  # the bot had it and handed it back without a review of this head: it failed
-        return 'failed', f"OpenClaw's review of {head[:7]} ended without a review (it failed)", \
-            f'{again}; if it fails twice, tell the owner'
-    if requested(pr):
-        memory.setdefault('requested', now)
-        if now - memory['requested'] > WATCH_UNPICKED:
-            return 'stalled', f'review requested, not picked up after {WATCH_UNPICKED // 60} minutes', \
-                'tell the owner: OpenClaw has not taken the review (is it running?)'
-        return None, 'review requested; waiting for OpenClaw to take it', None
     older = any(login_of(r.get('author')) == BOT.lower() for r in pr.get('reviews') or [])
     return 'unrequested', ('pushed after the review: the new head has no review' if older else 'no review requested'), \
         f'{again} (it requests the review)'
@@ -7034,8 +7038,7 @@ def pr_watch(a):
     threads = (open_threads_of(repo, n, login_of(pr.get('author')) != BOT.lower())
                if result in ('findings', 'merged', 'held', 'reviewed') else [])
     if result == 'merged':
-        app = checkout_app() if ((checkout_root() or pathlib.Path('/nonexistent')) / 'deploy' / 'app.yaml').is_file() \
-            else None
+        app = app_repo_here()
         answer = 'answer and resolve each open thread (AGENTS.md, "Review comments")' if threads else None
         deploy = f'`magehand status {app} --watch` (the build and the dev deploy)' if app else None
         step = ', then '.join(s for s in (answer, deploy) if s) or None
