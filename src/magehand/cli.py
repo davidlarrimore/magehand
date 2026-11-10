@@ -6897,6 +6897,11 @@ def bot_review_of(pr, head):
     return mine[-1] if mine else None
 
 
+def bot_reviews(pr):
+    """How many reviews OpenClaw has posted on the PR."""
+    return sum(login_of(r.get('author')) == BOT.lower() for r in pr.get('reviews') or [])
+
+
 def owner_verdict(pr, head):
     """On OpenClaw's own PR: the latest review of `head` by someone other than the bot that decides something
     (APPROVED or CHANGES_REQUESTED), else the latest COMMENTED one (a review of line comments, or a reply in a
@@ -6942,10 +6947,11 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
     # A review in progress first: a head re-requested without a push already has the old review (GitHub drops the
     # request, and OpenClaw its assignment, when the review is posted)
     if any(login_of(a) == BOT.lower() for a in pr.get('assignees') or []):
-        # the reviews there were when it first had the PR (not later: it posts, then hands the PR back)
-        memory.setdefault('taken', len(pr.get('reviews') or []))
+        # OpenClaw's reviews when it first had the PR (not later: it posts, then hands the PR back); only its own,
+        # so the owner's reply in a thread meanwhile changes nothing
+        memory.setdefault('taken', bot_reviews(pr))
         return None, 'OpenClaw is reviewing it (or has it queued)', None
-    if 'taken' in memory and len(pr.get('reviews') or []) == memory['taken']:  # handed back without posting (the request
+    if 'taken' in memory and bot_reviews(pr) == memory['taken']:  # handed back without posting (the request
         # stays): failed
         return 'failed', f"OpenClaw's review of {head[:7]} ended without a review (it failed)", \
             f'{again}; if it fails twice, tell the owner'
