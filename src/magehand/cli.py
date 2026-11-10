@@ -2470,7 +2470,8 @@ def cmd_new(a):
         if not APP_NAME.match(value):
             usage('new', f"bad {label} name '{value}': lowercase letters, digits and dashes, at most 40, "
                          'starting and ending with a letter or digit')
-        if value in RESERVED or (label == 'app' and (value.endswith(('-dev', '-prod')) or value.startswith('kube-'))):
+        if value in RESERVED or (label == 'app' and (value.endswith(('-dev', '-prod', '-fetch'))
+                                                     or value.startswith('kube-'))):
             usage('new', f"'{value}' is reserved for the platform; choose another")
     repo = f'{OWNER}/{name}'
     dest = pathlib.Path(a.dir or name)
@@ -3522,10 +3523,10 @@ def check_app_name(app):
     name, repo = app['name'], remote_repo(root)
     if 'app' in app['spec']:
         value = app['spec']['app']
-        if not isinstance(value, str) or not APP_NAME.match(value) or value.endswith(('-dev', '-prod')) \
+        if not isinstance(value, str) or not APP_NAME.match(value) or value.endswith(('-dev', '-prod', '-fetch')) \
                 or value.startswith('kube-'):
             return [finding('error', at, f'app: {value!r} is not an app name (lowercase letters, digits and dashes, '
-                            'at most 40, not ending in -dev or -prod)', guide)]
+                            'at most 40, not ending in -dev, -prod or -fetch)', guide)]
         if value in RESERVED:
             return [finding('error', at, f'app: {value} is reserved for the platform', guide)]
     if not repo:
@@ -3714,6 +3715,12 @@ def env_findings(app, container, deployment_file, catalog):
 
 # What the platform lets an app deploy (the only copy of this list: app CI runs `check --strict`; Argo CD's
 # agent-app-bundles project and Kyverno enforce it in the cluster): namespace, quota, limits and network policy come from the platform.
+# What an app's own deploy/fetch overlays may hold (homelab docs/restricted-egress-plan.md, "Admission rules"): the
+# fetcher's workloads and config. The platform adds the queue, its Secret and the zone's policies.
+FETCH_ALLOWED_KINDS = {
+    ('', 'ConfigMap'), ('apps', 'Deployment'), ('batch', 'Job'), ('batch', 'CronJob'),
+    ('policy', 'PodDisruptionBudget'),
+}
 ALLOWED_KINDS = {
     ('', 'ConfigMap'), ('', 'Secret'), ('', 'Service'), ('', 'ServiceAccount'), ('', 'PersistentVolumeClaim'),
     ('apps', 'Deployment'), ('apps', 'StatefulSet'), ('batch', 'Job'), ('batch', 'CronJob'),
@@ -3752,7 +3759,9 @@ def render_overlay(local, overlay):
 
 # Memory (requests, limits) in MiB: each namespace's quota (homelab platform/agent-apps-baseline{,-prod}/
 # resource-quota.yaml) and each block's pod (platform/building-blocks/<type>/templates/statefulset.yaml).
-NAMESPACE_MEMORY_MI = {'dev': (1024, 2048), 'prod': (2048, 4096)}
+NAMESPACE_MEMORY_MI = {'dev': (1024, 2048), 'prod': (2048, 4096),
+                      # a fetch zone's (platform/agent-apps-baseline-fetch/resource-quota.yaml), dev and production
+                      'fetch/dev': (384, 768), 'fetch/prod': (384, 768)}
 BLOCK_MEMORY_MI = {'postgres': (128, 512), 'redis': (64, 256)}
 
 
@@ -3840,11 +3849,15 @@ def check_rendered(root, name):
         return [], []
     found, skipped, rendered = [], [], []
     domain = LAB.split('.', 1)[1]
-    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
+    overlays = [('dev', f'{name}-dev'), ('prod', name)]
+    if any((local / FETCH_DIR / 'base').glob('*.y*ml')):  # the fetch zone (check_fetch_zone reports the layout)
+        overlays += [(f'{FETCH_DIR}/dev', f'{name}-fetch-dev'), (f'{FETCH_DIR}/prod', f'{name}-fetch')]
+    for overlay, namespace in overlays:
         where = f'{DEPLOY}/{overlay}'
-        if overlay == 'dev' and not (local / overlay / 'kustomization.yaml').is_file():
+        fetch = overlay.startswith(f'{FETCH_DIR}/')
+        if overlay.endswith('dev') and not (local / overlay / 'kustomization.yaml').is_file():
             continue  # check_deploy_files reports a missing dev overlay
-        if overlay == 'prod' and not (local / overlay).is_dir():
+        if overlay.endswith('prod') and not (local / overlay).is_dir():
             continue  # production is optional, but CI renders deploy/prod whenever it exists
         if not (local / overlay / 'kustomization.yaml').is_file():
             found.append(finding('error', f'{where}/kustomization.yaml', f'missing: CI renders {where} because it '
@@ -3859,7 +3872,8 @@ def check_rendered(root, name):
             skipped.append(f'{where}: not rendered ({why}); CI renders and checks it')
             continue
         rendered.append((overlay, docs))
-        found += check_rollout_room(where, overlay, docs, app_services(local))
+        found += check_rollout_room(where, overlay, docs,
+                                    {'queue': {'type': 'redis'}} if fetch else app_services(local))
         found += check_metrics_exposure(where, docs)
         lab, public = f'{namespace}.{LAB}', f'{namespace}.{domain}'
         for doc in docs:
@@ -3869,7 +3883,11 @@ def check_rendered(root, name):
             if meta.get('namespace') not in (None, namespace):
                 found.append(finding('error', label, f'namespace must be {namespace} (found {meta["namespace"]})',
                                      'README "How an app is put together"'))
-            if (group, kind) not in ALLOWED_KINDS:
+            if fetch and (group, kind) not in FETCH_ALLOWED_KINDS:
+                found.append(finding('error', label, f'{kind} ({group or "core"}) is not allowed in a fetch zone '
+                                     f'(its workloads, ConfigMaps and PodDisruptionBudgets only; the platform adds '
+                                     f'the queue)', 'fetch'))
+            elif (group, kind) not in ALLOWED_KINDS:
                 found.append(finding('error', label, f'{kind} ({group or "core"}) is not allowed in an app',
                                      'homelab-apps AGENTS.md "Not allowed"'))
             if kind == 'Ingress':
@@ -3990,14 +4008,16 @@ def check_admission(name, rendered):
         for n in names:
             (policies / n).write_text(github_file(APPS_REPO, f'{POLICY_DIR}/{n}'))
         for overlay, docs in rendered:
-            where, env = f'{DEPLOY}/{overlay}', 'prod' if overlay == 'prod' else 'dev'
-            kdir = pathlib.Path(tmp) / overlay
+            where, env = f'{DEPLOY}/{overlay}', 'prod' if overlay.endswith('prod') else 'dev'
+            # The Application Argo CD applies it as: <app>-dev / <app>-prod, a fetch zone <app>-fetch-dev / -prod.
+            application = f'{name}-fetch-{env}' if overlay.startswith(f'{FETCH_DIR}/') else f'{name}-{env}'
+            kdir = pathlib.Path(tmp) / overlay.replace('/', '-')
             kdir.mkdir()
             (kdir / 'app.yaml').write_text(yaml.safe_dump_all(docs, sort_keys=False))
             (kdir / 'kustomization.yaml').write_text(json.dumps({
                 'resources': ['app.yaml'],
                 'images': [{'name': f'ghcr.io/davidlarrimore/homelab-apps/{name}', 'digest': POLICY_DIGEST}],
-                'commonAnnotations': {'argocd.argoproj.io/tracking-id': f'{name}-{env}:policy-check'}}))
+                'commonAnnotations': {'argocd.argoproj.io/tracking-id': f'{application}:policy-check'}}))
             applied, why = run_tool(['kubectl', 'kustomize', str(kdir)], 60)
             if why:
                 skipped.append(f'{where}: admission policies not checked ({why}); CI checks them')
@@ -4137,10 +4157,13 @@ def check_deploy_files(root, name=None):
     found = check_post_checks(root)
     for path in sorted(local.rglob('*')):
         rel = path.relative_to(local)
-        if path.is_file() and not (rel.as_posix() in ('app.yaml', 'checks.yaml') or (len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
-                                                                    and rel.suffix in ('.yaml', '.yml'))):
+        overlay_file = rel.suffix in ('.yaml', '.yml') and (
+            len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
+            or len(rel.parts) == 3 and rel.parts[0] == FETCH_DIR and rel.parts[1] in DEPLOY_DIRS)
+        if path.is_file() and not (rel.as_posix() in ('app.yaml', 'checks.yaml') or overlay_file):
             found.append(finding('error', f'{DEPLOY}/{rel.as_posix()}', 'not deployed: deploy/ holds app.yaml, checks.yaml and '
-                                 'base/, dev/, prod/ *.yaml only, and a merge with anything else is not deployed',
+                                 'base/, dev/, prod/ *.yaml only (a fetch zone also fetch/base/, fetch/dev/, '
+                                 'fetch/prod/ *.yaml), and a merge with anything else is not deployed',
                                  'README "How an app is put together"'))
     if not any((local / 'base').glob('*.y*ml')):
         try:
@@ -4158,7 +4181,9 @@ def check_deploy_files(root, name=None):
         found.append(finding('error', f'{DEPLOY}/dev/kustomization.yaml',
                              f'missing: the dev overlay (namespace: {name or "<app>"}-dev, resources: [../base]); '
                              'nothing registers or deploys without it', 'README "How an app is put together"'))
-    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
+    found += check_fetch_zone(local, name)
+    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name), (f'{FETCH_DIR}/dev', f'{name}-fetch-dev'),
+                               (f'{FETCH_DIR}/prod', f'{name}-fetch')):
         path = local / overlay / 'kustomization.yaml'
         if not name or not path.is_file():
             continue
@@ -4176,6 +4201,53 @@ def check_deploy_files(root, name=None):
         if '../base' not in (spec.get('resources') or []):
             found.append(finding('error', f'{DEPLOY}/{overlay}/kustomization.yaml', 'resources must include ../base',
                                  'README "How an app is put together"'))
+    return found
+
+
+FETCH_DIR = 'fetch'
+FETCH_QUEUE_SIZES = ('1Gi',)  # the zone's quota: one 1Gi volume
+
+
+def check_fetch_zone(local, name):
+    """An app's fetch zone (homelab docs/restricted-egress-plan.md): deploy/app.yaml's `fetch:` block, written as a
+    block mapping holding exactly `services: {queue: {type: redis}}` (the platform's deploy controller copies it as
+    text, and the queue's Secret queue-connection is the only one the app's store may read), and the fetcher in
+    deploy/fetch/base/ with the overlays fetch/dev/ (and fetch/prod/ for production). Either both or neither."""
+    at, guide = f'{DEPLOY}/app.yaml', 'fetch'
+    try:
+        text = (local / 'app.yaml').read_text()
+        spec = yaml.safe_load(text) or {}
+    except (OSError, yaml.YAMLError):
+        return []  # reported where app.yaml is loaded
+    zone_files = [p for p in (local / FETCH_DIR).rglob('*') if p.is_file()] if (local / FETCH_DIR).is_dir() else []
+    if not isinstance(spec, dict) or 'fetch' not in spec:
+        if zone_files:
+            return [finding('error', f'{DEPLOY}/{FETCH_DIR}', 'a fetch zone without `fetch:` in deploy/app.yaml: add '
+                            'the block (services: {queue: {type: redis}}) or remove deploy/fetch/', guide)]
+        return []
+    found = []
+    fetch = spec['fetch']
+    if not re.search(r'(?m)^fetch:[ \t]*(?:#.*)?$', text):
+        found.append(finding('error', at, '`fetch:` must be a block (fetch:, then services: indented below it); the '
+                             'platform copies it as text', guide))
+    services = fetch.get('services') if isinstance(fetch, dict) else None
+    queue = services.get('queue') if isinstance(services, dict) else None
+    if not isinstance(fetch, dict) or set(fetch) != {'services'} or not isinstance(services, dict) \
+            or set(services) != {'queue'} or not isinstance(queue, dict) or queue.get('type') != 'redis' \
+            or set(queue) - {'type', 'size'}:
+        found.append(finding('error', at, '`fetch:` holds exactly `services: {queue: {type: redis}}`: one redis queue '
+                             'named queue, the zone\'s only block (its Secret queue-connection is what the app reads)',
+                             guide))
+    elif 'size' in queue and queue['size'] not in FETCH_QUEUE_SIZES:
+        found.append(finding('error', at, f"the fetch queue's size must be {', '.join(FETCH_QUEUE_SIZES)} (the zone's "
+                             'quota)', guide))
+    if not any((local / FETCH_DIR / 'base').glob('*.y*ml')):
+        found.append(finding('error', f'{DEPLOY}/{FETCH_DIR}/base', 'missing: the fetcher\'s Kustomize base (its '
+                             'Deployment or CronJobs, the app\'s own image)', guide))
+    elif not (local / FETCH_DIR / 'dev' / 'kustomization.yaml').is_file():
+        found.append(finding('error', f'{DEPLOY}/{FETCH_DIR}/dev/kustomization.yaml',
+                             f'missing: the fetch zone\'s dev overlay (namespace: {name or "<app>"}-fetch-dev, '
+                             'resources: [../base])', guide))
     return found
 
 
@@ -6348,9 +6420,11 @@ def edit_kustomization(text, entry, add=True):
     return new
 
 
-def deploy_documents(local):
-    """(file, document) for every YAML document in deploy/base, dev and prod."""
+def deploy_documents(local, zone=''):
+    """(file, document) for every YAML document in deploy/base, dev and prod; with zone='fetch', in the fetch zone's
+    deploy/fetch/base, dev and prod instead."""
     for part in DEPLOY_DIRS:
+        part = f'{zone}/{part}' if zone else part
         for path in sorted((local / part).glob('*.y*ml')) if (local / part).is_dir() else ():
             try:
                 docs = list(yaml.safe_load_all(path.read_text()))
@@ -6369,19 +6443,50 @@ def cronjob_parts(doc):
     return spec, job, pod, ((pod.get('containers') or [{}])[0] or {})
 
 
+def fetch_secret_refs(pod):
+    """Names of the Secrets a pod spec reads: env valueFrom, envFrom and secret volumes (projected ones too)."""
+    names = set()
+    for c in (pod.get('containers') or []) + (pod.get('initContainers') or []):
+        for e in (c or {}).get('env') or []:
+            ref = ((e or {}).get('valueFrom') or {}).get('secretKeyRef') or {}
+            if ref:
+                names.add(str(ref.get('name')))
+        for e in (c or {}).get('envFrom') or []:
+            if (e or {}).get('secretRef'):
+                names.add(str(e['secretRef'].get('name')))
+    for v in pod.get('volumes') or []:
+        if (v or {}).get('secret'):
+            names.add(str(v['secret'].get('secretName')))
+        for source in ((v or {}).get('projected') or {}).get('sources') or []:
+            if (source or {}).get('secret'):
+                names.add(str(source['secret'].get('name')))
+    return names
+
+
+FETCH_SECRET = 'queue-connection'
+
+
 def check_jobs(app, catalog):
-    """Rules for the CronJobs (and bare Jobs) in a checkout's deploy/: the settings the platform needs, the
-    app's own image, Secrets that exist, pods the app's Service doesn't select, and listed in the base."""
+    """Rules for the CronJobs (and bare Jobs) in a checkout's deploy/, and in its fetch zone's deploy/fetch/: the
+    settings the platform needs, the app's own image, Secrets that exist (a fetcher: only its queue's), pods the
+    app's Service doesn't select, and listed in the base."""
     if app.get('where') != DEPLOY or not app.get('root'):
         return []
     local = pathlib.Path(app['root']) / DEPLOY
     found = []
-    listed = None
-    kustomization = local / 'base' / 'kustomization.yaml'
-    if kustomization.is_file():
-        listed = kustomization_resources(kustomization.read_text())
     own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name']) + r'(@sha256:[0-9a-f]{64})?'
-    for where, doc in deploy_documents(local):
+    for zone in ('', FETCH_DIR):
+        base = f'{zone}/base' if zone else 'base'
+        kustomization = local / base / 'kustomization.yaml'
+        listed = kustomization_resources(kustomization.read_text()) if kustomization.is_file() else None
+        found += check_job_documents(app, catalog, deploy_documents(local, zone), own, base, listed, fetch=bool(zone))
+    return found
+
+
+def check_job_documents(app, catalog, documents, own, base, listed, fetch=False):
+    """check_jobs for one set of documents: the app's (base/, dev/, prod/) or its fetch zone's."""
+    found = []
+    for where, doc in documents:
         kind, name = doc.get('kind'), str((doc.get('metadata') or {}).get('name') or '')
         if kind == 'Job':
             found.append(finding('warning', where, f'Job {name}: one-off Jobs are not supported yet (it runs once, '
@@ -6417,6 +6522,17 @@ def check_jobs(app, catalog):
         if not re.fullmatch(own, image):
             found.append(finding('error', where, f'{label}: image {image or "(none)"}: a job runs the app\'s own image '
                                  f'(ghcr.io/davidlarrimore/homelab-apps/{app["name"]}, without a digest)', JOB_SEE))
+        if fetch:
+            # A fetcher holds no credential but its queue's (homelab docs/restricted-egress-plan.md); the app's blocks
+            # and their Secrets are in the app's namespace, out of its reach.
+            other = sorted(fetch_secret_refs(pod) - {FETCH_SECRET})
+            if other:
+                found.append(finding('error', where, f'{label}: a fetcher may read only its queue\'s Secret '
+                                     f'{FETCH_SECRET} (it reads {", ".join(other)})', 'fetch'))
+            if where.startswith(f'{DEPLOY}/{base}/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
+                found.append(finding('error', where, f'{label}: not in {DEPLOY}/{base}/kustomization.yaml resources, '
+                                     'so it is never deployed', JOB_SEE))
+            continue
         labels = ((job.get('template') or {}).get('metadata') or {}).get('labels') or {}
         selector = app.get('selector') or {}
         if selector and all(labels.get(k) == v for k, v in selector.items()):
@@ -6424,7 +6540,7 @@ def check_jobs(app, catalog):
                                  f'({", ".join(f"{k}={v}" for k, v in selector.items())}), so the app\'s Service would '
                                  'send requests to a job; give them their own (`magehand job add` does)', JOB_SEE))
         found += env_findings(app, container, where, catalog)
-        if where.startswith(f'{DEPLOY}/base/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
+        if where.startswith(f'{DEPLOY}/{base}/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
             found.append(finding('error', where, f'{label}: not in deploy/base/kustomization.yaml resources, so it '
                                  'is never deployed', JOB_SEE))
     return found

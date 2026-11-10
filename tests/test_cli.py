@@ -1641,6 +1641,109 @@ def deploy_repo(tmp, app_yaml='services:\n  ai: {type: llm, models: [paid/m2]}\n
     return root
 
 
+FETCH_APP = 'services: {}\nfetch:\n  services:\n    queue: {type: redis}\n'
+FETCH_FILES = {'deploy/fetch/base/kustomization.yaml': 'resources: [fetcher.yaml]\n',
+               'deploy/fetch/base/fetcher.yaml': 'kind: Deployment\nmetadata: {name: fetcher}\n',
+               'deploy/fetch/dev/kustomization.yaml': 'namespace: demo-fetch-dev\nresources: [../base]\n'}
+
+
+class FetchZone(unittest.TestCase):
+    """deploy/app.yaml `fetch:` and deploy/fetch/: an app's fetch zone (homelab docs/restricted-egress-plan.md)."""
+
+    def found(self, app_yaml=FETCH_APP, files=FETCH_FILES):
+        with tempfile.TemporaryDirectory() as tmp:
+            return [(f['level'], f['where'], f['text']) for f in
+                    magehand.check_deploy_files(deploy_repo(tmp, app_yaml, files), 'demo')]
+
+    def test_a_complete_zone_passes(self):
+        self.assertEqual(self.found(), [])
+        self.assertEqual(self.found('services: {}\nfetch:  # the crawler\n  services:\n    queue:\n      type: redis\n'
+                                    '      size: 1Gi\n'), [])
+        prod = {**FETCH_FILES, 'deploy/fetch/prod/kustomization.yaml': 'namespace: demo-fetch\nresources: [../base]\n'}
+        self.assertEqual(self.found(files=prod), [])
+
+    def test_no_zone_is_unchanged(self):
+        self.assertEqual(self.found('services: {}\n', {}), [])
+
+    def test_the_block_and_the_directory_go_together(self):
+        (finding,) = self.found('services: {}\n')
+        self.assertEqual(finding[:2], ('error', 'deploy/fetch'))
+        found = self.found(files={})
+        self.assertEqual([f[1] for f in found], ['deploy/fetch/base'])
+        no_dev = {k: v for k, v in FETCH_FILES.items() if '/dev/' not in k}
+        self.assertEqual([f[1] for f in self.found(files=no_dev)], ['deploy/fetch/dev/kustomization.yaml'])
+
+    def test_the_block_is_one_redis_queue_named_queue(self):
+        for label, block in {
+                'flow style': 'fetch: {services: {queue: {type: redis}}}\n',
+                'true': 'fetch: true\n',
+                'other name': 'fetch:\n  services:\n    jobs: {type: redis}\n',
+                'two blocks': 'fetch:\n  services:\n    queue: {type: redis}\n    db: {type: postgres}\n',
+                'postgres': 'fetch:\n  services:\n    queue: {type: postgres}\n',
+                'other key': 'fetch:\n  services:\n    queue: {type: redis}\n  egress: any\n',
+                'option': 'fetch:\n  services:\n    queue: {type: redis, access: public}\n',
+                'too big': 'fetch:\n  services:\n    queue: {type: redis, size: 2Gi}\n'}.items():
+            with self.subTest(label):
+                found = self.found('services: {}\n' + block)
+                self.assertTrue(found and all(f[:2] == ('error', 'deploy/app.yaml') for f in found), found)
+
+    def test_overlays_and_files(self):
+        files = {**FETCH_FILES, 'deploy/fetch/dev/kustomization.yaml': 'namespace: demo-dev\nresources: [../base]\n',
+                 'deploy/fetch/prod/kustomization.yaml': 'namespace: demo\nresources: [x]\n',
+                 'deploy/fetch/base/x/y.yaml': 'x', 'deploy/fetch/stage/k.yaml': 'x', 'deploy/fetch/README.md': 'x'}
+        where = sorted(f[1] for f in self.found(files=files))
+        self.assertEqual(where, ['deploy/fetch/README.md', 'deploy/fetch/base/x/y.yaml',
+                                 'deploy/fetch/dev/kustomization.yaml', 'deploy/fetch/prod/kustomization.yaml',
+                                 'deploy/fetch/prod/kustomization.yaml', 'deploy/fetch/stage/k.yaml'])
+
+
+class FetchZoneRendered(unittest.TestCase):
+    """check_rendered renders and checks a fetch zone's overlays too (review of #84): their namespace, the kinds a
+    fetch zone may hold, and a render that fails."""
+
+    def run_rendered(self, answers, prod=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = dict(FETCH_FILES)
+            if prod:
+                files['deploy/fetch/prod/kustomization.yaml'] = 'namespace: demo-fetch\nresources: [../base]\n'
+            root = deploy_repo(tmp, FETCH_APP, files)
+            seen = []
+
+            def render(local, overlay):
+                seen.append(overlay)
+                return answers.get(overlay, ([], None))
+            with mock.patch.object(magehand, 'render_overlay', render), \
+                    mock.patch.object(magehand, 'check_admission', lambda name, rendered: ([], [])), \
+                    mock.patch.object(magehand, 'check_schemas', lambda rendered: ([], [])):
+                found, _ = magehand.check_rendered(root, 'demo')
+        return seen, [(f['level'], f['where'], f['text']) for f in found]
+
+    def test_both_fetch_overlays_are_rendered(self):
+        seen, found = self.run_rendered({})
+        self.assertEqual(seen, ['dev', 'fetch/dev', 'fetch/prod'])
+        self.assertEqual(found, [])
+        seen, _ = self.run_rendered({}, prod=False)
+        self.assertEqual(seen, ['dev', 'fetch/dev'])
+
+    def test_a_fetch_overlay_that_does_not_render_is_an_error(self):
+        _, found = self.run_rendered({'fetch/dev': ('failed', "accumulating resources: 'does-not-exist.yaml'")})
+        self.assertEqual([f[:2] for f in found], [('error', 'deploy/fetch/dev')])
+        self.assertIn('does-not-exist.yaml', found[0][2])
+
+    def test_kinds_and_namespace_of_a_fetch_zone(self):
+        def doc(kind, api='v1', ns=None):
+            meta = {'name': 'x', **({'namespace': ns} if ns else {})}
+            return {'apiVersion': api, 'kind': kind, 'metadata': meta}
+        docs = [doc('Deployment', 'apps/v1'), doc('CronJob', 'batch/v1'), doc('ConfigMap'),
+                doc('Ingress', 'networking.k8s.io/v1'), doc('ExternalSecret', 'external-secrets.io/v1'),
+                doc('Secret'), doc('Service'), doc('Deployment', 'apps/v1', ns='demo-dev')]
+        _, found = self.run_rendered({'fetch/dev': (docs, None)})
+        errors = [(where, text) for level, where, text in found if level == 'error']
+        refused = sorted(t.split(' (')[0] for _, t in errors if 'not allowed in a fetch zone' in t)
+        self.assertEqual(refused, ['ExternalSecret', 'Ingress', 'Secret', 'Service'])
+        self.assertTrue(any('namespace must be demo-fetch-dev' in t for _, t in errors))
+
+
 class DeployDir(unittest.TestCase):
     """An app repo with deploy/: magehand reads the app from the checkout, not homelab-apps."""
 
@@ -1864,7 +1967,7 @@ class DeployDir(unittest.TestCase):
                     'pass: 7, fail: 1, warn: 0, error: 0, skip: 4 \n')
 
     def cluster_rules(self, kyverno='', kubeconform='', tools=('kyverno', 'kubeconform'), policies=('pods.yaml',),
-                      kustomize=0):
+                      kustomize=0, rendered=None):
         """check_admission and check_schemas on one rendered dev overlay, with the tools answering as given."""
         calls = []
 
@@ -1873,6 +1976,7 @@ class DeployDir(unittest.TestCase):
             if argv[:2] == ['kubectl', 'kustomize']:
                 applied = pathlib.Path(argv[2])
                 self.kustomization = json.loads((applied / 'kustomization.yaml').read_text())
+                self.kustomizations.append(self.kustomization)
                 return subprocess.CompletedProcess(argv, kustomize, (applied / 'app.yaml').read_text(),
                                                    'Error: bad image' if kustomize else '')
             output = kyverno if argv[0].endswith('kyverno') else kubeconform
@@ -1883,7 +1987,8 @@ class DeployDir(unittest.TestCase):
                 mock.patch.object(magehand.shutil, 'which', lambda t: f'/usr/local/bin/{t}' if t in tools else None), \
                 mock.patch.object(magehand, 'github_dir', lambda repo, path, **k: [n.rsplit('/', 1)[1] for n in files]), \
                 mock.patch.object(magehand, 'github_file', lambda repo, path, **k: files[path]):
-            rendered = [('dev', [self.DEV_DEPLOYMENT])]
+            rendered = rendered or [('dev', [self.DEV_DEPLOYMENT])]
+            self.kustomizations = []
             admission, schemas = magehand.check_admission('demo', rendered), magehand.check_schemas(rendered)
         return admission, schemas, calls
 
@@ -1899,6 +2004,14 @@ class DeployDir(unittest.TestCase):
                                                          'digest': magehand.POLICY_DIGEST}])
         self.assertEqual(self.kustomization['commonAnnotations'],
                          {'argocd.argoproj.io/tracking-id': 'demo-dev:policy-check'})
+
+    def test_a_fetch_zone_is_checked_as_its_own_application(self):
+        ok = 'Applying 4 policy rule(s) to 2 resource(s)...\n\npass: 8, fail: 0, warn: 0, error: 0, skip: 2\n'
+        rendered = [('dev', [self.DEV_DEPLOYMENT]), ('fetch/dev', [self.DEV_DEPLOYMENT]),
+                    ('fetch/prod', [self.DEV_DEPLOYMENT])]
+        self.cluster_rules(kyverno=ok, rendered=rendered)
+        self.assertEqual([k['commonAnnotations']['argocd.argoproj.io/tracking-id'] for k in self.kustomizations],
+                         ['demo-dev:policy-check', 'demo-fetch-dev:policy-check', 'demo-fetch-prod:policy-check'])
 
     def test_a_refusal_names_the_policy_the_resource_and_why(self):
         (found, skipped), _, _ = self.cluster_rules(kyverno=self.KYVERNO_FAIL)
@@ -2108,6 +2221,7 @@ class AppNameOverride(unittest.TestCase):
         for app_yaml, why in (('app: Lab\nservices: {}\n', 'not an app name'),
                               ('app: litellm\nservices: {}\n', 'reserved'),
                               ('app: lab-dev\nservices: {}\n', 'not an app name'),
+                              ('app: lab-fetch\nservices: {}\n', 'not an app name'),
                               ('app: [x\n', 'not valid YAML')):
             with tempfile.TemporaryDirectory() as tmp:
                 code, result = self.run_check(self.seeded(tmp, app_yaml), name='lab-website')
@@ -2784,7 +2898,7 @@ class New(unittest.TestCase):
 
     def test_bad_and_reserved_names(self):
         self.fake()
-        for name in ('Elvis', '-x', 'a' * 41, 'litellm', 'homelab-apps'):
+        for name in ('Elvis', '-x', 'a' * 41, 'litellm', 'homelab-apps', 'crawl-fetch'):
             with self.assertRaises(SystemExit) as ctx:
                 self.run_new(name)
             self.assertEqual(ctx.exception.code, 2, name)
@@ -6027,6 +6141,34 @@ class Jobs(unittest.TestCase):
         self.assertTrue(any("Secret 'missing-connection'" in e for e in errors))
         self.assertTrue(any('never deployed' in e for e in errors))
         self.assertTrue(any('more often than every 5' in w for w in texts(found, 'warning')))
+
+    def write_fetch(self, doc, name='fetch-crawl.yaml', listed=True):
+        import yaml as pyyaml
+        base = self.root / 'deploy/fetch/base'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / name).write_text(pyyaml.safe_dump(doc, sort_keys=False))
+        (base / 'kustomization.yaml').write_text('resources:\n' + (f'  - {name}\n' if listed else '  - other.yaml\n'))
+
+    def test_a_fetch_zone_cronjob_meets_the_same_rules(self):
+        # Review of #84: a fetcher's CronJob without a timeout passed check, and with Forbid a hung crawl blocks every
+        # later run.
+        self.write_fetch(self.cronjob(job__activeDeadlineSeconds=None, spec__startingDeadlineSeconds=None,
+                                      container__env=[ref('Q', 'queue-connection', 'uri')]))
+        errors = [(f['where'], f['text']) for f in magehand.check_jobs(self.app(), CATALOG_MODELS)
+                  if f['level'] == 'error']
+        self.assertEqual({w for w, _ in errors}, {'deploy/fetch/base/fetch-crawl.yaml'})
+        for why in ('activeDeadlineSeconds', 'startingDeadlineSeconds'):
+            self.assertTrue(any(why in t for _, t in errors), why)
+
+    def test_a_fetcher_reads_only_its_queue_and_is_listed(self):
+        ok = self.cronjob(container__env=[ref('Q', 'queue-connection', 'uri')])
+        self.write_fetch(ok)
+        self.assertEqual(magehand.check_jobs(self.app(), CATALOG_MODELS), [])
+        self.write_fetch(self.cronjob(container__env=[ref('Q', 'queue-connection', 'uri'),
+                                                      ref('KEY', 'ai-connection', 'api_key')]), listed=False)
+        errors = texts(magehand.check_jobs(self.app(), CATALOG_MODELS), 'error')
+        self.assertTrue(any("only its queue's Secret queue-connection (it reads ai-connection)" in e for e in errors))
+        self.assertTrue(any('deploy/fetch/base/kustomization.yaml' in e and 'never deployed' in e for e in errors))
 
     def test_a_bare_job_is_a_warning(self):
         (self.root / 'deploy/base/once.yaml').write_text('kind: Job\nmetadata: {name: once}\n')
