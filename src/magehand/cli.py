@@ -7354,7 +7354,13 @@ def fetch_rm(a, app, local):
     edits = {}
     for overlay in ('dev', 'prod'):
         k = local / overlay / 'kustomization.yaml'
-        if k.is_file() and FETCH_QUEUE_FILE in (kustomization_resources(k.read_text()) or []):
+        if not k.is_file():
+            continue
+        listed = kustomization_resources(k.read_text())
+        if listed is None:  # unreadable is not empty: it may still list fetch-queue.yaml
+            die(f'{DEPLOY}/{overlay}/kustomization.yaml is not a readable Kustomization: nothing changed. Repair it, '
+                'then run `magehand fetch rm` again')
+        if FETCH_QUEUE_FILE in listed:
             new = edit_kustomization(k.read_text(), FETCH_QUEUE_FILE, add=False)
             if new is None:
                 die(f'could not remove {FETCH_QUEUE_FILE} from {DEPLOY}/{overlay}/kustomization.yaml: nothing '

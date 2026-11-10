@@ -6074,6 +6074,16 @@ class FetchScaffold(unittest.TestCase):
         self.assertTrue((self.root / 'deploy/fetch/base/fetcher.yaml').exists())
         self.assertTrue((self.root / 'deploy/dev/fetch-queue.yaml').exists())
 
+    def test_rm_with_an_unreadable_overlay_changes_nothing(self):
+        # Review of #85: a broken kustomization.yaml read as "no resources", so rm deleted fetch-queue.yaml it lists.
+        self.assertEqual(self.init()[0], 0)
+        k = self.root / 'deploy/dev/kustomization.yaml'
+        k.write_text(k.read_text() + 'broken: [\n')
+        snapshot = {p: p.read_text() for p in self.root.rglob('*') if p.is_file()}
+        code, _, err = self.run_main('fetch', 'rm')
+        self.assertEqual(code, 1)
+        self.assertEqual({p: p.read_text() for p in self.root.rglob('*') if p.is_file()}, snapshot)
+
     def test_the_fetcher_never_rolls_beside_itself(self):
         # Review of #85: above 256Mi two fetchers and the queue exceed the zone's 768Mi of limits.
         for memory in ('256Mi', '384Mi', '512Mi'):
