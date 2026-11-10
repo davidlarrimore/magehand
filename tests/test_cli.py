@@ -5990,6 +5990,126 @@ class Icon(unittest.TestCase):
         self.assertIn("inside the app's repo", err)
 
 
+class FetchScaffold(unittest.TestCase):
+    """`magehand fetch init/rm`: the fetch zone's scaffold, which `check` accepts as written."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = deploy_repo(self.tmp.name, extra={
+            'deploy/base/kustomization.yaml': 'resources:\n  - deployment.yaml\n  - es.yaml\n',
+            'deploy/prod/kustomization.yaml': 'namespace: demo\nresources:\n  - ../base\n'})
+        (self.root / 'deploy/base/deployment.yaml').write_text(SELECTED)
+        self.before = {p: p.read_text() for p in self.root.rglob('*') if p.is_file()}
+        self.cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, self.cwd)
+        for p in (mock.patch.object(magehand, 'app_repo_here', lambda: 'demo'),
+                  mock.patch.object(magehand, 'app_here', lambda name=None: magehand.try_load_app('demo', self.root))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    run_main = CommandLine.run_main
+
+    def init(self, *extra):
+        return self.run_main('fetch', 'init', *extra, '--', 'python', '-m', 'app.fetcher')
+
+    def test_init_writes_a_zone_check_accepts(self):
+        code, out, err = self.init()
+        self.assertEqual(code, 0, err)
+        local = self.root / 'deploy'
+        spec = yaml_load((local / 'app.yaml').read_text())
+        self.assertEqual(spec['fetch'], {'services': {'queue': {'type': 'redis'}}})
+        fetcher = yaml_load((local / 'fetch/base/fetcher.yaml').read_text())
+        (container,) = fetcher['spec']['template']['spec']['containers']
+        self.assertEqual(container['command'], ['python', '-m', 'app.fetcher'])
+        self.assertEqual(container['image'], 'ghcr.io/davidlarrimore/homelab-apps/demo')
+        self.assertEqual(container['env'], [{'name': 'QUEUE_URL', 'valueFrom': {'secretKeyRef': {
+            'name': 'queue-connection', 'key': 'uri'}}}])  # none of the app's env or Secrets
+        self.assertFalse(fetcher['spec']['template']['spec']['automountServiceAccountToken'])
+        for overlay, zone in (('dev', 'demo-fetch-dev'), ('prod', 'demo-fetch')):
+            self.assertEqual(yaml_load((local / f'fetch/{overlay}/kustomization.yaml').read_text()),
+                             {'namespace': zone, 'resources': ['../base']})
+            es = yaml_load((local / f'{overlay}/fetch-queue.yaml').read_text())
+            self.assertEqual(es['spec']['secretStoreRef'], {'kind': 'SecretStore', 'name': 'fetch-queue'})
+            self.assertEqual(es['spec']['target']['template']['data']['uri'],
+                             f'redis://:{{{{ .password }}}}@queue.{zone}.svc:6379/0')
+            self.assertIn('fetch-queue.yaml', magehand.kustomization_resources(
+                (local / f'{overlay}/kustomization.yaml').read_text()))
+        self.assertEqual(magehand.check_deploy_files(self.root, 'demo'), [])
+        self.assertEqual(magehand.check_jobs(magehand.try_load_app('demo', self.root), CATALOG_MODELS), [])
+        self.assertIn('fetch-queue', magehand.provided_secrets('demo', self.root))
+
+    def test_init_refuses_bad_input_and_a_second_zone(self):
+        code, _, err = self.run_main('fetch', 'init')
+        self.assertEqual(code, 2)
+        code, _, err = self.init('--memory', '1Gi')
+        self.assertEqual(code, 2)
+        self.assertIn('512Mi', err)
+        self.assertEqual(self.init()[0], 0)
+        self.assertEqual(self.init()[0], 1)
+
+    def test_rm_an_edited_block_keeps_the_rest_or_changes_nothing(self):
+        # Review of #85: an unindented comment inside an edited block ended it early and left `services:` behind.
+        app_yaml = self.root / 'deploy/app.yaml'
+        base = app_yaml.read_text()
+        for edited in ('fetch:\n# the crawler\n  services:\n    queue:\n      type: redis\n',
+                       'fetch:\n  services:\n\n    queue: {type: redis, size: 1Gi}',  # no newline at the end
+                       'fetch:  # zone\n  services:\n    queue: {type: redis}\nlater: 1\n'):
+            with self.subTest(edited):
+                self.assertEqual(self.init()[0], 0)
+                app_yaml.write_text(base + edited)
+                self.assertEqual(self.run_main('fetch', 'rm')[0], 0)
+                spec = yaml_load(app_yaml.read_text())
+                self.assertNotIn('fetch', spec)
+                self.assertEqual(spec, {**yaml_load(base), **({'later': 1} if 'later' in edited else {})})
+                self.assertFalse((self.root / 'deploy/fetch').exists())
+                app_yaml.write_text(base)
+        # A layout it can't take apart safely: nothing is changed or deleted.
+        self.assertEqual(self.init()[0], 0)
+        tricky = base + 'fetch: &zone\n  services:\n    queue: {type: redis}\nalias: *zone\n'
+        app_yaml.write_text(tricky)
+        self.assertEqual(self.run_main('fetch', 'rm')[0], 1)
+        self.assertEqual(app_yaml.read_text(), tricky)
+        self.assertTrue((self.root / 'deploy/fetch/base/fetcher.yaml').exists())
+        self.assertTrue((self.root / 'deploy/dev/fetch-queue.yaml').exists())
+
+    def test_rm_with_an_unreadable_overlay_changes_nothing(self):
+        # Review of #85: a broken kustomization.yaml read as "no resources", so rm deleted fetch-queue.yaml it lists.
+        self.assertEqual(self.init()[0], 0)
+        k = self.root / 'deploy/dev/kustomization.yaml'
+        k.write_text(k.read_text() + 'broken: [\n')
+        snapshot = {p: p.read_text() for p in self.root.rglob('*') if p.is_file()}
+        code, _, err = self.run_main('fetch', 'rm')
+        self.assertEqual(code, 1)
+        self.assertEqual({p: p.read_text() for p in self.root.rglob('*') if p.is_file()}, snapshot)
+
+    def test_the_fetcher_never_rolls_beside_itself(self):
+        # Review of #85: above 256Mi two fetchers and the queue exceed the zone's 768Mi of limits.
+        for memory in ('256Mi', '384Mi', '512Mi'):
+            doc = magehand.fetcher_manifest(magehand.try_load_app('demo', self.root), ['x'], memory)
+            self.assertEqual(doc['spec']['strategy'], {'type': 'Recreate'})
+            self.assertEqual(magehand.check_rollout_room('deploy/fetch/dev', 'fetch/dev', [doc],
+                                                         {'queue': {'type': 'redis'}}), [])
+
+    def test_the_zone_in_app_and_status(self):
+        app = magehand.try_load_app('demo', self.root)
+        self.assertIsNone(magehand.fetch_zone_summary(app, {'services': {}}))
+        self.assertEqual(self.init()[0], 0)
+        app = magehand.try_load_app('demo', self.root)
+        self.assertEqual(magehand.fetch_zone_summary(app, {'services': {}}),
+                         {'namespace': 'demo-fetch-dev', 'prod_namespace': 'demo-fetch', 'deployed': False})
+        self.assertTrue(magehand.fetch_zone_summary(app, {'services': {}, 'fetch': True})['deployed'])
+
+    def test_rm_restores_the_checkout(self):
+        self.assertEqual(self.init()[0], 0)
+        code, out, err = self.run_main('fetch', 'rm', '--json')
+        self.assertEqual(code, 0, err)
+        after = {p: p.read_text() for p in self.root.rglob('*') if p.is_file()}
+        self.assertEqual(after, self.before)
+        self.assertEqual(self.run_main('fetch', 'rm')[0], 1)
+
+
 class Jobs(unittest.TestCase):
     """`magehand job add/rm/ls` and the CronJob rules of `check` (homelab docs/app-jobs-plan.md)."""
 
