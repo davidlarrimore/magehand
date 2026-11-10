@@ -3536,6 +3536,13 @@ class PrWatch(unittest.TestCase):
             self.assertEqual((code, step), (None, None), what)
             self.assertIn(what, got)
 
+    def test_openclaws_own_pr_waits_for_the_owner(self):
+        pr = self.pr()
+        pr['author'] = {'login': magehand.BOT}
+        self.assertIsNone(self.step(pr)[0])
+        pr['reviews'] = [{'author': {'login': 'davidlarrimore'}, 'state': 'CHANGES_REQUESTED', 'commit': {'oid': self.HEAD}}]
+        self.assertEqual(self.step(pr)[0], magehand.WATCH_FINDINGS)
+
     def test_a_review_the_bot_handed_back_without_posting_failed(self):
         memory = {}
         self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])

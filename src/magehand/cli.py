@@ -6912,6 +6912,13 @@ def watch_step(pr, memory, now):
         if running or not rollup:
             return None, 'draft: checks running' if running else 'draft: no checks yet', None
         return WATCH_DONE, f'draft: checks green on {head[:7]}', f'`magehand pr ready {n}`, then `magehand pr watch {n}`'
+    if ((pr.get('author') or {}).get('login') or '').lower() == BOT.lower():  # OpenClaw's own PR: the owner reviews
+        theirs = [r for r in pr.get('reviews') or [] if ((r.get('author') or {}).get('login') or '').lower() != BOT.lower()
+                  and (r.get('commit') or {}).get('oid') == head and r.get('state') in ('COMMENTED', 'CHANGES_REQUESTED')]
+        if theirs:
+            return WATCH_FINDINGS, f"the owner's review of {head[:7]} asks for changes", \
+                f'fix them, answer and resolve each thread, push until green, then `magehand pr watch {n}`'
+        return None, 'OpenClaw\'s own PR: waiting for the owner to review and merge it', None
     review = bot_review_of(pr, head)
     held = any((label.get('name') or '') == HOLD for label in pr.get('labels') or [])
     if review and review.get('state') == 'APPROVED':
@@ -6989,6 +6996,9 @@ def pr_watch(a):
         time.sleep(WATCH_POLL)
     repo, n = '/'.join(pr['url'].split('/')[3:5]), pr['number']
     review = bot_review_of(pr, pr.get('headRefOid')) if code in (WATCH_FINDINGS, WATCH_DONE) else None
+    if code == WATCH_FINDINGS and not review:  # OpenClaw's own PR: the owner's review
+        review = ([r for r in pr.get('reviews') or [] if (r.get('commit') or {}).get('oid') == pr.get('headRefOid')]
+                  or [None])[-1]
     threads = open_bot_threads(repo, n) if code in (WATCH_FINDINGS, WATCH_DONE) else []
     if code == WATCH_DONE and pr.get('state') == 'MERGED':
         deploy = ('`magehand status --watch` (the build and the dev deploy)'
@@ -7001,7 +7011,8 @@ def pr_watch(a):
                           'threads': threads, 'next': step}, indent=1))
         sys.exit(code)
     if code == WATCH_FINDINGS and review:
-        print(f"\nOpenClaw's review ({pr['url']}):\n\n{(review.get('body') or '').strip()}\n")
+        who = (review.get('author') or {}).get('login') or 'the'
+        print(f"\n{'OpenClaw' if who == BOT else who}'s review ({pr['url']}):\n\n{(review.get('body') or '').strip()}\n")
     if threads:
         print(f"OpenClaw's open line comments ({len(threads)}):")
         for t in threads:
