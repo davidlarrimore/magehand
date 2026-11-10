@@ -2124,8 +2124,9 @@ COPY --from=test /coverage/ /
 FROM base AS runtime
 # The app installs nothing at run time: drop pip and its vendored libraries (certifi, urllib3, ...), which
 # the image scan flags (a fixable CRITICAL in pip's certifi failed egress-canary's first build).
-RUN rm -rf /usr/local/lib/python3.14/site-packages/pip /usr/local/lib/python3.14/site-packages/pip-* \\
-    /usr/local/lib/python3.14/site-packages/setuptools* /usr/local/bin/pip*
+RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-* \\
+    /usr/local/lib/python3*/site-packages/setuptools* /usr/local/bin/pip* \\
+    && ! python -c "import pip" 2>/dev/null
 USER 65532
 CMD ["python", "-B", "/app/app.py"]
 """,

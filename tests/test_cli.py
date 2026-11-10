@@ -3485,6 +3485,16 @@ class PrReady(unittest.TestCase):
 class Scaffold(unittest.TestCase):
     """`new` writes a deployable app's missing files into the checkout, never over one that exists."""
 
+    def test_runtime_stage_drops_pip_for_any_python_and_fails_if_it_stays(self):
+        # A fixable CRITICAL in pip's vendored certifi failed egress-canary's first build; a hard-coded python3.14
+        # path would silently stop matching after Renovate moves the base image to another Python.
+        dockerfile = magehand.SCAFFOLD_FILES['Dockerfile']
+        runtime = dockerfile[dockerfile.index('FROM base AS runtime'):]
+        self.assertIn('/usr/local/lib/python3*/site-packages/pip ', runtime)
+        self.assertNotIn('python3.1', runtime)
+        self.assertIn('! python -c "import pip"', runtime)
+        self.assertLess(runtime.index('import pip'), runtime.index('USER 65532'))
+
     def test_writes_a_deployable_app_that_passes_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
