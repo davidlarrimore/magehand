@@ -1789,7 +1789,8 @@ def release_next(plan, refuse, created=False):
         return f'`magehand status {plan["app"]}`: the platform deploys it to production within minutes'
     if refuse:
         return f'fix what blocks it (above), then `magehand release {plan["app"]} --dry-run` again'
-    return f'`magehand release {plan["app"]}` (the owner only: it deploys {plan["app"]} to production)'
+    return (f'`magehand release {plan["app"]}` (it deploys {plan["app"]} to production: run it when the owner '
+            'asks for the release)')
 
 
 def cmd_release(a):
@@ -5136,7 +5137,8 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    `deploy/`, that is the app's deployment: `deploy/app.yaml` requests blocks
    and models, `deploy/base/` is its Kubernetes manifests, `deploy/dev/` and
    `deploy/prod/` its overlays; edit them there. Merging deploys dev; the
-   owner's GitHub Release `vX.Y.Z` deploys production.
+   owner's GitHub Release `vX.Y.Z` deploys production: `magehand release`,
+   which you run only when the user asks for a release.
 2. Any "how do I ... on the homelab" question, before answering or coding:
    `magehand guide search <words>` (e.g. `web search`, `database`,
    `who is the user`, `env var`, `production`). Read the sections it prints
@@ -5235,7 +5237,7 @@ APPROVALS = (
     (('cd',), 'allow', 'changes directory (so `cd app && magehand check` needs no prompt)'),
     (('gh', 'pr', 'merge'), 'forbidden', 'the owner merges'),
     (('gh', 'release', ('create', 'edit', 'delete', 'upload')), 'forbidden',
-     'the owner releases (`magehand release`, in a terminal)'),
+     'releases go through `magehand release`, which checks first'),
     (('gh', 'repo', 'delete'), 'forbidden', 'the owner deletes repos'),
     (('git', 'push', '--tags'), 'forbidden', 'the owner tags releases'),
     (('git', 'push', 'origin', '--tags'), 'forbidden', 'the owner tags releases'),
