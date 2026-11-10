@@ -6142,6 +6142,34 @@ class Jobs(unittest.TestCase):
         self.assertTrue(any('never deployed' in e for e in errors))
         self.assertTrue(any('more often than every 5' in w for w in texts(found, 'warning')))
 
+    def write_fetch(self, doc, name='fetch-crawl.yaml', listed=True):
+        import yaml as pyyaml
+        base = self.root / 'deploy/fetch/base'
+        base.mkdir(parents=True, exist_ok=True)
+        (base / name).write_text(pyyaml.safe_dump(doc, sort_keys=False))
+        (base / 'kustomization.yaml').write_text('resources:\n' + (f'  - {name}\n' if listed else '  - other.yaml\n'))
+
+    def test_a_fetch_zone_cronjob_meets_the_same_rules(self):
+        # Review of #84: a fetcher's CronJob without a timeout passed check, and with Forbid a hung crawl blocks every
+        # later run.
+        self.write_fetch(self.cronjob(job__activeDeadlineSeconds=None, spec__startingDeadlineSeconds=None,
+                                      container__env=[ref('Q', 'queue-connection', 'uri')]))
+        errors = [(f['where'], f['text']) for f in magehand.check_jobs(self.app(), CATALOG_MODELS)
+                  if f['level'] == 'error']
+        self.assertEqual({w for w, _ in errors}, {'deploy/fetch/base/fetch-crawl.yaml'})
+        for why in ('activeDeadlineSeconds', 'startingDeadlineSeconds'):
+            self.assertTrue(any(why in t for _, t in errors), why)
+
+    def test_a_fetcher_reads_only_its_queue_and_is_listed(self):
+        ok = self.cronjob(container__env=[ref('Q', 'queue-connection', 'uri')])
+        self.write_fetch(ok)
+        self.assertEqual(magehand.check_jobs(self.app(), CATALOG_MODELS), [])
+        self.write_fetch(self.cronjob(container__env=[ref('Q', 'queue-connection', 'uri'),
+                                                      ref('KEY', 'ai-connection', 'api_key')]), listed=False)
+        errors = texts(magehand.check_jobs(self.app(), CATALOG_MODELS), 'error')
+        self.assertTrue(any("only its queue's Secret queue-connection (it reads ai-connection)" in e for e in errors))
+        self.assertTrue(any('deploy/fetch/base/kustomization.yaml' in e and 'never deployed' in e for e in errors))
+
     def test_a_bare_job_is_a_warning(self):
         (self.root / 'deploy/base/once.yaml').write_text('kind: Job\nmetadata: {name: once}\n')
         found = magehand.check_jobs(self.app(), CATALOG_MODELS)

@@ -6420,9 +6420,11 @@ def edit_kustomization(text, entry, add=True):
     return new
 
 
-def deploy_documents(local):
-    """(file, document) for every YAML document in deploy/base, dev and prod."""
+def deploy_documents(local, zone=''):
+    """(file, document) for every YAML document in deploy/base, dev and prod; with zone='fetch', in the fetch zone's
+    deploy/fetch/base, dev and prod instead."""
     for part in DEPLOY_DIRS:
+        part = f'{zone}/{part}' if zone else part
         for path in sorted((local / part).glob('*.y*ml')) if (local / part).is_dir() else ():
             try:
                 docs = list(yaml.safe_load_all(path.read_text()))
@@ -6441,19 +6443,50 @@ def cronjob_parts(doc):
     return spec, job, pod, ((pod.get('containers') or [{}])[0] or {})
 
 
+def fetch_secret_refs(pod):
+    """Names of the Secrets a pod spec reads: env valueFrom, envFrom and secret volumes (projected ones too)."""
+    names = set()
+    for c in (pod.get('containers') or []) + (pod.get('initContainers') or []):
+        for e in (c or {}).get('env') or []:
+            ref = ((e or {}).get('valueFrom') or {}).get('secretKeyRef') or {}
+            if ref:
+                names.add(str(ref.get('name')))
+        for e in (c or {}).get('envFrom') or []:
+            if (e or {}).get('secretRef'):
+                names.add(str(e['secretRef'].get('name')))
+    for v in pod.get('volumes') or []:
+        if (v or {}).get('secret'):
+            names.add(str(v['secret'].get('secretName')))
+        for source in ((v or {}).get('projected') or {}).get('sources') or []:
+            if (source or {}).get('secret'):
+                names.add(str(source['secret'].get('name')))
+    return names
+
+
+FETCH_SECRET = 'queue-connection'
+
+
 def check_jobs(app, catalog):
-    """Rules for the CronJobs (and bare Jobs) in a checkout's deploy/: the settings the platform needs, the
-    app's own image, Secrets that exist, pods the app's Service doesn't select, and listed in the base."""
+    """Rules for the CronJobs (and bare Jobs) in a checkout's deploy/, and in its fetch zone's deploy/fetch/: the
+    settings the platform needs, the app's own image, Secrets that exist (a fetcher: only its queue's), pods the
+    app's Service doesn't select, and listed in the base."""
     if app.get('where') != DEPLOY or not app.get('root'):
         return []
     local = pathlib.Path(app['root']) / DEPLOY
     found = []
-    listed = None
-    kustomization = local / 'base' / 'kustomization.yaml'
-    if kustomization.is_file():
-        listed = kustomization_resources(kustomization.read_text())
     own = r'ghcr\.io/davidlarrimore/homelab-apps/' + re.escape(app['name']) + r'(@sha256:[0-9a-f]{64})?'
-    for where, doc in deploy_documents(local):
+    for zone in ('', FETCH_DIR):
+        base = f'{zone}/base' if zone else 'base'
+        kustomization = local / base / 'kustomization.yaml'
+        listed = kustomization_resources(kustomization.read_text()) if kustomization.is_file() else None
+        found += check_job_documents(app, catalog, deploy_documents(local, zone), own, base, listed, fetch=bool(zone))
+    return found
+
+
+def check_job_documents(app, catalog, documents, own, base, listed, fetch=False):
+    """check_jobs for one set of documents: the app's (base/, dev/, prod/) or its fetch zone's."""
+    found = []
+    for where, doc in documents:
         kind, name = doc.get('kind'), str((doc.get('metadata') or {}).get('name') or '')
         if kind == 'Job':
             found.append(finding('warning', where, f'Job {name}: one-off Jobs are not supported yet (it runs once, '
@@ -6489,6 +6522,17 @@ def check_jobs(app, catalog):
         if not re.fullmatch(own, image):
             found.append(finding('error', where, f'{label}: image {image or "(none)"}: a job runs the app\'s own image '
                                  f'(ghcr.io/davidlarrimore/homelab-apps/{app["name"]}, without a digest)', JOB_SEE))
+        if fetch:
+            # A fetcher holds no credential but its queue's (homelab docs/restricted-egress-plan.md); the app's blocks
+            # and their Secrets are in the app's namespace, out of its reach.
+            other = sorted(fetch_secret_refs(pod) - {FETCH_SECRET})
+            if other:
+                found.append(finding('error', where, f'{label}: a fetcher may read only its queue\'s Secret '
+                                     f'{FETCH_SECRET} (it reads {", ".join(other)})', 'fetch'))
+            if where.startswith(f'{DEPLOY}/{base}/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
+                found.append(finding('error', where, f'{label}: not in {DEPLOY}/{base}/kustomization.yaml resources, '
+                                     'so it is never deployed', JOB_SEE))
+            continue
         labels = ((job.get('template') or {}).get('metadata') or {}).get('labels') or {}
         selector = app.get('selector') or {}
         if selector and all(labels.get(k) == v for k, v in selector.items()):
@@ -6496,7 +6540,7 @@ def check_jobs(app, catalog):
                                  f'({", ".join(f"{k}={v}" for k, v in selector.items())}), so the app\'s Service would '
                                  'send requests to a job; give them their own (`magehand job add` does)', JOB_SEE))
         found += env_findings(app, container, where, catalog)
-        if where.startswith(f'{DEPLOY}/base/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
+        if where.startswith(f'{DEPLOY}/{base}/') and listed is not None and where.rsplit('/', 1)[1] not in listed:
             found.append(finding('error', where, f'{label}: not in deploy/base/kustomization.yaml resources, so it '
                                  'is never deployed', JOB_SEE))
     return found
