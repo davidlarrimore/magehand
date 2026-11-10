@@ -3487,42 +3487,38 @@ class PrWatch(unittest.TestCase):
 
     HEAD = 'a' * 40
     GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
+    FAILED = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}]
 
     def pr(self, state='OPEN', draft=False, checks=GREEN, review=None, assigned=False, requested=False, labels=(),
-           head=HEAD):
-        reviews = [{'author': {'login': magehand.BOT}, 'state': s, 'commit': {'oid': c}, 'body': f'review {s}'}
-                   for s, c in (review or [])]
+           author='davidlarrimore'):
+        reviews = [{'author': {'login': who}, 'state': s, 'commit': {'oid': c}, 'body': f'review {s}'}
+                   for who, s, c in ((r if len(r) == 3 else (magehand.BOT, *r)) for r in (review or []))]
         return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': state,
-                'isDraft': draft, 'headRefOid': head, 'author': {'login': 'davidlarrimore'},
+                'isDraft': draft, 'headRefOid': self.HEAD, 'author': {'login': author},
                 'statusCheckRollup': checks, 'reviewRequests': [{'login': magehand.BOT}] if requested else [],
                 'reviews': reviews, 'assignees': [{'login': magehand.BOT}] if assigned else [],
                 'labels': [{'name': n} for n in labels]}
 
-    def step(self, pr, memory=None, now=0):
-        return magehand.watch_step(pr, {} if memory is None else memory, now)
+    def step(self, pr, memory=None, now=0, threads=()):
+        return magehand.watch_step(pr, {} if memory is None else memory, now, lambda: list(threads))
 
     def test_ends(self):
         H = self.HEAD
-        cases = (
-            (self.pr(state='MERGED'), magehand.WATCH_DONE, 'merged'),
-            (self.pr(state='CLOSED'), magehand.WATCH_FIX, 'closed'),
-            (self.pr(checks=[{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}]), magehand.WATCH_FIX,
-             'checks failed'),
-            (self.pr(draft=True), magehand.WATCH_DONE, 'draft: checks green'),
-            (self.pr(review=[('APPROVED', H)], labels=['hold']), magehand.WATCH_DONE, 'held'),
-            (self.pr(review=[('APPROVED', H), ('COMMENTED', H)]), magehand.WATCH_FINDINGS, 'has findings'),
-            (self.pr(review=[('COMMENTED', 'b' * 40)]), magehand.WATCH_FIX, 'pushed after the review'),
-            (self.pr(), magehand.WATCH_FIX, 'no review requested'),
-        )
-        for pr, code, what in cases:
-            got = self.step(pr)
-            self.assertEqual(got[0], code, what)
-            self.assertIn(what, got[1])
-            self.assertTrue(got[2] or what == 'merged', what)  # merged: pr_watch picks the step
-        # a failed check on a ready PR: undo ready first; on a draft, not
-        failed = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}]
-        self.assertIn('--undo', self.step(self.pr(checks=failed))[2])
-        self.assertNotIn('--undo', self.step(self.pr(checks=failed, draft=True))[2])
+        for pr, result in (
+                (self.pr(state='MERGED'), 'merged'),
+                (self.pr(state='CLOSED'), 'closed'),
+                (self.pr(checks=self.FAILED), 'failed'),
+                (self.pr(draft=True), 'green'),
+                (self.pr(review=[('APPROVED', H)], labels=['hold']), 'held'),
+                (self.pr(review=[('APPROVED', H), ('COMMENTED', H)]), 'findings'),
+                (self.pr(review=[('COMMENTED', H)], author='renovate[bot]'), 'reviewed'),
+                (self.pr(review=[('COMMENTED', 'b' * 40)]), 'unrequested'),
+                (self.pr(), 'unrequested')):
+            got, what, step = self.step(pr)
+            self.assertEqual(got, result, what)
+            self.assertTrue(step or result == 'merged', result)  # merged: pr_watch picks the step
+        self.assertIn('--undo', self.step(self.pr(checks=self.FAILED))[2])
+        self.assertNotIn('--undo', self.step(self.pr(checks=self.FAILED, draft=True))[2])
 
     def test_waits(self):
         H = self.HEAD
@@ -3532,33 +3528,41 @@ class PrWatch(unittest.TestCase):
                          (self.pr(review=[('APPROVED', H)]), 'waiting for the queue'),
                          (self.pr(review=[('APPROVED', H)], checks=self.GREEN + [{'name': 'x', 'status': 'QUEUED'}]),
                           'checks still running')):
-            code, got, step = self.step(pr)
-            self.assertEqual((code, step), (None, None), what)
+            result, got, step = self.step(pr)
+            self.assertEqual((result, step), (None, None), what)
             self.assertIn(what, got)
 
-    def test_openclaws_own_pr_waits_for_the_owner(self):
-        pr = self.pr()
-        pr['author'] = {'login': magehand.BOT}
-        self.assertIsNone(self.step(pr)[0])
-        pr['reviews'] = [{'author': {'login': 'davidlarrimore'}, 'state': 'CHANGES_REQUESTED', 'commit': {'oid': self.HEAD}}]
-        self.assertEqual(self.step(pr)[0], magehand.WATCH_FINDINGS)
+    def test_openclaws_own_pr_follows_the_owners_latest_verdict(self):
+        H, own = self.HEAD, magehand.BOT
+        self.assertIsNone(self.step(self.pr(author=own))[0])
+        changes = self.pr(author=own, review=[('davidlarrimore', 'CHANGES_REQUESTED', H)])
+        self.assertEqual(self.step(changes)[0], 'findings')
+        # line comments only: findings while a thread is open, not once they are resolved
+        comments = self.pr(author=own, review=[('davidlarrimore', 'COMMENTED', H)])
+        self.assertEqual(self.step(comments, threads=[{'id': 'T'}])[0], 'findings')
+        self.assertIsNone(self.step(comments)[0])
+        # commented, then approved (and a later reply in a thread): the approval decides
+        approved = self.pr(author=own, review=[('davidlarrimore', 'COMMENTED', H), ('davidlarrimore', 'APPROVED', H),
+                                               ('davidlarrimore', 'COMMENTED', H)])
+        result, what, _ = self.step(approved, threads=[{'id': 'T'}])
+        self.assertIsNone(result)
+        self.assertIn('approved', what)
 
     def test_a_review_the_bot_handed_back_without_posting_failed(self):
         memory = {}
         self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])
-        code, what, _ = self.step(self.pr(requested=True), memory)
-        self.assertEqual(code, magehand.WATCH_FIX)
-        self.assertIn('failed', what)
+        result, what, _ = self.step(self.pr(requested=True), memory)
+        self.assertEqual(result, 'failed')
+        self.assertIn('ended without a review', what)
 
     def test_stalls_are_reported(self):
         memory = {}
         self.assertIsNone(self.step(self.pr(requested=True), memory, now=0)[0])
-        self.assertEqual(self.step(self.pr(requested=True), memory, now=magehand.WATCH_UNPICKED + 1)[0],
-                         magehand.WATCH_FIX)
+        self.assertEqual(self.step(self.pr(requested=True), memory, now=magehand.WATCH_UNPICKED + 1)[0], 'stalled')
         memory, approved = {}, self.pr(review=[('APPROVED', self.HEAD)])
         self.assertIsNone(self.step(approved, memory, now=0)[0])
-        code, what, _ = self.step(approved, memory, now=magehand.WATCH_UNMERGED + 1)
-        self.assertEqual(code, magehand.WATCH_FIX)
+        result, what, _ = self.step(approved, memory, now=magehand.WATCH_UNMERGED + 1)
+        self.assertEqual(result, 'stalled')
         self.assertIn('not merged', what)
 
     def run_watch(self, prs, threads=None, args=()):
@@ -3568,40 +3572,63 @@ class PrWatch(unittest.TestCase):
         def query(*a):
             if a[:2] == ('api', 'graphql'):
                 return {'data': {'repository': {'pullRequest': {'reviewThreads': {'nodes': threads or []}}}}}, None
-            return next(seq), None
+            got = next(seq)
+            return (None, got) if isinstance(got, str) else (got, None)
         with mock.patch.object(magehand, 'gh_query', query), mock.patch.object(magehand.time, 'sleep', lambda s: None), \
                 mock.patch.object(magehand.time, 'monotonic', lambda: next(clock)):
             return CommandLine.run_main(self, 'pr', 'watch', '12', *args)
 
+    def thread(self, tid, who, resolved=False):
+        return {'id': tid, 'isResolved': resolved, 'path': f'{tid}.py', 'line': 3,
+                'comments': {'nodes': [{'author': {'login': who}, 'body': f'comment {tid}', 'url': 'u'}]}}
+
     def test_findings_print_the_review_and_open_threads(self):
-        H = self.HEAD
-        thread = {'id': 'T1', 'isResolved': False, 'path': 'app.py', 'line': 3,
-                  'comments': {'nodes': [{'author': {'login': magehand.BOT}, 'body': 'should fix: x', 'url': 'u'}]}}
-        done = {'id': 'T2', 'isResolved': True, 'path': 'b.py', 'line': 1,
-                'comments': {'nodes': [{'author': {'login': magehand.BOT}, 'body': 'old', 'url': 'u'}]}}
-        code, out, _ = self.run_watch([self.pr(requested=True), self.pr(assigned=True),
-                                       self.pr(review=[('COMMENTED', H)])], [thread, done])
-        self.assertEqual(code, magehand.WATCH_FINDINGS)
+        code, out, err = self.run_watch(
+            [self.pr(requested=True), self.pr(assigned=True), self.pr(review=[('COMMENTED', self.HEAD)])],
+            [self.thread('T1', magehand.BOT), self.thread('T2', magehand.BOT, resolved=True),
+             self.thread('T3', 'davidlarrimore')])
+        self.assertEqual(code, 1)
         self.assertIn('review COMMENTED', out)
-        self.assertIn('app.py:3 (thread T1): should fix: x', out)
-        self.assertNotIn('b.py', out)
+        self.assertIn('T1.py:3 (thread T1): comment T1', out)
+        self.assertNotIn('T2', out)
+        self.assertNotIn('T3', out)  # on the owner's PR only OpenClaw's threads ask something
         self.assertIn('magehand pr ready 12', out.splitlines()[-1])
+        self.assertIn('reviewing it', err)  # progress on stderr
+        self.assertNotIn('reviewing it', out)
+
+    def test_on_openclaws_own_pr_the_owners_threads_are_listed(self):
+        own = self.pr(author=magehand.BOT, review=[('davidlarrimore', 'COMMENTED', self.HEAD)])
+        own['reviews'][0]['body'] = ''
+        code, out, _ = self.run_watch([own], [self.thread('T1', magehand.BOT), self.thread('T3', 'davidlarrimore')])
+        self.assertEqual(code, 1)
+        self.assertIn('T3.py:3 (thread T3)', out)
+        self.assertNotIn('T1.py', out)
+
+    def test_a_failed_read_is_retried_then_gives_up(self):
+        code, out, err = self.run_watch([self.pr(requested=True), 'HTTP 502', self.pr(state='MERGED')])
+        self.assertEqual(code, 0)
+        self.assertIn('retrying', err)
+        code, _, err = self.run_watch([self.pr(requested=True)] + ['HTTP 502'] * magehand.WATCH_READ_TRIES)
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count('retrying'), magehand.WATCH_READ_TRIES)  # then die(): the watch stopped
 
     def test_times_out_and_json(self):
         code, out, _ = self.run_watch([self.pr(requested=True)] * 400, args=('--timeout', '1', '--json'))
-        self.assertEqual(code, magehand.WATCH_TIMEOUT_EXIT)
+        self.assertEqual(code, 1)
         report = json.loads(out)
-        self.assertEqual((report['exit'], report['pr']), (3, 12))
+        self.assertEqual((report['result'], report['pr']), ('timeout', 12))
         self.assertIn('magehand pr watch 12', report['next'])
+        self.assertEqual(self.run_watch([], args=('--timeout', '0'))[0], 2)  # a usage error stays 2
 
-    def test_merged_points_at_the_deploy_only_in_an_app_repo(self):
+    def test_merged_points_at_the_apps_deploy_only_in_an_app_repo(self):
         with tempfile.TemporaryDirectory() as d:
             (pathlib.Path(d) / 'deploy').mkdir()
             (pathlib.Path(d) / 'deploy' / 'app.yaml').write_text('app: demo\n')
-            with mock.patch.object(magehand, 'checkout_root', lambda *a: pathlib.Path(d)):
+            with mock.patch.object(magehand, 'checkout_root', lambda *a: pathlib.Path(d)), \
+                    mock.patch.object(magehand, 'checkout_app', lambda *a: 'demo'):
                 code, out, _ = self.run_watch([self.pr(state='MERGED')])
             self.assertEqual(code, 0)
-            self.assertIn('magehand status --watch', out.splitlines()[-1])
+            self.assertIn('`magehand status demo --watch`', out.splitlines()[-1])
         with mock.patch.object(magehand, 'checkout_root', lambda *a: None):
             self.assertEqual(self.run_watch([self.pr(state='MERGED')])[1].splitlines()[-1], 'next: nothing')
 
