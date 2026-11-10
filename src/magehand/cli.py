@@ -5161,8 +5161,13 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    stuck (or says why not). Each review costs a model run. A push starts no
    review and dismisses the approval: to change a reviewed PR,
    `gh pr ready N --undo`, push until green, then `magehand pr ready` again.
-   Don't call the PR ready to merge until its review has posted; the owner
-   merges. Base every PR on `main` (the repo's ruleset only guards the
+   Then follow it yourself, don't wait for the user: `magehand pr watch N`
+   (Claude Code: as a background command, which wakes you when it exits;
+   Codex: in the foreground, again on exit 3). It ends when the review has
+   findings (fix them, answer and resolve each thread, ready it again and
+   watch again), a check or the review fails, or the PR merges (then
+   `magehand status --watch`). Don't call the PR done until the watch says
+   merged. Base every PR on `main` (the repo's ruleset only guards the
    default branch).
 7. When `magehand check` warns that AGENTS.md is behind the template, run
    `magehand update-agents`, review the diff and commit it. Never edit
@@ -5230,6 +5235,7 @@ APPROVALS = (
      "magehand's read-only commands"),
     (('magehand', 'job', 'ls'), 'allow', "lists the app's scheduled jobs"),
     (('magehand', 'pr', 'ready'), 'allow', "readies a green PR and requests OpenClaw's review (the PR routine)"),
+    (('magehand', 'pr', 'watch'), 'allow', 'follows a PR until its review or merge (reads only)'),
     (('gh', 'pr', ('view', 'checks', 'list', 'diff', 'status')), 'allow', 'reads PRs'),
     (('gh', 'run', ('view', 'list', 'watch')), 'allow', 'reads CI runs'),
     (('gh', 'issue', ('view', 'list')), 'allow', 'reads issues'),
@@ -6783,6 +6789,8 @@ def requested(pr):
 
 
 def cmd_pr(a):
+    if a.pr_action == 'watch':
+        return pr_watch(a)
     target = [str(a.number)] if a.number else []
     pr, err = gh_query('pr', 'view', *target, '--json', PR_FIELDS)
     if err:
@@ -6855,7 +6863,154 @@ def cmd_pr(a):
         finish(True, None if changed else "already ready; OpenClaw's own PR, so no review is requested",
                'the owner reviews and merges it (OpenClaw does not review its own PRs)')
     finish(True, None if changed else 'already ready, and its review requested',
-           "wait for OpenClaw's review (it starts within about 5 minutes); the owner merges")
+           f'`magehand pr watch {number}`, in the background if you can (it ends when the review has findings, '
+           'a check fails or the PR merges, and says what to do)')
+
+
+# --- pr watch: the agent follows its PR instead of waiting for the owner to wake it ------------------------
+# A coding agent that readied a PR used to stop there: OpenClaw's review with findings, a failed check or a
+# review that never ran waited for the owner to notice. `pr watch` polls the PR (reads only) until something
+# needs the agent or the PR is done, then prints what happened and the next step and exits, so an agent that
+# runs it in the background (Claude Code wakes when it exits) or in the foreground (Codex) picks the work up.
+
+WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels,mergedAt'
+WATCH_POLL = 30          # seconds between reads
+WATCH_TIMEOUT = 60       # minutes, by default
+WATCH_UNPICKED = 15 * 60  # seconds a requested review may wait unqueued before it is reported
+WATCH_UNMERGED = 20 * 60  # seconds an approved, green, unheld PR may wait for the queue's merge
+HOLD = 'hold'
+THREADS_QUERY = ('query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n)'
+                 '{reviewThreads(first:100){nodes{id isResolved path line comments(first:1){nodes{author{login} body url}}}}}}}')
+# exit codes: 0 done (merged, approved and held, a draft gone green), 1 something to fix or ask about,
+# 2 the review has findings, 3 still waiting at the timeout
+WATCH_DONE, WATCH_FIX, WATCH_FINDINGS, WATCH_TIMEOUT_EXIT = 0, 1, 2, 3
+
+
+def bot_review_of(pr, head):
+    """OpenClaw's latest review of `head`, or None."""
+    mine = [r for r in pr.get('reviews') or [] if ((r.get('author') or {}).get('login') or '').lower() == BOT.lower()
+            and (r.get('commit') or {}).get('oid') == head]
+    return mine[-1] if mine else None
+
+
+def watch_step(pr, memory, now):
+    """One look at the PR: (exit code, what, next) when the watch ends, or (None, what, None) while it waits.
+    `memory` carries what earlier looks saw: whether the bot took the PR, since when the review has been
+    requested without being picked up, since when an approved PR has waited for its merge."""
+    n, head = pr['number'], pr.get('headRefOid')
+    rollup = pr.get('statusCheckRollup')
+    failing, running = not_green_checks(rollup), pending_checks(rollup)
+    if pr.get('state') == 'MERGED':
+        return WATCH_DONE, 'merged', None
+    if pr.get('state') == 'CLOSED':
+        return WATCH_FIX, 'closed without merging', 'ask the owner why, if you did not close it'
+    if failing:
+        undo = '' if pr.get('isDraft') else f'`gh pr ready {n} --undo`, '
+        return WATCH_FIX, f'checks failed on {head[:7]}: {", ".join(failing)}', \
+            f'{undo}read the failed run (`gh pr checks {n}`), fix it and push until green, then `magehand pr ready {n}`'
+    if pr.get('isDraft'):
+        if running or not rollup:
+            return None, 'draft: checks running' if running else 'draft: no checks yet', None
+        return WATCH_DONE, f'draft: checks green on {head[:7]}', f'`magehand pr ready {n}`, then `magehand pr watch {n}`'
+    review = bot_review_of(pr, head)
+    held = any((label.get('name') or '') == HOLD for label in pr.get('labels') or [])
+    if review and review.get('state') == 'APPROVED':
+        if held:
+            return WATCH_DONE, f'approved; held (label `{HOLD}`): the queue will not merge it', \
+                'nothing: the owner removes the label when it may merge'
+        if running:
+            return None, 'approved; checks still running', None
+        memory.setdefault('approved', now)
+        if now - memory['approved'] > WATCH_UNMERGED:
+            return WATCH_FIX, f'approved and green, not merged after {WATCH_UNMERGED // 60} minutes', \
+                "tell the owner: OpenClaw's queue has not merged it (`gh pr view` shows nothing blocking?)"
+        return None, 'approved; waiting for the queue to merge it', None
+    if review:  # a review that only comments: findings
+        return WATCH_FINDINGS, f"OpenClaw's review of {head[:7]} has findings", \
+            (f'fix each finding: `gh pr ready {n} --undo`, push until green, answer and resolve each thread '
+             f'(AGENTS.md, "Review comments"), then `magehand pr ready {n}` and `magehand pr watch {n}`')
+    bot_has_it = any(((a.get('login') or '').lower() == BOT.lower()) for a in pr.get('assignees') or [])
+    if bot_has_it:
+        memory['taken'] = True
+        return None, 'OpenClaw is reviewing it (or has it queued)', None
+    if memory.get('taken'):  # the bot had it and handed it back without a review of this head: it failed
+        return WATCH_FIX, f"OpenClaw's review of {head[:7]} ended without a review (it failed)", \
+            f'`magehand pr ready {n}` again; if it fails twice, tell the owner'
+    if requested(pr):
+        memory.setdefault('requested', now)
+        if now - memory['requested'] > WATCH_UNPICKED:
+            return WATCH_FIX, f'review requested, not picked up after {WATCH_UNPICKED // 60} minutes', \
+                'tell the owner: OpenClaw has not taken the review (is it running?)'
+        return None, 'review requested; waiting for OpenClaw to take it', None
+    older = any(((r.get('author') or {}).get('login') or '').lower() == BOT.lower() for r in pr.get('reviews') or [])
+    return WATCH_FIX, ('pushed after the review: the new head has no review' if older else 'no review requested'), \
+        f'`magehand pr ready {n}` (it requests the review), then `magehand pr watch {n}`'
+
+
+def open_bot_threads(repo, number):
+    """[{path, line, body, url}] of OpenClaw's unresolved line comments, or None when GitHub can't say."""
+    owner, name = repo.split('/', 1)
+    found, err = gh_query('api', 'graphql', '-f', f'query={THREADS_QUERY}', '-f', f'owner={owner}', '-f',
+                          f'repo={name}', '-F', f'n={number}')
+    if err:
+        return None
+    nodes = ((((found.get('data') or {}).get('repository') or {}).get('pullRequest') or {}).get('reviewThreads')
+             or {}).get('nodes') or []
+    out = []
+    for t in nodes:
+        first = ((t.get('comments') or {}).get('nodes') or [{}])[0] or {}
+        if not t.get('isResolved') and ((first.get('author') or {}).get('login') or '').lower() == BOT.lower():
+            out.append({'id': t.get('id'), 'path': t.get('path'), 'line': t.get('line'), 'body': first.get('body') or '',
+                        'url': first.get('url')})
+    return out
+
+
+def pr_watch(a):
+    target = [str(a.number)] if a.number else []
+    if a.timeout is not None and a.timeout <= 0:
+        usage('pr', '--timeout is minutes, more than 0')
+    deadline = time.monotonic() + 60 * (a.timeout or WATCH_TIMEOUT)
+    memory, last, pr = {}, None, None
+    while True:
+        pr, err = gh_query('pr', 'view', *target, '--json', WATCH_FIELDS)
+        if err:
+            die(f'cannot read {"PR #" + str(a.number) if a.number else "the PR for this branch"}: {err}'
+                + (' (pass its number)' if 'no pull requests found' in err else ' (`gh auth status`)'))
+        target = [str(pr['number']), '-R', '/'.join(pr['url'].split('/')[3:5])]  # stay on this PR
+        code, what, step = watch_step(pr, memory, time.monotonic())
+        if what != last and not a.json:
+            print(f'{time.strftime("%H:%M")} PR #{pr["number"]}: {what}', flush=True)
+        last = what
+        if code is not None:
+            break
+        if time.monotonic() + WATCH_POLL > deadline:
+            code, step = WATCH_TIMEOUT_EXIT, f'`magehand pr watch {pr["number"]}` again (still: {what})'
+            break
+        time.sleep(WATCH_POLL)
+    repo, n = '/'.join(pr['url'].split('/')[3:5]), pr['number']
+    review = bot_review_of(pr, pr.get('headRefOid')) if code in (WATCH_FINDINGS, WATCH_DONE) else None
+    threads = open_bot_threads(repo, n) if code in (WATCH_FINDINGS, WATCH_DONE) else []
+    if code == WATCH_DONE and pr.get('state') == 'MERGED':
+        deploy = ('`magehand status --watch` (the build and the dev deploy)'
+                  if ((checkout_root() or pathlib.Path('/nonexistent')) / 'deploy' / 'app.yaml').is_file() else None)
+        answer = 'answer and resolve each of OpenClaw\'s open threads (AGENTS.md, "Review comments")' if threads else None
+        step = ', then '.join(s for s in (answer, deploy) if s) or None
+    if a.json:
+        print(json.dumps({'pr': n, 'url': pr['url'], 'state': what, 'exit': code, 'head': pr.get('headRefOid'),
+                          'review': (review or {}).get('body') if code == WATCH_FINDINGS else None,
+                          'threads': threads, 'next': step}, indent=1))
+        sys.exit(code)
+    if code == WATCH_FINDINGS and review:
+        print(f"\nOpenClaw's review ({pr['url']}):\n\n{(review.get('body') or '').strip()}\n")
+    if threads:
+        print(f"OpenClaw's open line comments ({len(threads)}):")
+        for t in threads:
+            print(f"- {t['path']}:{t['line'] or '?'} (thread {t['id']}): {t['body'].strip()}")
+    elif threads is None:
+        print("could not read OpenClaw's line comments: read them on the PR page")
+    print(next_line(step))
+    sys.exit(code)
+
 
 # --- icon: the app's tile in the homelab's app library (authentik) ---------------------------
 # The app ships its icon in its own deploy/base as the ConfigMap app-icon (binaryData icon.png or icon.webp);
@@ -7569,11 +7724,20 @@ def build_parser():
                 'says why (the bot is not a collaborator, can only read, or has not accepted yet) and exits 1.\n'
                 "On OpenClaw's own PRs it requests nobody: the owner reviews those. Open the PR with\n"
                 '`gh pr create --draft`; after a push to a reviewed PR, run it again.\n\n'
+                '`pr watch` then follows the PR (reads only, every 30 s) until something needs you or it is done,\n'
+                'and exits: 0 merged (or approved and held, or a draft gone green), 1 something to fix (a failed\n'
+                'check, a failed or missing review, no merge 20 minutes after the approval), 2 the review has\n'
+                "findings (printed with OpenClaw's open line comments), 3 still waiting at --timeout. A coding\n"
+                'agent runs it in the background right after `pr ready` and works on what it reports.\n\n'
                 'examples:\n  magehand pr ready          # the PR of this branch\n  magehand pr ready 12\n'
-                '  magehand pr ready 12 --json')
+                '  magehand pr ready 12 --json\n  magehand pr watch 12\n  magehand pr watch 12 --timeout 10 --json')
     psub = p.add_subparsers(dest='pr_action', metavar='ACTION', required=True, parser_class=Parser)
     q = psub.add_parser('ready', help='ready a green PR and request the review, confirmed')
     q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
+    q = psub.add_parser('watch', help='follow the PR until its review, a failure or the merge, then say what to do')
+    q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
+    q.add_argument('--timeout', type=int, metavar='MIN', help=f'stop waiting after MIN minutes (default {WATCH_TIMEOUT})')
     q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     p = command('job', cmd_job, 'add, remove and list scheduled jobs (CronJobs)', "add, remove or list the app's scheduled jobs: CronJobs in its deploy/base that run its image with another command",
                 'A job is the app\'s own image run on a schedule with another command and the Deployment\'s env (its\n'

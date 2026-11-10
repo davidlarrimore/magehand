@@ -3432,7 +3432,7 @@ class PrReady(unittest.TestCase):
         self.assertEqual(writes[0][3:], (f'repos/davidlarrimore/demo/pulls/12/requested_reviewers',
                                          '-f', f'reviewers[]={magehand.BOT}'))
         self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
-        self.assertIn("wait for OpenClaw's review", out.splitlines()[-1])
+        self.assertIn('`magehand pr watch 12`', out.splitlines()[-1])
 
     def test_a_request_that_did_not_stick_says_why_and_leaves_the_draft(self):
         for access, why, step in (('missing', 'is not a collaborator', 'magehand new demo'),
@@ -3480,6 +3480,123 @@ class PrReady(unittest.TestCase):
         code, out, writes = self.run_pr(author=magehand.BOT, draft=False)
         self.assertEqual((code, writes), (0, []))
         self.assertIn('no review is requested', out)
+
+
+class PrWatch(unittest.TestCase):
+    """`pr watch`: follows a readied PR and ends exactly when the agent has something to do, or it is done."""
+
+    HEAD = 'a' * 40
+    GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
+
+    def pr(self, state='OPEN', draft=False, checks=GREEN, review=None, assigned=False, requested=False, labels=(),
+           head=HEAD):
+        reviews = [{'author': {'login': magehand.BOT}, 'state': s, 'commit': {'oid': c}, 'body': f'review {s}'}
+                   for s, c in (review or [])]
+        return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': state,
+                'isDraft': draft, 'headRefOid': head, 'author': {'login': 'davidlarrimore'},
+                'statusCheckRollup': checks, 'reviewRequests': [{'login': magehand.BOT}] if requested else [],
+                'reviews': reviews, 'assignees': [{'login': magehand.BOT}] if assigned else [],
+                'labels': [{'name': n} for n in labels]}
+
+    def step(self, pr, memory=None, now=0):
+        return magehand.watch_step(pr, {} if memory is None else memory, now)
+
+    def test_ends(self):
+        H = self.HEAD
+        cases = (
+            (self.pr(state='MERGED'), magehand.WATCH_DONE, 'merged'),
+            (self.pr(state='CLOSED'), magehand.WATCH_FIX, 'closed'),
+            (self.pr(checks=[{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}]), magehand.WATCH_FIX,
+             'checks failed'),
+            (self.pr(draft=True), magehand.WATCH_DONE, 'draft: checks green'),
+            (self.pr(review=[('APPROVED', H)], labels=['hold']), magehand.WATCH_DONE, 'held'),
+            (self.pr(review=[('APPROVED', H), ('COMMENTED', H)]), magehand.WATCH_FINDINGS, 'has findings'),
+            (self.pr(review=[('COMMENTED', 'b' * 40)]), magehand.WATCH_FIX, 'pushed after the review'),
+            (self.pr(), magehand.WATCH_FIX, 'no review requested'),
+        )
+        for pr, code, what in cases:
+            got = self.step(pr)
+            self.assertEqual(got[0], code, what)
+            self.assertIn(what, got[1])
+            self.assertTrue(got[2] or what == 'merged', what)  # merged: pr_watch picks the step
+        # a failed check on a ready PR: undo ready first; on a draft, not
+        failed = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'FAILURE'}]
+        self.assertIn('--undo', self.step(self.pr(checks=failed))[2])
+        self.assertNotIn('--undo', self.step(self.pr(checks=failed, draft=True))[2])
+
+    def test_waits(self):
+        H = self.HEAD
+        for pr, what in ((self.pr(draft=True, checks=[{'name': 't', 'status': 'IN_PROGRESS'}]), 'checks running'),
+                         (self.pr(requested=True), 'waiting for OpenClaw'),
+                         (self.pr(requested=True, assigned=True), 'reviewing'),
+                         (self.pr(review=[('APPROVED', H)]), 'waiting for the queue'),
+                         (self.pr(review=[('APPROVED', H)], checks=self.GREEN + [{'name': 'x', 'status': 'QUEUED'}]),
+                          'checks still running')):
+            code, got, step = self.step(pr)
+            self.assertEqual((code, step), (None, None), what)
+            self.assertIn(what, got)
+
+    def test_a_review_the_bot_handed_back_without_posting_failed(self):
+        memory = {}
+        self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])
+        code, what, _ = self.step(self.pr(requested=True), memory)
+        self.assertEqual(code, magehand.WATCH_FIX)
+        self.assertIn('failed', what)
+
+    def test_stalls_are_reported(self):
+        memory = {}
+        self.assertIsNone(self.step(self.pr(requested=True), memory, now=0)[0])
+        self.assertEqual(self.step(self.pr(requested=True), memory, now=magehand.WATCH_UNPICKED + 1)[0],
+                         magehand.WATCH_FIX)
+        memory, approved = {}, self.pr(review=[('APPROVED', self.HEAD)])
+        self.assertIsNone(self.step(approved, memory, now=0)[0])
+        code, what, _ = self.step(approved, memory, now=magehand.WATCH_UNMERGED + 1)
+        self.assertEqual(code, magehand.WATCH_FIX)
+        self.assertIn('not merged', what)
+
+    def run_watch(self, prs, threads=None, args=()):
+        seq = iter(prs)
+        clock = iter(range(0, 10 ** 6, 30))
+
+        def query(*a):
+            if a[:2] == ('api', 'graphql'):
+                return {'data': {'repository': {'pullRequest': {'reviewThreads': {'nodes': threads or []}}}}}, None
+            return next(seq), None
+        with mock.patch.object(magehand, 'gh_query', query), mock.patch.object(magehand.time, 'sleep', lambda s: None), \
+                mock.patch.object(magehand.time, 'monotonic', lambda: next(clock)):
+            return CommandLine.run_main(self, 'pr', 'watch', '12', *args)
+
+    def test_findings_print_the_review_and_open_threads(self):
+        H = self.HEAD
+        thread = {'id': 'T1', 'isResolved': False, 'path': 'app.py', 'line': 3,
+                  'comments': {'nodes': [{'author': {'login': magehand.BOT}, 'body': 'should fix: x', 'url': 'u'}]}}
+        done = {'id': 'T2', 'isResolved': True, 'path': 'b.py', 'line': 1,
+                'comments': {'nodes': [{'author': {'login': magehand.BOT}, 'body': 'old', 'url': 'u'}]}}
+        code, out, _ = self.run_watch([self.pr(requested=True), self.pr(assigned=True),
+                                       self.pr(review=[('COMMENTED', H)])], [thread, done])
+        self.assertEqual(code, magehand.WATCH_FINDINGS)
+        self.assertIn('review COMMENTED', out)
+        self.assertIn('app.py:3 (thread T1): should fix: x', out)
+        self.assertNotIn('b.py', out)
+        self.assertIn('magehand pr ready 12', out.splitlines()[-1])
+
+    def test_times_out_and_json(self):
+        code, out, _ = self.run_watch([self.pr(requested=True)] * 400, args=('--timeout', '1', '--json'))
+        self.assertEqual(code, magehand.WATCH_TIMEOUT_EXIT)
+        report = json.loads(out)
+        self.assertEqual((report['exit'], report['pr']), (3, 12))
+        self.assertIn('magehand pr watch 12', report['next'])
+
+    def test_merged_points_at_the_deploy_only_in_an_app_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / 'deploy').mkdir()
+            (pathlib.Path(d) / 'deploy' / 'app.yaml').write_text('app: demo\n')
+            with mock.patch.object(magehand, 'checkout_root', lambda *a: pathlib.Path(d)):
+                code, out, _ = self.run_watch([self.pr(state='MERGED')])
+            self.assertEqual(code, 0)
+            self.assertIn('magehand status --watch', out.splitlines()[-1])
+        with mock.patch.object(magehand, 'checkout_root', lambda *a: None):
+            self.assertEqual(self.run_watch([self.pr(state='MERGED')])[1].splitlines()[-1], 'next: nothing')
 
 
 class Scaffold(unittest.TestCase):
