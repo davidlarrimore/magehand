@@ -6049,6 +6049,39 @@ class FetchScaffold(unittest.TestCase):
         self.assertEqual(self.init()[0], 0)
         self.assertEqual(self.init()[0], 1)
 
+    def test_rm_an_edited_block_keeps_the_rest_or_changes_nothing(self):
+        # Review of #85: an unindented comment inside an edited block ended it early and left `services:` behind.
+        app_yaml = self.root / 'deploy/app.yaml'
+        base = app_yaml.read_text()
+        for edited in ('fetch:\n# the crawler\n  services:\n    queue:\n      type: redis\n',
+                       'fetch:\n  services:\n\n    queue: {type: redis, size: 1Gi}',  # no newline at the end
+                       'fetch:  # zone\n  services:\n    queue: {type: redis}\nlater: 1\n'):
+            with self.subTest(edited):
+                self.assertEqual(self.init()[0], 0)
+                app_yaml.write_text(base + edited)
+                self.assertEqual(self.run_main('fetch', 'rm')[0], 0)
+                spec = yaml_load(app_yaml.read_text())
+                self.assertNotIn('fetch', spec)
+                self.assertEqual(spec, {**yaml_load(base), **({'later': 1} if 'later' in edited else {})})
+                self.assertFalse((self.root / 'deploy/fetch').exists())
+                app_yaml.write_text(base)
+        # A layout it can't take apart safely: nothing is changed or deleted.
+        self.assertEqual(self.init()[0], 0)
+        tricky = base + 'fetch: &zone\n  services:\n    queue: {type: redis}\nalias: *zone\n'
+        app_yaml.write_text(tricky)
+        self.assertEqual(self.run_main('fetch', 'rm')[0], 1)
+        self.assertEqual(app_yaml.read_text(), tricky)
+        self.assertTrue((self.root / 'deploy/fetch/base/fetcher.yaml').exists())
+        self.assertTrue((self.root / 'deploy/dev/fetch-queue.yaml').exists())
+
+    def test_the_fetcher_never_rolls_beside_itself(self):
+        # Review of #85: above 256Mi two fetchers and the queue exceed the zone's 768Mi of limits.
+        for memory in ('256Mi', '384Mi', '512Mi'):
+            doc = magehand.fetcher_manifest(magehand.try_load_app('demo', self.root), ['x'], memory)
+            self.assertEqual(doc['spec']['strategy'], {'type': 'Recreate'})
+            self.assertEqual(magehand.check_rollout_room('deploy/fetch/dev', 'fetch/dev', [doc],
+                                                         {'queue': {'type': 'redis'}}), [])
+
     def test_the_zone_in_app_and_status(self):
         app = magehand.try_load_app('demo', self.root)
         self.assertIsNone(magehand.fetch_zone_summary(app, {'services': {}}))

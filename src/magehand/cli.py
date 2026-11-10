@@ -7226,7 +7226,10 @@ def fetcher_manifest(app, command, memory):
                 'runAsNonRoot': True, 'seccompProfile': {'type': 'RuntimeDefault'}})),
             'containers': [fetcher], 'volumes': [{'name': 'tmp', 'emptyDir': {'sizeLimit': '128Mi'}}]}
     return {'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': {'name': 'fetcher', 'labels': dict(labels)},
-            'spec': {'replicas': 1, 'selector': {'matchLabels': {'app.kubernetes.io/name': 'fetcher'}},
+            # Recreate: the zone's quota (768Mi of limits, 256Mi of them the queue's) can't hold a second fetcher
+            # beside the old one at most sizes, so a rolling update would never start the new pod.
+            'spec': {'replicas': 1, 'strategy': {'type': 'Recreate'},
+                     'selector': {'matchLabels': {'app.kubernetes.io/name': 'fetcher'}},
                      'template': {'metadata': {'labels': labels}, 'spec': spec}}}
 
 
@@ -7307,15 +7310,60 @@ def fetch_init(a, app, local):
     print(next_line(step))
 
 
+def without_fetch_block(text):
+    """deploy/app.yaml's text without its top-level `fetch:` block, or None when the rest would not come out as the
+    same request. The block `fetch init` wrote (with its comment) goes as written; an edited one runs until the
+    next top-level key or the end of the file, a comment or blank line belonging to it when indented content
+    follows (as the platform's deploy controller reads it)."""
+    def same_request(kept):
+        try:
+            before, after = yaml.safe_load(text) or {}, yaml.safe_load(kept) or {}
+        except yaml.YAMLError:
+            return False
+        return isinstance(before, dict) and isinstance(after, dict) and 'fetch' not in after \
+            and after == {k: v for k, v in before.items() if k != 'fetch'}
+
+    if FETCH_BLOCK in text and same_request(text.replace(FETCH_BLOCK, '', 1)):
+        return text.replace(FETCH_BLOCK, '', 1)
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, line in enumerate(lines) if re.match(r'^fetch:', line)), None)
+    if start is None:
+        return None
+    filler = lambda line: not line.strip() or line.lstrip().startswith('#')  # noqa: E731
+    end = start + 1
+    while end < len(lines):
+        if filler(lines[end]):
+            nxt = next((line for line in lines[end + 1:] if not filler(line)), None)
+            if nxt is None or nxt[0] not in ' \t':
+                break
+        elif lines[end][0] not in ' \t':
+            break
+        end += 1
+    kept = ''.join(lines[:start] + lines[end:])
+    return kept if same_request(kept) else None
+
+
 def fetch_rm(a, app, local):
-    removed = []
+    # Every edit is prepared (and verified) before any file is changed or deleted.
+    app_yaml = local / 'app.yaml'
+    text = app_yaml.read_text()
+    kept = without_fetch_block(text) if re.search(r'(?m)^fetch:', text) else text
+    if kept is None:
+        die(f'could not remove `fetch:` from {DEPLOY}/app.yaml without changing the rest of it: nothing changed. '
+            'Remove the block by hand, then run `magehand fetch rm` again')
+    edits = {}
     for overlay in ('dev', 'prod'):
         k = local / overlay / 'kustomization.yaml'
         if k.is_file() and FETCH_QUEUE_FILE in (kustomization_resources(k.read_text()) or []):
             new = edit_kustomization(k.read_text(), FETCH_QUEUE_FILE, add=False)
             if new is None:
-                die(f'could not remove {FETCH_QUEUE_FILE} from {DEPLOY}/{overlay}/kustomization.yaml: remove it by hand')
-            k.write_text(new)
+                die(f'could not remove {FETCH_QUEUE_FILE} from {DEPLOY}/{overlay}/kustomization.yaml: nothing '
+                    'changed. Remove it by hand, then run `magehand fetch rm` again')
+            edits[k] = new
+    removed = []
+    for k, new in edits.items():
+        k.write_text(new)
+    for overlay in ('dev', 'prod'):
         if (local / overlay / FETCH_QUEUE_FILE).is_file():
             (local / overlay / FETCH_QUEUE_FILE).unlink()
             removed.append(f'{DEPLOY}/{overlay}/{FETCH_QUEUE_FILE}')
@@ -7323,10 +7371,6 @@ def fetch_rm(a, app, local):
     if zone.is_dir():
         shutil.rmtree(zone)
         removed.append(f'{DEPLOY}/{FETCH_DIR}/')
-    app_yaml = local / 'app.yaml'
-    text = app_yaml.read_text()
-    kept = text.replace(FETCH_BLOCK, '') if FETCH_BLOCK in text else re.sub(
-        r'(?m)^fetch:[ \t]*(?:#.*)?\n(?:(?:[ \t]+.*|[ \t]*)\n)*', '', text)
     if kept != text:
         app_yaml.write_text(kept)
         removed.append(f'{DEPLOY}/app.yaml fetch:')
