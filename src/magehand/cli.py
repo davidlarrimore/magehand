@@ -2126,7 +2126,7 @@ FROM base AS runtime
 # the image scan flags (a fixable CRITICAL in pip's certifi failed egress-canary's first build).
 RUN rm -rf /usr/local/lib/python3*/site-packages/pip /usr/local/lib/python3*/site-packages/pip-* \\
     /usr/local/lib/python3*/site-packages/setuptools* /usr/local/bin/pip* \\
-    && ! python -c "import pip" 2>/dev/null
+    && python -c "import importlib.util as u, sys; sys.exit(u.find_spec('pip') is not None)"
 USER 65532
 CMD ["python", "-B", "/app/app.py"]
 """,

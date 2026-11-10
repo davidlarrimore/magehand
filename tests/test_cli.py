@@ -3492,8 +3492,9 @@ class Scaffold(unittest.TestCase):
         runtime = dockerfile[dockerfile.index('FROM base AS runtime'):]
         self.assertIn('/usr/local/lib/python3*/site-packages/pip ', runtime)
         self.assertNotIn('python3.1', runtime)
-        self.assertIn('! python -c "import pip"', runtime)
-        self.assertLess(runtime.index('import pip'), runtime.index('USER 65532'))
+        self.assertIn("sys.exit(u.find_spec('pip') is not None)", runtime)  # fails only if pip stays
+        self.assertNotIn('2>/dev/null', runtime)
+        self.assertLess(runtime.index("find_spec('pip')"), runtime.index('USER 65532'))
 
     def test_writes_a_deployable_app_that_passes_check(self):
         with tempfile.TemporaryDirectory() as tmp:
