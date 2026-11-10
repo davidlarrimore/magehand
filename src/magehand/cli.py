@@ -2470,7 +2470,8 @@ def cmd_new(a):
         if not APP_NAME.match(value):
             usage('new', f"bad {label} name '{value}': lowercase letters, digits and dashes, at most 40, "
                          'starting and ending with a letter or digit')
-        if value in RESERVED or (label == 'app' and (value.endswith(('-dev', '-prod')) or value.startswith('kube-'))):
+        if value in RESERVED or (label == 'app' and (value.endswith(('-dev', '-prod', '-fetch'))
+                                                     or value.startswith('kube-'))):
             usage('new', f"'{value}' is reserved for the platform; choose another")
     repo = f'{OWNER}/{name}'
     dest = pathlib.Path(a.dir or name)
@@ -3522,10 +3523,10 @@ def check_app_name(app):
     name, repo = app['name'], remote_repo(root)
     if 'app' in app['spec']:
         value = app['spec']['app']
-        if not isinstance(value, str) or not APP_NAME.match(value) or value.endswith(('-dev', '-prod')) \
+        if not isinstance(value, str) or not APP_NAME.match(value) or value.endswith(('-dev', '-prod', '-fetch')) \
                 or value.startswith('kube-'):
             return [finding('error', at, f'app: {value!r} is not an app name (lowercase letters, digits and dashes, '
-                            'at most 40, not ending in -dev or -prod)', guide)]
+                            'at most 40, not ending in -dev, -prod or -fetch)', guide)]
         if value in RESERVED:
             return [finding('error', at, f'app: {value} is reserved for the platform', guide)]
     if not repo:
@@ -4137,10 +4138,13 @@ def check_deploy_files(root, name=None):
     found = check_post_checks(root)
     for path in sorted(local.rglob('*')):
         rel = path.relative_to(local)
-        if path.is_file() and not (rel.as_posix() in ('app.yaml', 'checks.yaml') or (len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
-                                                                    and rel.suffix in ('.yaml', '.yml'))):
+        overlay_file = rel.suffix in ('.yaml', '.yml') and (
+            len(rel.parts) == 2 and rel.parts[0] in DEPLOY_DIRS
+            or len(rel.parts) == 3 and rel.parts[0] == FETCH_DIR and rel.parts[1] in DEPLOY_DIRS)
+        if path.is_file() and not (rel.as_posix() in ('app.yaml', 'checks.yaml') or overlay_file):
             found.append(finding('error', f'{DEPLOY}/{rel.as_posix()}', 'not deployed: deploy/ holds app.yaml, checks.yaml and '
-                                 'base/, dev/, prod/ *.yaml only, and a merge with anything else is not deployed',
+                                 'base/, dev/, prod/ *.yaml only (a fetch zone also fetch/base/, fetch/dev/, '
+                                 'fetch/prod/ *.yaml), and a merge with anything else is not deployed',
                                  'README "How an app is put together"'))
     if not any((local / 'base').glob('*.y*ml')):
         try:
@@ -4158,7 +4162,9 @@ def check_deploy_files(root, name=None):
         found.append(finding('error', f'{DEPLOY}/dev/kustomization.yaml',
                              f'missing: the dev overlay (namespace: {name or "<app>"}-dev, resources: [../base]); '
                              'nothing registers or deploys without it', 'README "How an app is put together"'))
-    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
+    found += check_fetch_zone(local, name)
+    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name), (f'{FETCH_DIR}/dev', f'{name}-fetch-dev'),
+                               (f'{FETCH_DIR}/prod', f'{name}-fetch')):
         path = local / overlay / 'kustomization.yaml'
         if not name or not path.is_file():
             continue
@@ -4176,6 +4182,53 @@ def check_deploy_files(root, name=None):
         if '../base' not in (spec.get('resources') or []):
             found.append(finding('error', f'{DEPLOY}/{overlay}/kustomization.yaml', 'resources must include ../base',
                                  'README "How an app is put together"'))
+    return found
+
+
+FETCH_DIR = 'fetch'
+FETCH_QUEUE_SIZES = ('1Gi',)  # the zone's quota: one 1Gi volume
+
+
+def check_fetch_zone(local, name):
+    """An app's fetch zone (homelab docs/restricted-egress-plan.md): deploy/app.yaml's `fetch:` block, written as a
+    block mapping holding exactly `services: {queue: {type: redis}}` (the platform's deploy controller copies it as
+    text, and the queue's Secret queue-connection is the only one the app's store may read), and the fetcher in
+    deploy/fetch/base/ with the overlays fetch/dev/ (and fetch/prod/ for production). Either both or neither."""
+    at, guide = f'{DEPLOY}/app.yaml', 'fetch'
+    try:
+        text = (local / 'app.yaml').read_text()
+        spec = yaml.safe_load(text) or {}
+    except (OSError, yaml.YAMLError):
+        return []  # reported where app.yaml is loaded
+    zone_files = [p for p in (local / FETCH_DIR).rglob('*') if p.is_file()] if (local / FETCH_DIR).is_dir() else []
+    if not isinstance(spec, dict) or 'fetch' not in spec:
+        if zone_files:
+            return [finding('error', f'{DEPLOY}/{FETCH_DIR}', 'a fetch zone without `fetch:` in deploy/app.yaml: add '
+                            'the block (services: {queue: {type: redis}}) or remove deploy/fetch/', guide)]
+        return []
+    found = []
+    fetch = spec['fetch']
+    if not re.search(r'(?m)^fetch:[ \t]*(?:#.*)?$', text):
+        found.append(finding('error', at, '`fetch:` must be a block (fetch:, then services: indented below it); the '
+                             'platform copies it as text', guide))
+    services = fetch.get('services') if isinstance(fetch, dict) else None
+    queue = services.get('queue') if isinstance(services, dict) else None
+    if not isinstance(fetch, dict) or set(fetch) != {'services'} or not isinstance(services, dict) \
+            or set(services) != {'queue'} or not isinstance(queue, dict) or queue.get('type') != 'redis' \
+            or set(queue) - {'type', 'size'}:
+        found.append(finding('error', at, '`fetch:` holds exactly `services: {queue: {type: redis}}`: one redis queue '
+                             'named queue, the zone\'s only block (its Secret queue-connection is what the app reads)',
+                             guide))
+    elif 'size' in queue and queue['size'] not in FETCH_QUEUE_SIZES:
+        found.append(finding('error', at, f"the fetch queue's size must be {', '.join(FETCH_QUEUE_SIZES)} (the zone's "
+                             'quota)', guide))
+    if not any((local / FETCH_DIR / 'base').glob('*.y*ml')):
+        found.append(finding('error', f'{DEPLOY}/{FETCH_DIR}/base', 'missing: the fetcher\'s Kustomize base (its '
+                             'Deployment or CronJobs, the app\'s own image)', guide))
+    elif not (local / FETCH_DIR / 'dev' / 'kustomization.yaml').is_file():
+        found.append(finding('error', f'{DEPLOY}/{FETCH_DIR}/dev/kustomization.yaml',
+                             f'missing: the fetch zone\'s dev overlay (namespace: {name or "<app>"}-fetch-dev, '
+                             'resources: [../base])', guide))
     return found
 
 

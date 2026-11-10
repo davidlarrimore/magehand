@@ -1641,6 +1641,62 @@ def deploy_repo(tmp, app_yaml='services:\n  ai: {type: llm, models: [paid/m2]}\n
     return root
 
 
+FETCH_APP = 'services: {}\nfetch:\n  services:\n    queue: {type: redis}\n'
+FETCH_FILES = {'deploy/fetch/base/kustomization.yaml': 'resources: [fetcher.yaml]\n',
+               'deploy/fetch/base/fetcher.yaml': 'kind: Deployment\nmetadata: {name: fetcher}\n',
+               'deploy/fetch/dev/kustomization.yaml': 'namespace: demo-fetch-dev\nresources: [../base]\n'}
+
+
+class FetchZone(unittest.TestCase):
+    """deploy/app.yaml `fetch:` and deploy/fetch/: an app's fetch zone (homelab docs/restricted-egress-plan.md)."""
+
+    def found(self, app_yaml=FETCH_APP, files=FETCH_FILES):
+        with tempfile.TemporaryDirectory() as tmp:
+            return [(f['level'], f['where'], f['text']) for f in
+                    magehand.check_deploy_files(deploy_repo(tmp, app_yaml, files), 'demo')]
+
+    def test_a_complete_zone_passes(self):
+        self.assertEqual(self.found(), [])
+        self.assertEqual(self.found('services: {}\nfetch:  # the crawler\n  services:\n    queue:\n      type: redis\n'
+                                    '      size: 1Gi\n'), [])
+        prod = {**FETCH_FILES, 'deploy/fetch/prod/kustomization.yaml': 'namespace: demo-fetch\nresources: [../base]\n'}
+        self.assertEqual(self.found(files=prod), [])
+
+    def test_no_zone_is_unchanged(self):
+        self.assertEqual(self.found('services: {}\n', {}), [])
+
+    def test_the_block_and_the_directory_go_together(self):
+        (finding,) = self.found('services: {}\n')
+        self.assertEqual(finding[:2], ('error', 'deploy/fetch'))
+        found = self.found(files={})
+        self.assertEqual([f[1] for f in found], ['deploy/fetch/base'])
+        no_dev = {k: v for k, v in FETCH_FILES.items() if '/dev/' not in k}
+        self.assertEqual([f[1] for f in self.found(files=no_dev)], ['deploy/fetch/dev/kustomization.yaml'])
+
+    def test_the_block_is_one_redis_queue_named_queue(self):
+        for label, block in {
+                'flow style': 'fetch: {services: {queue: {type: redis}}}\n',
+                'true': 'fetch: true\n',
+                'other name': 'fetch:\n  services:\n    jobs: {type: redis}\n',
+                'two blocks': 'fetch:\n  services:\n    queue: {type: redis}\n    db: {type: postgres}\n',
+                'postgres': 'fetch:\n  services:\n    queue: {type: postgres}\n',
+                'other key': 'fetch:\n  services:\n    queue: {type: redis}\n  egress: any\n',
+                'option': 'fetch:\n  services:\n    queue: {type: redis, access: public}\n',
+                'too big': 'fetch:\n  services:\n    queue: {type: redis, size: 2Gi}\n'}.items():
+            with self.subTest(label):
+                found = self.found('services: {}\n' + block)
+                self.assertTrue(found and all(f[:2] == ('error', 'deploy/app.yaml') for f in found), found)
+
+    def test_overlays_and_files(self):
+        files = {**FETCH_FILES, 'deploy/fetch/dev/kustomization.yaml': 'namespace: demo-dev\nresources: [../base]\n',
+                 'deploy/fetch/prod/kustomization.yaml': 'namespace: demo\nresources: [x]\n',
+                 'deploy/fetch/base/x/y.yaml': 'x', 'deploy/fetch/stage/k.yaml': 'x', 'deploy/fetch/README.md': 'x'}
+        where = sorted(f[1] for f in self.found(files=files))
+        self.assertEqual(where, ['deploy/fetch/README.md', 'deploy/fetch/base/x/y.yaml',
+                                 'deploy/fetch/dev/kustomization.yaml', 'deploy/fetch/prod/kustomization.yaml',
+                                 'deploy/fetch/prod/kustomization.yaml', 'deploy/fetch/stage/k.yaml'])
+
+
 class DeployDir(unittest.TestCase):
     """An app repo with deploy/: magehand reads the app from the checkout, not homelab-apps."""
 
@@ -2108,6 +2164,7 @@ class AppNameOverride(unittest.TestCase):
         for app_yaml, why in (('app: Lab\nservices: {}\n', 'not an app name'),
                               ('app: litellm\nservices: {}\n', 'reserved'),
                               ('app: lab-dev\nservices: {}\n', 'not an app name'),
+                              ('app: lab-fetch\nservices: {}\n', 'not an app name'),
                               ('app: [x\n', 'not valid YAML')):
             with tempfile.TemporaryDirectory() as tmp:
                 code, result = self.run_check(self.seeded(tmp, app_yaml), name='lab-website')
@@ -2784,7 +2841,7 @@ class New(unittest.TestCase):
 
     def test_bad_and_reserved_names(self):
         self.fake()
-        for name in ('Elvis', '-x', 'a' * 41, 'litellm', 'homelab-apps'):
+        for name in ('Elvis', '-x', 'a' * 41, 'litellm', 'homelab-apps', 'crawl-fetch'):
             with self.assertRaises(SystemExit) as ctx:
                 self.run_new(name)
             self.assertEqual(ctx.exception.code, 2, name)
