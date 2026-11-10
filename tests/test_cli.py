@@ -3564,6 +3564,12 @@ class PrWatch(unittest.TestCase):
         self.assertIsNone(self.step(self.pr(review=old + [('APPROVED', H)], assigned=True), memory)[0])
         self.assertIsNone(self.step(self.pr(review=old + [('APPROVED', H)]), memory)[0])  # waits for the merge
 
+    def test_the_owners_reply_during_a_review_that_fails_is_still_a_failure(self):
+        memory = {}
+        self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])
+        reply = self.pr(requested=True, review=[('davidlarrimore', 'COMMENTED', self.HEAD)])
+        self.assertEqual(self.step(reply, memory)[0], 'failed')
+
     def test_a_review_the_bot_handed_back_without_posting_failed(self):
         memory = {}
         self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])
