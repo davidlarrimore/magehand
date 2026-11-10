@@ -1697,6 +1697,53 @@ class FetchZone(unittest.TestCase):
                                  'deploy/fetch/prod/kustomization.yaml', 'deploy/fetch/stage/k.yaml'])
 
 
+class FetchZoneRendered(unittest.TestCase):
+    """check_rendered renders and checks a fetch zone's overlays too (review of #84): their namespace, the kinds a
+    fetch zone may hold, and a render that fails."""
+
+    def run_rendered(self, answers, prod=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = dict(FETCH_FILES)
+            if prod:
+                files['deploy/fetch/prod/kustomization.yaml'] = 'namespace: demo-fetch\nresources: [../base]\n'
+            root = deploy_repo(tmp, FETCH_APP, files)
+            seen = []
+
+            def render(local, overlay):
+                seen.append(overlay)
+                return answers.get(overlay, ([], None))
+            with mock.patch.object(magehand, 'render_overlay', render), \
+                    mock.patch.object(magehand, 'check_admission', lambda name, rendered: ([], [])), \
+                    mock.patch.object(magehand, 'check_schemas', lambda rendered: ([], [])):
+                found, _ = magehand.check_rendered(root, 'demo')
+        return seen, [(f['level'], f['where'], f['text']) for f in found]
+
+    def test_both_fetch_overlays_are_rendered(self):
+        seen, found = self.run_rendered({})
+        self.assertEqual(seen, ['dev', 'fetch/dev', 'fetch/prod'])
+        self.assertEqual(found, [])
+        seen, _ = self.run_rendered({}, prod=False)
+        self.assertEqual(seen, ['dev', 'fetch/dev'])
+
+    def test_a_fetch_overlay_that_does_not_render_is_an_error(self):
+        _, found = self.run_rendered({'fetch/dev': ('failed', "accumulating resources: 'does-not-exist.yaml'")})
+        self.assertEqual([f[:2] for f in found], [('error', 'deploy/fetch/dev')])
+        self.assertIn('does-not-exist.yaml', found[0][2])
+
+    def test_kinds_and_namespace_of_a_fetch_zone(self):
+        def doc(kind, api='v1', ns=None):
+            meta = {'name': 'x', **({'namespace': ns} if ns else {})}
+            return {'apiVersion': api, 'kind': kind, 'metadata': meta}
+        docs = [doc('Deployment', 'apps/v1'), doc('CronJob', 'batch/v1'), doc('ConfigMap'),
+                doc('Ingress', 'networking.k8s.io/v1'), doc('ExternalSecret', 'external-secrets.io/v1'),
+                doc('Secret'), doc('Service'), doc('Deployment', 'apps/v1', ns='demo-dev')]
+        _, found = self.run_rendered({'fetch/dev': (docs, None)})
+        errors = [(where, text) for level, where, text in found if level == 'error']
+        refused = sorted(t.split(' (')[0] for _, t in errors if 'not allowed in a fetch zone' in t)
+        self.assertEqual(refused, ['ExternalSecret', 'Ingress', 'Secret', 'Service'])
+        self.assertTrue(any('namespace must be demo-fetch-dev' in t for _, t in errors))
+
+
 class DeployDir(unittest.TestCase):
     """An app repo with deploy/: magehand reads the app from the checkout, not homelab-apps."""
 
@@ -1920,7 +1967,7 @@ class DeployDir(unittest.TestCase):
                     'pass: 7, fail: 1, warn: 0, error: 0, skip: 4 \n')
 
     def cluster_rules(self, kyverno='', kubeconform='', tools=('kyverno', 'kubeconform'), policies=('pods.yaml',),
-                      kustomize=0):
+                      kustomize=0, rendered=None):
         """check_admission and check_schemas on one rendered dev overlay, with the tools answering as given."""
         calls = []
 
@@ -1929,6 +1976,7 @@ class DeployDir(unittest.TestCase):
             if argv[:2] == ['kubectl', 'kustomize']:
                 applied = pathlib.Path(argv[2])
                 self.kustomization = json.loads((applied / 'kustomization.yaml').read_text())
+                self.kustomizations.append(self.kustomization)
                 return subprocess.CompletedProcess(argv, kustomize, (applied / 'app.yaml').read_text(),
                                                    'Error: bad image' if kustomize else '')
             output = kyverno if argv[0].endswith('kyverno') else kubeconform
@@ -1939,7 +1987,8 @@ class DeployDir(unittest.TestCase):
                 mock.patch.object(magehand.shutil, 'which', lambda t: f'/usr/local/bin/{t}' if t in tools else None), \
                 mock.patch.object(magehand, 'github_dir', lambda repo, path, **k: [n.rsplit('/', 1)[1] for n in files]), \
                 mock.patch.object(magehand, 'github_file', lambda repo, path, **k: files[path]):
-            rendered = [('dev', [self.DEV_DEPLOYMENT])]
+            rendered = rendered or [('dev', [self.DEV_DEPLOYMENT])]
+            self.kustomizations = []
             admission, schemas = magehand.check_admission('demo', rendered), magehand.check_schemas(rendered)
         return admission, schemas, calls
 
@@ -1955,6 +2004,14 @@ class DeployDir(unittest.TestCase):
                                                          'digest': magehand.POLICY_DIGEST}])
         self.assertEqual(self.kustomization['commonAnnotations'],
                          {'argocd.argoproj.io/tracking-id': 'demo-dev:policy-check'})
+
+    def test_a_fetch_zone_is_checked_as_its_own_application(self):
+        ok = 'Applying 4 policy rule(s) to 2 resource(s)...\n\npass: 8, fail: 0, warn: 0, error: 0, skip: 2\n'
+        rendered = [('dev', [self.DEV_DEPLOYMENT]), ('fetch/dev', [self.DEV_DEPLOYMENT]),
+                    ('fetch/prod', [self.DEV_DEPLOYMENT])]
+        self.cluster_rules(kyverno=ok, rendered=rendered)
+        self.assertEqual([k['commonAnnotations']['argocd.argoproj.io/tracking-id'] for k in self.kustomizations],
+                         ['demo-dev:policy-check', 'demo-fetch-dev:policy-check', 'demo-fetch-prod:policy-check'])
 
     def test_a_refusal_names_the_policy_the_resource_and_why(self):
         (found, skipped), _, _ = self.cluster_rules(kyverno=self.KYVERNO_FAIL)

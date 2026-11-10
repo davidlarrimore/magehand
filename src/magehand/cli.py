@@ -3715,6 +3715,12 @@ def env_findings(app, container, deployment_file, catalog):
 
 # What the platform lets an app deploy (the only copy of this list: app CI runs `check --strict`; Argo CD's
 # agent-app-bundles project and Kyverno enforce it in the cluster): namespace, quota, limits and network policy come from the platform.
+# What an app's own deploy/fetch overlays may hold (homelab docs/restricted-egress-plan.md, "Admission rules"): the
+# fetcher's workloads and config. The platform adds the queue, its Secret and the zone's policies.
+FETCH_ALLOWED_KINDS = {
+    ('', 'ConfigMap'), ('apps', 'Deployment'), ('batch', 'Job'), ('batch', 'CronJob'),
+    ('policy', 'PodDisruptionBudget'),
+}
 ALLOWED_KINDS = {
     ('', 'ConfigMap'), ('', 'Secret'), ('', 'Service'), ('', 'ServiceAccount'), ('', 'PersistentVolumeClaim'),
     ('apps', 'Deployment'), ('apps', 'StatefulSet'), ('batch', 'Job'), ('batch', 'CronJob'),
@@ -3753,7 +3759,9 @@ def render_overlay(local, overlay):
 
 # Memory (requests, limits) in MiB: each namespace's quota (homelab platform/agent-apps-baseline{,-prod}/
 # resource-quota.yaml) and each block's pod (platform/building-blocks/<type>/templates/statefulset.yaml).
-NAMESPACE_MEMORY_MI = {'dev': (1024, 2048), 'prod': (2048, 4096)}
+NAMESPACE_MEMORY_MI = {'dev': (1024, 2048), 'prod': (2048, 4096),
+                      # a fetch zone's (platform/agent-apps-baseline-fetch/resource-quota.yaml), dev and production
+                      'fetch/dev': (384, 768), 'fetch/prod': (384, 768)}
 BLOCK_MEMORY_MI = {'postgres': (128, 512), 'redis': (64, 256)}
 
 
@@ -3841,11 +3849,15 @@ def check_rendered(root, name):
         return [], []
     found, skipped, rendered = [], [], []
     domain = LAB.split('.', 1)[1]
-    for overlay, namespace in (('dev', f'{name}-dev'), ('prod', name)):
+    overlays = [('dev', f'{name}-dev'), ('prod', name)]
+    if any((local / FETCH_DIR / 'base').glob('*.y*ml')):  # the fetch zone (check_fetch_zone reports the layout)
+        overlays += [(f'{FETCH_DIR}/dev', f'{name}-fetch-dev'), (f'{FETCH_DIR}/prod', f'{name}-fetch')]
+    for overlay, namespace in overlays:
         where = f'{DEPLOY}/{overlay}'
-        if overlay == 'dev' and not (local / overlay / 'kustomization.yaml').is_file():
+        fetch = overlay.startswith(f'{FETCH_DIR}/')
+        if overlay.endswith('dev') and not (local / overlay / 'kustomization.yaml').is_file():
             continue  # check_deploy_files reports a missing dev overlay
-        if overlay == 'prod' and not (local / overlay).is_dir():
+        if overlay.endswith('prod') and not (local / overlay).is_dir():
             continue  # production is optional, but CI renders deploy/prod whenever it exists
         if not (local / overlay / 'kustomization.yaml').is_file():
             found.append(finding('error', f'{where}/kustomization.yaml', f'missing: CI renders {where} because it '
@@ -3860,7 +3872,8 @@ def check_rendered(root, name):
             skipped.append(f'{where}: not rendered ({why}); CI renders and checks it')
             continue
         rendered.append((overlay, docs))
-        found += check_rollout_room(where, overlay, docs, app_services(local))
+        found += check_rollout_room(where, overlay, docs,
+                                    {'queue': {'type': 'redis'}} if fetch else app_services(local))
         found += check_metrics_exposure(where, docs)
         lab, public = f'{namespace}.{LAB}', f'{namespace}.{domain}'
         for doc in docs:
@@ -3870,7 +3883,11 @@ def check_rendered(root, name):
             if meta.get('namespace') not in (None, namespace):
                 found.append(finding('error', label, f'namespace must be {namespace} (found {meta["namespace"]})',
                                      'README "How an app is put together"'))
-            if (group, kind) not in ALLOWED_KINDS:
+            if fetch and (group, kind) not in FETCH_ALLOWED_KINDS:
+                found.append(finding('error', label, f'{kind} ({group or "core"}) is not allowed in a fetch zone '
+                                     f'(its workloads, ConfigMaps and PodDisruptionBudgets only; the platform adds '
+                                     f'the queue)', 'fetch'))
+            elif (group, kind) not in ALLOWED_KINDS:
                 found.append(finding('error', label, f'{kind} ({group or "core"}) is not allowed in an app',
                                      'homelab-apps AGENTS.md "Not allowed"'))
             if kind == 'Ingress':
@@ -3991,14 +4008,16 @@ def check_admission(name, rendered):
         for n in names:
             (policies / n).write_text(github_file(APPS_REPO, f'{POLICY_DIR}/{n}'))
         for overlay, docs in rendered:
-            where, env = f'{DEPLOY}/{overlay}', 'prod' if overlay == 'prod' else 'dev'
-            kdir = pathlib.Path(tmp) / overlay
+            where, env = f'{DEPLOY}/{overlay}', 'prod' if overlay.endswith('prod') else 'dev'
+            # The Application Argo CD applies it as: <app>-dev / <app>-prod, a fetch zone <app>-fetch-dev / -prod.
+            application = f'{name}-fetch-{env}' if overlay.startswith(f'{FETCH_DIR}/') else f'{name}-{env}'
+            kdir = pathlib.Path(tmp) / overlay.replace('/', '-')
             kdir.mkdir()
             (kdir / 'app.yaml').write_text(yaml.safe_dump_all(docs, sort_keys=False))
             (kdir / 'kustomization.yaml').write_text(json.dumps({
                 'resources': ['app.yaml'],
                 'images': [{'name': f'ghcr.io/davidlarrimore/homelab-apps/{name}', 'digest': POLICY_DIGEST}],
-                'commonAnnotations': {'argocd.argoproj.io/tracking-id': f'{name}-{env}:policy-check'}}))
+                'commonAnnotations': {'argocd.argoproj.io/tracking-id': f'{application}:policy-check'}}))
             applied, why = run_tool(['kubectl', 'kustomize', str(kdir)], 60)
             if why:
                 skipped.append(f'{where}: admission policies not checked ({why}); CI checks them')
