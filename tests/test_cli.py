@@ -3829,14 +3829,15 @@ class PrWatch(unittest.TestCase):
         self.assertIn('--add-label live-tested', step)
         self.assertIn(f'`live-tested: {H}`', step)  # the exact line the queue looks for, with the full head
         self.assertNotIn(result, magehand.WATCH_DONE)  # the agent has the live test to run
-        # as homelab's queue: the label counts only with an owner comment's line for this head
+        # as homelab's queue: the label counts only with a tester's comment line for this head
         for labels, comments in (((), [said(H)]),                              # the line, no label
                                  (('live-tested',), []),                       # the label, no line
                                  (('live-tested',), [said('b' * 40)]),         # a line for an older head
-                                 (('live-tested',), [said(H, 'davidlarrimore-bot')])):  # not the owner's
+                                 (('live-tested',), [said(H, 'someone-else')])):  # not a tester's
             with self.subTest(labels=labels, comments=comments):
                 self.assertEqual(self.step(pr(vm, labels=labels, comments=comments))[0], 'live-test')
         for p in (pr(vm, labels=['live-tested'], comments=[said(H)]),       # tested: the queue merges it
+                  pr(vm, labels=['live-tested'], comments=[said(H, 'davidlarrimore-bot')]),  # by OpenClaw's review
                   pr(['platform/openclaw/skills/x/SKILL.md']),           # not what it runs on its own
                   pr(vm, url='https://github.com/davidlarrimore/demo/pull/12'),  # not the homelab
                   pr(vm, author='renovate[bot]')):                       # not the owner's
