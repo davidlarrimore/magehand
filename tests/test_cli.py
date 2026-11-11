@@ -3646,28 +3646,39 @@ class PrWatch(unittest.TestCase):
 
     def test_live_test_holds_the_owners_homelab_pr_that_changes_openclaws_runtime(self):
         H, url = self.HEAD, 'https://github.com/davidlarrimore/homelab/pull/12'
+        said = lambda sha, who='davidlarrimore': {'author': {'login': who}, 'body': f'ran it\n\nlive-tested: {sha}'}
 
-        def pr(files, labels=(), author='davidlarrimore', review=(('APPROVED', H),), url=url):
-            p = self.pr(review=list(review), labels=labels, author=author)
-            p.update(url=url, files=[{'path': f} for f in files])
+        def pr(files, labels=(), author='davidlarrimore', review=(('APPROVED', H),), url=url, comments=(), **kw):
+            p = self.pr(review=list(review), labels=labels, author=author, **kw)
+            p.update(url=url, files=[{'path': f} for f in files], comments=list(comments))
             return p
         vm = ['platform/openclaw/vm/versions.env']
         result, what, step = self.step(pr(vm))
         self.assertEqual(result, 'live-test')
         self.assertIn('versions.env', what)
         self.assertIn('--add-label live-tested', step)
+        self.assertIn(f'`live-tested: {H}`', step)  # the exact line the queue looks for, with the full head
         self.assertNotIn(result, magehand.WATCH_DONE)  # the agent has the live test to run
-        for p in (pr(vm, labels=['live-tested']),                        # tested: the queue merges it
+        # as homelab's queue: the label counts only with an owner comment's line for this head
+        for labels, comments in (((), [said(H)]),                              # the line, no label
+                                 (('live-tested',), []),                       # the label, no line
+                                 (('live-tested',), [said('b' * 40)]),         # a line for an older head
+                                 (('live-tested',), [said(H, 'davidlarrimore-bot')])):  # not the owner's
+            with self.subTest(labels=labels, comments=comments):
+                self.assertEqual(self.step(pr(vm, labels=labels, comments=comments))[0], 'live-test')
+        for p in (pr(vm, labels=['live-tested'], comments=[said(H)]),       # tested: the queue merges it
                   pr(['platform/openclaw/skills/x/SKILL.md']),           # not what it runs on its own
                   pr(vm, url='https://github.com/davidlarrimore/demo/pull/12'),  # not the homelab
                   pr(vm, author='renovate[bot]')):                       # not the owner's
             self.assertNotEqual(self.step(p)[0], 'live-test', p['url'])
         self.assertEqual(self.step(pr(vm, labels=['hold']))[0], 'held')
-        # a push after the label: the next step drops it, as the new head needs its own test
-        for review in ((('COMMENTED', H),), (('APPROVED', 'b' * 40),)):
-            step = self.step(pr(vm, labels=['live-tested'], review=review))[2]
-            self.assertIn('--remove-label live-tested', step)
+        # a push after the label (findings, a new head, a failed check): the next step drops it first
+        for p in (pr(vm, labels=['live-tested'], review=(('COMMENTED', H),)),
+                  pr(vm, labels=['live-tested'], review=(('APPROVED', 'b' * 40),)),
+                  pr(vm, labels=['live-tested'], checks=self.FAILED)):
+            self.assertIn('--remove-label live-tested', self.step(p)[2])
         self.assertNotIn('remove-label', self.step(pr(vm, review=(('COMMENTED', H),)))[2])
+        self.assertNotIn('remove-label', self.step(pr(vm, checks=self.FAILED))[2])
 
     def test_waits(self):
         H = self.HEAD
