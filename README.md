@@ -14,6 +14,25 @@ that only the owner has: the private homelab repos on GitHub, the private
 `*.lab` network, and an authentik passkey for
 OpenBao.
 
+## What magehand needs
+
+magehand is a client for the homelab, not a standalone tool. It reads GitHub,
+the homelab's `*.lab` services and the git checkout you run it in, and can do
+little without them. `magehand setup` checks most of this once per machine;
+`magehand doctor` checks it again at the start of a session.
+
+| It needs | For | Without it |
+| --- | --- | --- |
+| **git**, and the app's checkout: `origin` is `github.com/davidlarrimore/REPO` | knowing which app you are working on ([below](#which-app-a-command-acts-on)) | name the app (`magehand status APP`); `bucket`, `job`, `fetch` and `icon` refuse |
+| **GitHub as the owner**: `gh` signed in (`gh auth login`), or `GITHUB_TOKEN` / `GH_TOKEN` | nearly everything: the guide, homelab-apps, the app's repo, PRs and releases are private | almost nothing (`setup` and `doctor` say what is missing) |
+| **The homelab's network**: `*.lab.davidlarrimore.com` resolving to it (`magehand setup` sends only those lookups to your home gateway) and reachable | OpenBao (the app's keys) and the services a local run calls (LiteLLM) | `login`, `run`, `bucket --env dev\|prod` fail; the GitHub-only commands work |
+| **An authentik account in `homelab-admins` with a passkey**, a browser, and local port 8250 free for the sign-in's callback | `magehand login`: the app's LLM and bucket keys | `run` (for an app with an `llm` block) and `bucket --env dev\|prod` can't get their keys |
+| **A container runtime**: Docker Desktop, OrbStack, Colima, Rancher Desktop or Podman | `dev`, `run --container`, `check --ui` | those refuse; `run -- CMD` still works for an app whose blocks are only `llm` and `secret` |
+| **kubectl** with a context for the cluster (optional) | `status` and `job ls` read the pods; `check` renders the overlays | they read what the platform publishes on GitHub; `check` skips the render with a note |
+| **kyverno** and **kubeconform** (optional: `brew install kyverno kubeconform`) | `check` runs the cluster's admission policies and schema check, as CI does | skipped with a note (an error with `--strict`) |
+| **The macOS Keychain** (`security`), on a Mac | keeping the sign-in | elsewhere, a file only you can read |
+| **Python 3.9+** and uv (or pipx) | installing and upgrading magehand | |
+
 ## Install
 
 ```sh
@@ -57,6 +76,40 @@ instead (CI's tests and browser check, or the owner). `doctor` there checks
 only GitHub and the repo, and `app` shows no sign-in line. Nothing OpenClaw
 does needs the sign-in: the platform gives apps their keys.
 
+### Which app a command acts on
+
+magehand works out the app from the git checkout you run it in (from any
+directory inside it), never from a setting or a file of its own:
+
+1. The checkout is an **app checkout** when its top has `ui-check.yaml` or
+   `deploy/app.yaml` and its `origin` is `github.com/davidlarrimore/REPO`
+   (https, `ssh://` or `git@`). Another owner's repo of the same name, a
+   look-alike host or a checkout with no `origin` is not one.
+2. The app is `deploy/app.yaml`'s `app:` when it sets a valid name, else REPO.
+
+**In an app checkout, every app command acts on that app only.** `app`,
+`status`, `check`, `release`, `dev`, `run`, `bucket`, `job`, `fetch` and
+`icon` refuse another app's name (exit 1), so nothing run in one app's
+directory reaches another app's keys, data, release or deployment. (`check`
+also takes the repo's own name, for a repo whose `app:` names its app
+differently.) To work on another app, run the command in that app's checkout,
+or outside any app checkout.
+
+**Outside an app checkout** (`homelab`, `homelab-apps`, any other directory)
+name the app: `magehand status elvis`. `bucket`, `job`, `fetch` and `icon`
+work only in the app's checkout, because they work on its files or its data.
+
+**Platform commands** involve no app and work anywhere: `guide`, `setup`,
+`doctor`, `upgrade`, `login`, `runtime`, `skill`, `version`, `help`, `new`,
+`pr` (the PR of the repo you are in) and `update-agents` (the checkout it is
+given).
+
+The sign-in is not per app: one `magehand login` per machine covers every
+app, read-only, for LLM and bucket keys. The scoping is magehand's own rule:
+it stops a mistake made in the wrong directory, yours or a coding agent's. It
+is not a boundary against a program running as you that reads the Keychain
+itself.
+
 Every command that leads somewhere ends with one line, `next: ...`: the one
 thing to do next (`next: nothing` when there is nothing), and its `--json`
 has it as `"next"`. Only commands whose output is the result itself (`guide`,
@@ -94,7 +147,7 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 | `magehand bucket [--env local\|dev\|prod] ls\|cp\|sync\|url\|usage ...` | Read and write the buckets of the app whose repo you are in (nothing else; `--app` may only name that app) with the keys the platform hands the app: `ls BUCKET[/PREFIX]`, `cp FILE BUCKET/KEY` (and back), `sync DIR BUCKET/PREFIX` (uploads what changed, never deletes), `url BUCKET/KEY` (a public bucket), `usage [BUCKET]` (objects and bytes against the 1 GB cap). `dev` (default) and `prod` read the keys from OpenBao (`magehand login`); `local` uses the Garage `dev up` started; an `internal` bucket is only reachable with `--env local` or from code in the cluster. Uploads set `Content-Type` and can set `Cache-Control`. **A write to an app's own bucket** (`cp`, `sync`; with `--env prod` it is production data), on an explicit command, never a delete; its S3 endpoint (R2, or the local Garage) is the one network destination besides GitHub and `*.lab`. `BUCKET/KEY` is always the remote side; write a local path that starts with a bucket name as `./PATH`. `--json` prints one object for every action |
 | `magehand dev [up\|down\|status] [APP]` | Containers for the app's `postgres`/`redis`/`bucket` blocks (the blocks' own pinned images; a bucket is the platform's Garage with one 1 GB bucket and a key limited to it, its data in a volume that survives a restart) on a per-app network, and, for `secret` blocks, a value made for each run (never stored; set the variable in your shell to keep one stable across runs). A state file from an older magehand is cleaned of its passwords and generated values the first time it is read. No secret is written to magehand's state file: a database's password is its container's own environment, read back when a run needs it. A public bucket's local `url` is the S3 path and needs the key. `down` deletes the local data |
 | `magehand runtime [docker\|podman\|none\|auto] [--json]` | Shows or sets the container runtime for `dev` and `run --container`. Detected without sudo (`<cli> info`): the `docker` CLI of Docker Desktop, OrbStack, Colima or Rancher Desktop (dockerd), or Podman. `auto` (the default) uses the first running one; `none` means no containers (`magehand run -- CMD` still works for apps whose blocks are only `llm` and `secret`) |
-| `magehand login [--check [--min N]] [--json]` | Signs in to OpenBao through authentik (passkey) with role `dev`: read-only access to agent apps' LiteLLM keys, 1h (8h max). The token is kept in the macOS Keychain (passed on stdin, never as an argument), elsewhere in a file only you can read; `MAGEHAND_BAO_TOKEN` still works but is deprecated. `doctor`, `app` and `run` show the time left (a warning under 10 minutes); an expired session in a terminal offers to sign in again and carries on. `--check` only reports the time left and exits 1 when signed out or under N minutes (default 10), so an agent can ask you to sign in before a long task |
+| `magehand login [--check [--min N]] [--json]` | Signs in to OpenBao through authentik (passkey) with role `dev`: read-only access to agent apps' LiteLLM and bucket keys. One sign-in per machine, for every app (which app a command uses is the checkout's business, above). The session is 1h, renewed by itself while you use magehand (any command that needs it, or `--check`, renews it when under 30 minutes are left), up to 8h after you signed in: about one passkey tap a working day. The token is kept in the macOS Keychain (passed on stdin, never as an argument), elsewhere in a file only you can read; `MAGEHAND_BAO_TOKEN` still works but is deprecated. `doctor`, `app` and `run` show the time left (a warning under 10 minutes); an expired session in a terminal offers to sign in again and carries on. `--check` only reports the time left and exits 1 when signed out or under N minutes (default 10), so an agent can ask you to sign in before a long task |
 
 **This machine**
 
@@ -107,7 +160,8 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 | `magehand version [--json]`, `magehand -V` | The installed version, and whether a newer one exists (`--json`: `version`, `latest`, `newer`, `next`; no network call in OpenClaw's VM) |
 
 **Everywhere:** `-a/--app APP` names the app (default: the app repo you're
-in); `--json` prints JSON for scripts and agents; exit status 0 is success,
+in; in an app's repo it can only name that app, see "Which app a command acts
+on"); `--json` prints JSON for scripts and agents; exit status 0 is success,
 1 a failure (or `check` errors), 2 a usage error (with a "did you mean"),
 130 Ctrl-C. Messages go to stderr, results to stdout.
 
