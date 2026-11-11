@@ -1103,6 +1103,29 @@ class WithoutGh(unittest.TestCase):
             self.assertIn('with only GITHUB_TOKEN, magehand reads GitHub but cannot do this', str(ctx.exception.code))
         self.assertEqual(self.calls, [])
 
+    def test_a_read_only_gh_does_says_why(self):
+        """`pr view` (pr ready, pr watch) has no API reader: the reason names the token, not just a missing gh."""
+        code, _, why = magehand.gh_probe('pr', 'view', '19', '--json', 'number')
+        self.assertIsNone(code)
+        self.assertEqual(why, 'the GitHub CLI (gh) is not installed (with only GITHUB_TOKEN, magehand reads GitHub '
+                              'but cannot do this)')
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(magehand.gh_probe('pr', 'view', '19')[2], 'the GitHub CLI (gh) is not installed')
+
+    def test_pr_commands_refuse_without_gh(self):
+        for action in ('ready', 'watch'):
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.cmd_pr(magehand.build_parser().parse_args(['pr', action, '19']))
+            self.assertEqual(str(ctx.exception.code), f'magehand: `magehand pr {action}` needs the GitHub CLI: '
+                             '`brew install gh`, then `gh auth login` (with only GITHUB_TOKEN, magehand reads GitHub '
+                             'but cannot do this)')
+        self.assertEqual(self.calls, [])
+
+    def test_release_names_the_token_not_gh(self):
+        self.assertEqual(magehand.github_identity(), 'token')
+        with mock.patch.object(magehand.shutil, 'which', lambda name: '/usr/bin/gh'):
+            self.assertEqual(magehand.github_identity(), 'gh')
+
     def test_no_token_no_fallback(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(SystemExit) as ctx:
@@ -3632,6 +3655,13 @@ def setUpModule():
 class PrReady(unittest.TestCase):
     """`pr ready`: only on green checks, and the review request is confirmed, never assumed."""
 
+    def setUp(self):  # these run the gh path: the machine running the tests may have no gh
+        which = shutil.which
+        patch = mock.patch.object(magehand.shutil, 'which',
+                                  lambda name, *a, **k: '/usr/bin/gh' if name == 'gh' else which(name, *a, **k))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
 
     def run_pr(self, checks=GREEN, draft=True, author='davidlarrimore', requested_before=False, sticks=True,
@@ -3741,6 +3771,13 @@ class PrReady(unittest.TestCase):
 
 class PrWatch(unittest.TestCase):
     """`pr watch`: follows a readied PR and ends exactly when the agent has something to do, or it is done."""
+
+    def setUp(self):  # these run the gh path: the machine running the tests may have no gh
+        which = shutil.which
+        patch = mock.patch.object(magehand.shutil, 'which',
+                                  lambda name, *a, **k: '/usr/bin/gh' if name == 'gh' else which(name, *a, **k))
+        patch.start()
+        self.addCleanup(patch.stop)
 
     HEAD = 'a' * 40
     GREEN = [{'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
@@ -5152,15 +5189,23 @@ class Release(unittest.TestCase):
         stages = [{'stage': 'build', 'state': 'pending', 'text': 'building'},
                   {'stage': 'deploy', 'state': 'pending', 'text': 'no deploy PR'},
                   {'stage': 'dev', 'state': 'pending', 'text': 'rolling out'}]
-        plan = self.plan(stages=stages, files={'homelab/contents/platform/prod-apps/apps.yaml': 'other:\n  exposure: internal\n',
-                                               'app/contents/deploy/prod': None},
-                         **{self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1': failing,
-                            'user': {'login': 'someone-else'}})
+        files = {'homelab/contents/platform/prod-apps/apps.yaml': 'other:\n  exposure: internal\n',
+                 'app/contents/deploy/prod': None}
+        reads = {self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1': failing,
+                 'user': {'login': 'someone-else'}}
+        with mock.patch.object(magehand, 'github_identity', lambda: 'gh'):  # whatever the host has
+            plan = self.plan(stages=stages, files=files, **reads)
         problems = ' | '.join(plan['problems'])
-        for text in ('signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
+        for text in ('gh is signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
                      'failing checks: scan', 'still has checks running: build', 'build of', 'deploy of',
                      'dev is not running'):
             self.assertIn(text, problems)
+        with mock.patch.object(magehand, 'github_identity', lambda: 'token'):  # OpenClaw's VM: GITHUB_TOKEN, no gh
+            plan = self.plan(stages=stages, files=files, **reads)
+        problems = ' | '.join(plan['problems'])
+        self.assertIn("the GITHUB_TOKEN here is someone-else's (no gh): only davidlarrimore's release deploys "
+                      'production, and only davidlarrimore creates it', problems)
+        self.assertNotIn('gh auth login', problems)
 
     def test_approval_is_read_from_the_register_or_the_old_per_app_file(self):
         self.assertEqual(self.plan()['problems'], [])  # in the register
