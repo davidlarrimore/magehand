@@ -5839,6 +5839,20 @@ def update_notice():
 
 UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'upgrade', 'magehand'], 'pipx': ['pipx', 'upgrade', 'magehand'],
                     'venv': [sys.executable, '-m', 'pip', 'install', '--upgrade', 'magehand']}
+# uv answers `tool upgrade` from its cached package index: a release newer than the cache isn't seen, and it exits 0
+# having changed nothing (0.54.1 on 2026-11-11: `now: magehand 0.54.0`, `next: nothing`). Asking for the exact
+# version looks it up. On the interpreter this copy runs on, so a reinstall never moves it off Apple's Python.
+PIN_COMMANDS = {'uv': lambda v: ['uv', 'tool', 'install', '--force', '--python', os.path.realpath(sys.executable),
+                                 f'magehand=={v}'],
+                'pipx': lambda v: ['pipx', 'install', '--force', '--python', os.path.realpath(sys.executable),
+                                   f'magehand=={v}'],
+                'venv': lambda v: [sys.executable, '-m', 'pip', 'install', f'magehand=={v}']}
+
+
+def exe_version(exe):
+    """The version an installed magehand executable reports, or None."""
+    out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603  # our own executable
+    return out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else None
 
 
 def cmd_upgrade(_a):
@@ -5849,10 +5863,11 @@ def cmd_upgrade(_a):
     if method not in UPGRADE_COMMANDS:
         die('not installed with uv, pipx or a venv; reinstall with `uv tool install magehand`')
     current, latest = installed_version(), latest_version(max_age=0)
+    upgraded = False
     if current and latest and version_tuple(latest) <= (version_tuple(current) or ()):
         print(f'magehand {current} is the latest')
     else:
-        cmd = UPGRADE_COMMANDS[method]
+        upgraded, cmd = True, UPGRADE_COMMANDS[method]
         print(f'magehand {current or "?"} -> {latest or "latest"}: {" ".join(cmd)}', flush=True)
         if subprocess.run(cmd).returncode != 0:  # nosec B603  # fixed commands above
             die('the upgrade failed (see above)')
@@ -5862,8 +5877,20 @@ def cmd_upgrade(_a):
         print('upgraded')
         print(next_line('`magehand skill --install`, if you use the skill'))
         return
-    out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603
-    print(f'now: magehand {out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else "?"}', flush=True)
+    now = exe_version(exe)
+    behind = lambda v: bool(latest and version_tuple(v) and version_tuple(latest) and
+                            version_tuple(v) < version_tuple(latest))
+    if upgraded and behind(now):
+        pin = PIN_COMMANDS[method](latest)
+        print(f'still {now}: `{" ".join(cmd)}` did not see {latest} (its package index is older than the release); '
+              f'installing it by version: {" ".join(pin)}', flush=True)
+        if subprocess.run(pin).returncode != 0:  # nosec B603  # fixed commands above, a version from our tags
+            die(f'could not install magehand {latest} (PyPI has it a few minutes after the tag): '
+                f'`{" ".join(pin)}` again in a few minutes')
+        now = exe_version(exe)
+        if behind(now):
+            die(f'still magehand {now} after installing {latest}: run `{" ".join(pin)}` and read its output')
+    print(f'now: magehand {now or "?"}', flush=True)
     # The new version's own setup, quietly: it refreshes the skill and the approvals where setup put them, and
     # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
     code = subprocess.run([str(exe), 'setup', '--refresh']).returncode  # nosec B603
