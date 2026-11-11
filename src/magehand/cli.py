@@ -887,10 +887,12 @@ def deploy_marks(prs):
 
 
 def deploy_stage(prs, head):
-    """Dev's deploy PR (newest first) for the commit `head`."""
-    for pr, sha, image in deploy_marks(prs):
-        if sha != head:
-            continue
+    """Dev's deploy PR for the commit `head`: one that merged deployed it, whatever came after (OpenClaw can
+    open a duplicate for a commit just deployed and close it seconds later: homelab-apps#399 merged, #400
+    closed); otherwise the newest."""
+    marks = [m for m in deploy_marks(prs) if m[1] == head]
+    marks.sort(key=lambda m: m[0].get('state') != 'MERGED')  # stable: newest first within each group
+    for pr, sha, image in marks:
         ref = f'homelab-apps#{pr["number"]}'
         digest = image.rsplit('@', 1)[-1][:19]
         if pr.get('state') == 'MERGED':
