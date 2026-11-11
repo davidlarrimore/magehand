@@ -5189,15 +5189,23 @@ class Release(unittest.TestCase):
         stages = [{'stage': 'build', 'state': 'pending', 'text': 'building'},
                   {'stage': 'deploy', 'state': 'pending', 'text': 'no deploy PR'},
                   {'stage': 'dev', 'state': 'pending', 'text': 'rolling out'}]
-        plan = self.plan(stages=stages, files={'homelab/contents/platform/prod-apps/apps.yaml': 'other:\n  exposure: internal\n',
-                                               'app/contents/deploy/prod': None},
-                         **{self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1': failing,
-                            'user': {'login': 'someone-else'}})
+        files = {'homelab/contents/platform/prod-apps/apps.yaml': 'other:\n  exposure: internal\n',
+                 'app/contents/deploy/prod': None}
+        reads = {self.APP + f'commits/{self.HEAD}/check-runs?per_page=100&page=1': failing,
+                 'user': {'login': 'someone-else'}}
+        with mock.patch.object(magehand, 'github_identity', lambda: 'gh'):  # whatever the host has
+            plan = self.plan(stages=stages, files=files, **reads)
         problems = ' | '.join(plan['problems'])
-        for text in ('signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
+        for text in ('gh is signed in as someone-else', 'not approved for production', 'deploy/prod/ is missing',
                      'failing checks: scan', 'still has checks running: build', 'build of', 'deploy of',
                      'dev is not running'):
             self.assertIn(text, problems)
+        with mock.patch.object(magehand, 'github_identity', lambda: 'token'):  # OpenClaw's VM: GITHUB_TOKEN, no gh
+            plan = self.plan(stages=stages, files=files, **reads)
+        problems = ' | '.join(plan['problems'])
+        self.assertIn("the GITHUB_TOKEN here is someone-else's (no gh): only davidlarrimore's release deploys "
+                      'production, and only davidlarrimore creates it', problems)
+        self.assertNotIn('gh auth login', problems)
 
     def test_approval_is_read_from_the_register_or_the_old_per_app_file(self):
         self.assertEqual(self.plan()['problems'], [])  # in the register
