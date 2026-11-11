@@ -5221,6 +5221,15 @@ class Status(unittest.TestCase):
         self.assertIn('validate', stage['text'])
         self.assertEqual(magehand.deploy_stage([self.pr(122, 'CLOSED')], self.HEAD)['state'], 'failed')
 
+    def test_a_closed_duplicate_after_the_merged_deploy_pr_is_not_a_failure(self):
+        # mad-libs a7de361: homelab-apps#399 merged, then OpenClaw opened #400 for the same commit and closed it
+        prs = [self.pr(400, 'CLOSED'), self.pr(399, 'MERGED')]  # gh lists newest first
+        stage = magehand.deploy_stage(prs, self.HEAD)
+        self.assertEqual((stage['state'], stage['pr']), ('ok', 399))
+        # a newer open PR for the commit still wins over an older closed one
+        prs = [self.pr(401, 'OPEN', checks=[('scan', 'SUCCESS')]), self.pr(400, 'CLOSED')]
+        self.assertEqual(magehand.deploy_stage(prs, self.HEAD)['state'], 'pending')
+
     def test_prod_stage(self):
         prs = [{'number': 120, 'state': 'MERGED', 'title': 'elvis: release v1.2.0 to production'}]
         stage = magehand.prod_stage('v1.2.0', 3, prs)
