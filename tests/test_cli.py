@@ -1196,6 +1196,58 @@ class LocalNetworkBlocked(unittest.TestCase):
         self.assertEqual(runs[0], ['uv', 'tool', 'install', '--reinstall', '--python', '/usr/bin/python3', 'magehand'])
         self.assertEqual(runs[1][1:], ['setup'])
 
+    def upgrade(self, versions, fails=()):
+        """`magehand upgrade` from 0.54.0 with 0.54.1 released; `versions` is what the executable reports after
+        each install; `fails`, the install commands (by first words) that exit 1. Returns (code, out, runs)."""
+        runs, reported = [], list(versions)
+
+        def run(argv, **_k):
+            if argv[1:] == ['version']:
+                return subprocess.CompletedProcess(argv, 0, stdout=reported.pop(0) + '\n')
+            runs.append(argv)
+            code = 1 if any(argv[:len(f)] == list(f) for f in fails) else 2 if argv[1:2] == ['setup'] else 0
+            return subprocess.CompletedProcess(argv, code)
+        with mock.patch.object(magehand, 'install_method', lambda *a: 'uv'), \
+                mock.patch.object(magehand, 'installed_version', lambda: '0.54.0'), \
+                mock.patch.object(magehand, 'latest_version', lambda **k: '0.54.1'), \
+                mock.patch.object(magehand, 'skill_installed', lambda: False), \
+                mock.patch.object(magehand.pathlib.Path, 'is_file', lambda _p: True), \
+                mock.patch.object(magehand.subprocess, 'run', run):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                try:
+                    magehand.main(['upgrade'])
+                    code = 0
+                except SystemExit as stop:  # die(): the message is the exit value
+                    code = stop.code if isinstance(stop.code, int) else 1
+                    out.write('' if isinstance(stop.code, int) or stop.code is None else str(stop.code))
+        return code or 0, out.getvalue(), runs
+
+    def test_upgrade_checks_it_got_the_latest(self):
+        # 2026-11-11: uv's cached index predated 0.54.1, `uv tool upgrade` changed nothing and exited 0, and
+        # upgrade said `now: magehand 0.54.0`, `next: nothing`
+        code, out, runs = self.upgrade(['0.54.0', '0.54.1'])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(runs[0], ['uv', 'tool', 'upgrade', 'magehand'])
+        self.assertEqual(runs[1][:4] + runs[1][-1:], ['uv', 'tool', 'install', '--force', 'magehand==0.54.1'])
+        self.assertEqual(runs[1][4:6], ['--python', magehand.os.path.realpath(magehand.sys.executable)])
+        self.assertIn('did not see 0.54.1', out)
+        self.assertIn('now: magehand 0.54.1', out)
+        # the upgrade saw it: nothing more
+        code, out, runs = self.upgrade(['0.54.1'])
+        self.assertEqual((code, [r[:3] for r in runs if r[1:2] != ['setup']]), (0, [['uv', 'tool', 'upgrade']]))
+        self.assertIn('now: magehand 0.54.1', out)
+
+    def test_upgrade_says_so_when_it_still_cannot_get_the_latest(self):
+        code, out, _ = self.upgrade(['0.54.0'], fails=[('uv', 'tool', 'install')])
+        self.assertEqual(code, 1)  # PyPI not serving it yet: the message names the command to run again
+        self.assertIn('again in a few minutes', out)
+        self.assertIn('magehand==0.54.1', out)
+        code, out, _ = self.upgrade(['0.54.0', '0.54.0'])
+        self.assertEqual(code, 1)
+        self.assertIn('still magehand 0.54.0 after installing 0.54.1', out)
+        self.assertNotIn('now: magehand', out)
+
     def test_doctor_names_the_permission(self):
         def urlopen(*_a, **_k):
             raise self.no_route
