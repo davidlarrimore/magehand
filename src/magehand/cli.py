@@ -7111,13 +7111,16 @@ WATCH_READ_TRIES = 5      # failed reads in a row before the watch gives up (Git
 WATCH_DONE = ('merged', 'held', 'green', 'reviewed')
 HOLD = 'hold'
 # The homelab's queue holds the owner's PR that changes what OpenClaw runs on its own until it is labelled
-# `live-tested` and an owner comment has the line `live-tested: <full head SHA>`: its real entry path ran in
-# OpenClaw's VM on live data, on that commit (homelab's tools/homelab needs_live_test and current_labels, and its
-# docs/working-with-openclaw.md "Live tests"). Keep these in step with it.
+# `live-tested` and a tester's comment has the line `live-tested: <full head SHA>`: its real entry path ran in
+# OpenClaw's VM on live data, on that commit (homelab's tools/homelab needs_live_test, current_labels and
+# live_testers, and its docs/working-with-openclaw.md "Live tests"). Testers: the owner (Claude Code) and OpenClaw's
+# review, which runs the test and records a pass (homelab#547). The queue counts the bot's line only once that is out
+# of observe-only, and until then the bot posts none, so accepting it here is never early. Keep these in step.
 LIVE_TESTED = 'live-tested'
 LIVE_TEST_LINE = re.compile(r'^\s*live-tested: ([0-9a-f]{40})\s*$', re.MULTILINE)
 LIVE_TEST_REPO = f'{OWNER}/homelab'
 LIVE_TEST_PATHS = ('platform/openclaw/tools/', 'platform/openclaw/automations/', 'platform/openclaw/vm/')
+LIVE_TESTERS = (OWNER.lower(), BOT.lower())
 THREADS_QUERY = ('query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n)'
                  '{reviewThreads(first:100){nodes{id isResolved path line comments(first:1){nodes{author{login} body url}}}}}}}')
 
@@ -7157,10 +7160,11 @@ def live_test_paths(pr):
 
 
 def live_tested(pr):
-    """True if the queue counts this PR as live-tested: the label, and an owner comment's line for its head."""
+    """True if the queue counts this PR as live-tested: the label, and a tester's comment line for its head (the
+    owner's, or OpenClaw's review's)."""
     head = pr.get('headRefOid') or ''
     return any((label.get('name') or '') == LIVE_TESTED for label in pr.get('labels') or []) and any(
-        login_of(c.get('author')) == OWNER.lower() and head in LIVE_TEST_LINE.findall(c.get('body') or '')
+        login_of(c.get('author')) in LIVE_TESTERS and head in LIVE_TEST_LINE.findall(c.get('body') or '')
         for c in pr.get('comments') or [])
 
 
