@@ -1759,8 +1759,11 @@ def plan_release(repo, name, forced=None, cluster=True):
     head = commit['sha']
     who, err = gh_query('api', 'user')
     if err or (who or {}).get('login') != OWNER:
-        problems.append(f'gh is signed in as {(who or {}).get("login") or "nobody"}: only {OWNER}\'s release '
-                        f'deploys production (`gh auth login`)')
+        login = (who or {}).get('login') or 'nobody'
+        problems.append(f'gh is signed in as {login}: only {OWNER}\'s release deploys production (`gh auth login`)'
+                        if github_identity() == 'gh' else
+                        f'the GITHUB_TOKEN here is {login}\'s (no gh): only {OWNER}\'s release deploys production, '
+                        f'and only {OWNER} creates it')
     approved, err = production_approval(name)
     if err:
         problems.append(f'could not read the production approval of {name}: {err}')
@@ -2015,6 +2018,19 @@ def gh_pr_list(args):
     return 0, json.dumps(prs), ''
 
 
+NO_GH = 'the GitHub CLI (gh) is not installed'
+TOKEN_ONLY = ' (with only GITHUB_TOKEN, magehand reads GitHub but cannot do this)'
+
+
+def github_env_token():
+    return os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+
+
+def github_identity():
+    """What GitHub access magehand is using, for a message: 'gh' (signed in), or 'token' (GITHUB_TOKEN, no gh)."""
+    return 'token' if github_env_token() and not shutil.which('gh') else 'gh'
+
+
 def gh_without_gh(args):
     """What `gh ARGS` would give, on a machine with a GitHub token and no gh (OpenClaw's VM: GitHub through the
     bot's GITHUB_TOKEN, no gh by design). Reads only, None for anything else: magehand's writes (a release, a
@@ -2035,9 +2051,7 @@ def gh_cli(*args, stdin=None):
         found = None if stdin is not None else gh_without_gh(args)
         if found is not None:
             return found
-        die('needs the GitHub CLI: `brew install gh`, then `gh auth login`' + (
-            ' (with only GITHUB_TOKEN, magehand reads GitHub but cannot do this)'
-            if os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN') else ''))
+        die('needs the GitHub CLI: `brew install gh`, then `gh auth login`' + (TOKEN_ONLY if github_env_token() else ''))
     out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607
     return out.returncode, out.stdout, out.stderr.strip()
 
@@ -3497,7 +3511,7 @@ def gh_probe(*args):
     try:
         return gh_cli(*args)
     except SystemExit:
-        return None, '', 'the GitHub CLI (gh) is not installed'
+        return None, '', NO_GH + (TOKEN_ONLY if github_env_token() else '')
     except (OSError, subprocess.TimeoutExpired):
         return None, '', 'gh did not answer'
 
@@ -6999,6 +7013,9 @@ def requested(pr):
 
 
 def cmd_pr(a):
+    if not shutil.which('gh'):  # it reads and changes the PR through gh: no API reader stands in for that
+        die(f'`magehand pr {a.pr_action}` needs the GitHub CLI: `brew install gh`, then `gh auth login`'
+            + (TOKEN_ONLY if github_env_token() else ''))
     if a.pr_action == 'watch':
         return pr_watch(a)
     target = [str(a.number)] if a.number else []
