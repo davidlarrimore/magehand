@@ -3570,6 +3570,13 @@ class PrWatch(unittest.TestCase):
         reply = self.pr(requested=True, review=[('davidlarrimore', 'COMMENTED', self.HEAD)])
         self.assertEqual(self.step(reply, memory)[0], 'failed')
 
+    def test_a_review_first_seen_already_posted_while_still_assigned_is_not_a_failure(self):
+        # mad-libs#13: requested; the next poll lands between the review posting and the hand-back
+        memory, done = {}, [('APPROVED', self.HEAD)]
+        self.assertIsNone(self.step(self.pr(requested=True), memory)[0])
+        self.assertIsNone(self.step(self.pr(review=done, assigned=True), memory)[0])
+        self.assertIsNone(self.step(self.pr(review=done), memory)[0])  # waits for the merge
+
     def test_a_review_the_bot_handed_back_without_posting_failed(self):
         memory = {}
         self.assertIsNone(self.step(self.pr(requested=True, assigned=True), memory)[0])

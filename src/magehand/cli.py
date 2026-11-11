@@ -6946,10 +6946,13 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
                       "OpenClaw's own PR: waiting for the owner's review"), None
     # A review in progress first: a head re-requested without a push already has the old review (GitHub drops the
     # request, and OpenClaw its assignment, when the review is posted)
+    # OpenClaw's reviews before it took the PR: counted when the request is first seen, since a poll can first see
+    # the assignment just after the review posted (it posts, then hands the PR back); only its own, so the owner's
+    # reply in a thread meanwhile changes nothing
+    if requested(pr):
+        memory.setdefault('before', bot_reviews(pr))
     if any(login_of(a) == BOT.lower() for a in pr.get('assignees') or []):
-        # OpenClaw's reviews when it first had the PR (not later: it posts, then hands the PR back); only its own,
-        # so the owner's reply in a thread meanwhile changes nothing
-        memory.setdefault('taken', bot_reviews(pr))
+        memory.setdefault('taken', memory.get('before', bot_reviews(pr)))
         return None, 'OpenClaw is reviewing it (or has it queued)', None
     if 'taken' in memory and bot_reviews(pr) == memory['taken']:  # handed back without posting (the request
         # stays): failed
