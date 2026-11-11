@@ -1050,6 +1050,87 @@ class AppScope(unittest.TestCase):
         self.assertTrue({'app', 'status', 'release', 'dev', 'check', 'run', 'bucket', 'job'} <= set(checked), checked)
 
 
+class WithoutGh(unittest.TestCase):
+    """A machine with GITHUB_TOKEN and no gh (OpenClaw's VM) reads GitHub through its API, as gh would show it."""
+
+    def setUp(self):
+        self.calls = []
+        self.replies = {}
+        patches = [mock.patch.object(magehand.shutil, 'which', lambda name: None),
+                   mock.patch.dict(os.environ, {'GITHUB_TOKEN': 'tok'}),
+                   mock.patch.object(magehand, 'github_request', self.request)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        os.environ.pop('GH_TOKEN', None)
+
+    def request(self, method, path, body=None, accept='application/vnd.github+json'):
+        self.calls.append((method, path, body, accept))
+        return self.replies.get(path, (404, '{"message": "Not Found"}'))
+
+    def test_a_read_is_the_api_with_gh_output(self):
+        self.replies['repos/o/r'] = (200, json.dumps({'private': True, 'archived': False, 'full_name': 'o/r'}))
+        self.assertEqual(magehand.gh_cli('api', 'repos/o/r', '--jq', '.private, .archived'), (0, 'true\nfalse\n', ''))
+        self.assertEqual(magehand.gh_cli('api', 'repos/o/r', '--jq', '.full_name'), (0, 'o/r\n', ''))
+        self.assertEqual(magehand.gh_cli('api', 'repos/o/r')[1], self.replies['repos/o/r'][1])
+        magehand.gh_cli('api', '-H', 'Accept: application/vnd.github.raw', 'repos/o/r')
+        self.assertEqual(self.calls[-1], ('GET', 'repos/o/r', None, 'application/vnd.github.raw'))
+
+    def test_errors_read_as_gh_reports_them(self):
+        code, _, err = magehand.gh_cli('api', 'repos/o/missing')
+        self.assertEqual(code, 1)
+        self.assertIn('HTTP 404', err)  # callers tell "missing" from "unknown" by this
+
+    def test_graphql_queries_with_typed_variables(self):
+        self.replies['graphql'] = (200, '{"data": {"x": 1}}')
+        code, out, _ = magehand.gh_cli('api', 'graphql', '-f', 'query=query { x }', '-f', 'owner=o', '-F', 'n=5')
+        self.assertEqual((code, json.loads(out)), (0, {'data': {'x': 1}}))
+        self.assertEqual(self.calls[-1][2], {'query': 'query { x }', 'variables': {'owner': 'o', 'n': 5}})
+        self.replies['graphql'] = (200, '{"errors": [{"message": "bad field"}]}')
+        self.assertEqual(magehand.gh_cli('api', 'graphql', '-f', 'query=query { y }'), (1, '', 'bad field'))
+
+    def test_writes_and_unknown_forms_still_need_gh(self):
+        for args in (('api', '-X', 'PUT', 'repos/o/r/contents/x', '-f', 'message=m'),
+                     ('api', 'repos/o/r/pulls/1/requested_reviewers', '-f', 'reviewers[]=bot'),
+                     ('api', 'graphql', '-f', 'query=mutation { x }'),
+                     ('api', 'repos/o/r', '--jq', '.a + " " + .b'),
+                     ('api', '--paginate', 'repos/o/r/issues'),
+                     ('release', 'create', 'v1.0.0', '-R', 'o/r'),
+                     ('pr', 'ready', '1', '-R', 'o/r'),
+                     ('pr', 'list', '-R', 'o/r', '--head', 'b', '--state', 'all', '--json', 'author')):
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.gh_cli(*args)
+            self.assertIn('with only GITHUB_TOKEN, magehand reads GitHub but cannot do this', str(ctx.exception.code))
+        self.assertEqual(self.calls, [])
+
+    def test_no_token_no_fallback(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.gh_cli('api', 'repos/o/r')
+        self.assertEqual(str(ctx.exception.code), 'magehand: needs the GitHub CLI: `brew install gh`, then `gh auth login`')
+
+    def test_pr_list_in_gh_shape(self):
+        node = {'number': 7, 'state': 'MERGED', 'mergedAt': '2026-01-01T00:00:00Z', 'title': 't', 'body': 'b',
+                'commits': {'nodes': [{'commit': {'statusCheckRollup': {'contexts': {'nodes': [
+                    {'__typename': 'CheckRun', 'name': 'validate', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'},
+                    {'__typename': 'StatusContext', 'context': 'ci', 'state': 'FAILURE'}]}}}}]}}
+        self.replies['graphql'] = (200, json.dumps({'data': {'repository': {'pullRequests': {'nodes': [node]}}}}))
+        code, out, _ = magehand.gh_cli('pr', 'list', '-R', 'o/homelab-apps', '--head', 'deploy-dev/elvis',
+                                       '--state', 'all', '--limit', '10', '--json',
+                                       'number,state,mergedAt,title,body,statusCheckRollup')
+        prs = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(prs[0]['number'], 7)
+        self.assertEqual(magehand.failing_checks(prs[0]['statusCheckRollup']), ['ci'])
+        self.assertEqual(self.calls[-1][2]['variables'],
+                         {'owner': 'o', 'name': 'homelab-apps', 'head': 'deploy-dev/elvis', 'n': 10})
+        self.replies['graphql'] = (200, json.dumps({'data': {'repository': {'pullRequests': {'nodes': [
+            {'number': 8, 'state': 'OPEN', 'title': 'x'}]}}}}))
+        _, out, _ = magehand.gh_cli('pr', 'list', '-R', 'o/r', '--head', 'b', '--state', 'all', '--limit', '10',
+                                    '--json', 'number,state,title')
+        self.assertEqual(json.loads(out), [{'number': 8, 'state': 'OPEN', 'title': 'x'}])
+
+
 class SessionRenewal(unittest.TestCase):
     """A running session is renewed when it runs low, so a working day needs one sign-in."""
 

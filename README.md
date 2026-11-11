@@ -24,7 +24,7 @@ little without them. `magehand setup` checks most of this once per machine;
 | It needs | For | Without it |
 | --- | --- | --- |
 | **git**, and the app's checkout: `origin` is `github.com/davidlarrimore/REPO` | knowing which app you are working on ([below](#which-app-a-command-acts-on)) | name the app (`magehand status APP`); `bucket`, `job`, `fetch` and `icon` refuse |
-| **GitHub as the owner**: `gh` signed in (`gh auth login`), or `GITHUB_TOKEN` / `GH_TOKEN` | nearly everything: the guide, homelab-apps, the app's repo, PRs and releases are private | almost nothing (`setup` and `doctor` say what is missing) |
+| **GitHub as the owner**: `gh` signed in (`gh auth login`), or `GITHUB_TOKEN` / `GH_TOKEN`. With a token and no `gh`, magehand reads GitHub's API itself (`status`, `release --dry-run`, `app`, `check`, `doctor` work); `new`, `pr ready`, `pr watch` and `release` need `gh` | nearly everything: the guide, homelab-apps, the app's repo, PRs and releases are private | almost nothing (`setup` and `doctor` say what is missing) |
 | **The homelab's network**: `*.lab.davidlarrimore.com` resolving to it (`magehand setup` sends only those lookups to your home gateway) and reachable | OpenBao (the app's keys) and the services a local run calls (LiteLLM) | `login`, `run`, `bucket --env dev\|prod` fail; the GitHub-only commands work |
 | **An authentik account in `homelab-admins` with a passkey**, a browser, and local port 8250 free for the sign-in's callback | `magehand login`: the app's LLM and bucket keys | `run` (for an app with an `llm` block) and `bucket --env dev\|prod` can't get their keys |
 | **A container runtime**: Docker Desktop, OrbStack, Colima, Rancher Desktop or Podman | `dev`, `run --container`, `check --ui` | those refuse; `run -- CMD` still works for an app whose blocks are only `llm` and `secret` |
@@ -74,7 +74,9 @@ In OpenClaw's VM (the copy the platform installs and pins), `run`, `dev`,
 route to OpenBao and no passkey. They exit 1 with why and what does the job
 instead (CI's tests and browser check, or the owner). `doctor` there checks
 only GitHub and the repo, and `app` shows no sign-in line. Nothing OpenClaw
-does needs the sign-in: the platform gives apps their keys.
+does needs the sign-in: the platform gives apps their keys. The VM has no `gh`
+by design: magehand reads GitHub there with the bot's `GITHUB_TOKEN`, so
+`status`, `release --dry-run`, `app` and `check` work as on a Mac.
 
 ### Which app a command acts on
 
@@ -174,7 +176,7 @@ on"); `--json` prints JSON for scripts and agents; exit status 0 is success,
 | `MAGEHAND_NO_UPDATE_CHECK` | Set: no new-version notice |
 | `MAGEHAND_APPS_DIR` | Read this homelab-apps checkout instead of GitHub (`check --apps-dir` sets it) |
 | `MAGEHAND_PROXY_PORT` | The identity proxy's port (default 8080) |
-| `GITHUB_TOKEN`, `GH_TOKEN` | GitHub access (else `gh auth token`) |
+| `GITHUB_TOKEN`, `GH_TOKEN` | GitHub access (else `gh auth token`). Without `gh` installed, magehand reads GitHub's API with it directly; `new`, `pr ready`, `pr watch` and `release` still need `gh` |
 
 ## Development
 

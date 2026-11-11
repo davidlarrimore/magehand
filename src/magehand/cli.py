@@ -1889,10 +1889,155 @@ RESERVED = {'argocd', 'authentik', 'cloudflared', 'external-secrets', 'ingress',
             'homelab-events', 'magehand'}
 
 
+GITHUB_API = 'https://api.github.com/'
+# The `gh pr list --json` fields magehand reads, as GraphQL: the same names and shapes gh returns.
+PR_LIST_FIELDS = {'number': 'number', 'state': 'state', 'mergedAt': 'mergedAt', 'title': 'title', 'body': 'body',
+                  'statusCheckRollup': 'commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) '
+                                       '{ nodes { __typename ... on CheckRun { name status conclusion } '
+                                       '... on StatusContext { context state } } } } } } }'}
+
+
+def github_request(method, path, body=None, accept='application/vnd.github+json'):
+    """(HTTP status, text) of GitHub's API at `path` (relative to api.github.com, never another host), with
+    GITHUB_TOKEN or GH_TOKEN."""
+    token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    headers = {'Authorization': f'Bearer {token}', 'Accept': accept, 'X-GitHub-Api-Version': '2022-11-28',
+               'User-Agent': 'magehand'}
+    if body is not None:
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(GITHUB_API + path.lstrip('/'), method=method, headers=headers,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310  # fixed https URL (api.github.com)
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode(errors='replace')
+
+
+JQ_PATHS = re.compile(r'^\s*(\.[A-Za-z_][A-Za-z0-9_]*)+(\s*,\s*(\.[A-Za-z_][A-Za-z0-9_]*)+)*\s*$')
+
+
+def jq_paths(expr, value):
+    """gh's output for `--jq EXPR` when EXPR is plain paths, comma-separated (`.a.b, .c`), the only filters
+    magehand uses: each value on its own line, a string as is, anything else as JSON."""
+    lines = []
+    for path in expr.split(','):
+        found = value
+        for key in path.strip()[1:].split('.'):
+            found = found.get(key) if isinstance(found, dict) else None
+        lines.append(found if isinstance(found, str) else json.dumps(found))
+    return '\n'.join(lines) + '\n'
+
+
+def gh_api_read(args):
+    """`gh api ...` for a read, through GitHub's API with the token: (status, stdout, stderr) as gh gives them,
+    or None for a call it doesn't do (a write, a mutation, an option it doesn't know)."""
+    path, accept, fields, jq, rest = None, 'application/vnd.github+json', {}, None, list(args[1:])
+    while rest:
+        arg = rest.pop(0)
+        if arg == '-H' and rest:
+            name, _, value = rest.pop(0).partition(':')
+            if name.strip().lower() != 'accept':
+                return None
+            accept = value.strip()
+        elif arg in ('-f', '-F') and rest:
+            key, _, value = rest.pop(0).partition('=')
+            fields[key] = int(value) if arg == '-F' and re.match(r'^-?\d+$', value) else value
+        elif arg == '--jq' and rest:
+            jq = rest.pop(0)
+            if not JQ_PATHS.match(jq):
+                return None  # a filter only gh's jq does: never a guess
+        elif arg.startswith('-') or path:
+            return None  # -X (a write), --paginate, ...: only gh does those
+        else:
+            path = arg
+    if not path:
+        return None
+    if path == 'graphql':
+        query = fields.pop('query', '')
+        if not query or query.lstrip().startswith('mutation'):
+            return None
+        code, text = github_request('POST', 'graphql', {'query': query, 'variables': fields})
+        try:
+            if code == 200 and json.loads(text).get('errors'):
+                return 1, '', json.loads(text)['errors'][0].get('message', 'GraphQL error')
+        except (ValueError, AttributeError):
+            return 1, '', 'GitHub returned something that is not JSON'
+    elif fields:
+        return None  # gh sends fields as a POST: a write
+    else:
+        code, text = github_request('GET', path, accept=accept)
+    if not 200 <= code < 300:
+        try:
+            message = json.loads(text).get('message') or 'error'
+        except (ValueError, AttributeError):
+            message = 'error'
+        return 1, '', f'{message} (HTTP {code})'
+    if jq:
+        try:
+            text = jq_paths(jq, json.loads(text))
+        except ValueError:
+            return 1, '', 'GitHub returned something that is not JSON'
+    return 0, text, ''
+
+
+def gh_pr_list(args):
+    """`gh pr list -R OWNER/REPO --head BRANCH --state all --limit N --json FIELDS` through GraphQL with the
+    token, in gh's JSON shape; None for any other form."""
+    opts, rest = {}, list(args[2:])
+    while rest:
+        arg = rest.pop(0)
+        if arg not in ('-R', '--head', '--state', '--limit', '--json') or not rest:
+            return None
+        opts[arg] = rest.pop(0)
+    fields = opts.get('--json', '').split(',')
+    if '-R' not in opts or '--head' not in opts or opts.get('--state', 'open') != 'all' \
+            or not all(f in PR_LIST_FIELDS for f in fields):
+        return None
+    owner, name = opts['-R'].split('/', 1)
+    query = ('query($owner: String!, $name: String!, $head: String!, $n: Int!) { repository(owner: $owner, '
+             'name: $name) { pullRequests(headRefName: $head, first: $n, orderBy: {field: CREATED_AT, '
+             'direction: DESC}) { nodes { ' + ' '.join(PR_LIST_FIELDS[f] for f in fields) + ' } } } }')
+    found = gh_api_read(['api', 'graphql', '-f', f'query={query}', '-f', f'owner={owner}', '-f', f'name={name}',
+                         '-f', f'head={opts["--head"]}', '-F', f'n={int(opts.get("--limit", "30"))}'])
+    if found[0] != 0:
+        return found
+    nodes = ((((json.loads(found[1]).get('data') or {}).get('repository') or {}).get('pullRequests') or {})
+             .get('nodes') or [])
+    prs = []
+    for node in nodes:
+        pr = {f: node.get(f) for f in fields if f != 'statusCheckRollup'}
+        if 'statusCheckRollup' in fields:
+            commits = (node.get('commits') or {}).get('nodes') or [{}]
+            rollup = ((commits[-1].get('commit') or {}).get('statusCheckRollup') or {})
+            pr['statusCheckRollup'] = ((rollup.get('contexts') or {}).get('nodes') or [])
+        prs.append(pr)
+    return 0, json.dumps(prs), ''
+
+
+def gh_without_gh(args):
+    """What `gh ARGS` would give, on a machine with a GitHub token and no gh (OpenClaw's VM: GitHub through the
+    bot's GITHUB_TOKEN, no gh by design). Reads only, None for anything else: magehand's writes (a release, a
+    PR marked ready, a repo) go through gh, as whoever it is signed in as."""
+    if not (os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')):
+        return None
+    if args[:1] == ('api',):
+        return gh_api_read(args)
+    if args[:2] == ('pr', 'list'):
+        return gh_pr_list(args)
+    return None
+
+
 def gh_cli(*args, stdin=None):
-    """`gh ARGS` as the signed-in user: (exit status, stdout, stderr)."""
+    """`gh ARGS` as the signed-in user: (exit status, stdout, stderr). Without gh, a read goes to GitHub's
+    API with GITHUB_TOKEN (gh_without_gh)."""
     if not shutil.which('gh'):
-        die('needs the GitHub CLI: `brew install gh`, then `gh auth login`')
+        found = None if stdin is not None else gh_without_gh(args)
+        if found is not None:
+            return found
+        die('needs the GitHub CLI: `brew install gh`, then `gh auth login`' + (
+            ' (with only GITHUB_TOKEN, magehand reads GitHub but cannot do this)'
+            if os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN') else ''))
     out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607
     return out.returncode, out.stdout, out.stderr.strip()
 
@@ -2047,11 +2192,11 @@ def bot_access(repo):
     if code == 0:
         # permission is the legacy level (maintain reads as write, triage as read); role_name is the role itself.
         code, out, err = gh_probe('api', f'repos/{repo}/collaborators/{BOT}/permission', '--jq',
-                                  '.permission + " " + (.role_name // "")')
+                                  '.permission, .role_name')
         if code != 0:
             return None, err or 'gh api failed'
-        levels = set(out.split())
-        return ('write', '') if levels & {'admin', 'maintain', 'write', 'push'} else ('read', out.strip())
+        levels = [level for level in out.split() if level != 'null']
+        return ('write', '') if set(levels) & {'admin', 'maintain', 'write', 'push'} else ('read', ' '.join(levels))
     if code is None or 'HTTP 404' not in err:
         return None, err or 'gh api failed'
     invitations, err = gh_json_pages(f'repos/{repo}/invitations')
