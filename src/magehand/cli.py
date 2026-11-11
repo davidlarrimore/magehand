@@ -221,7 +221,7 @@ def registration_lookup(name, path=None):
 def current_app(root=None):
     """The app this checkout is: its deploy/app.yaml `app:` if it sets one, else the repo's name."""
     if remote_repo(root) is None:
-        die('not in a git checkout; pass the app name')
+        die(f'not in a checkout of one of {OWNER}\'s repos (origin github.com/{OWNER}/REPO); pass the app name')
     name = checkout_app(root)
     if not name:
         die('this is a platform repo; pass the app name')
@@ -308,7 +308,8 @@ def load_app(name, root=None):
 
 
 def app_here(name=None):
-    """load_app for `name` (default: this checkout's app), from this checkout's deploy/ when it is that app's repo."""
+    """load_app for `name` (default: this checkout's app), from this checkout's deploy/ when it is that app's repo.
+    Commands pass scoped_app()'s answer: a name given here is not checked against the checkout."""
     name = name or current_app()
     return load_app(name, repo_root(name))
 
@@ -352,12 +353,14 @@ def git_out(args, root=None):
 
 
 def remote_repo(root=None):
-    """The repo name (no owner, no .git) of the checkout's origin remote, or None without one."""
-    url = git_out(['remote', 'get-url', 'origin'], root)
-    if not url:
+    """The repo name (no owner, no .git) of the checkout's origin when it is github.com/OWNER/NAME, else None:
+    another owner's repo of the same name, a look-alike host or no origin is not one of the homelab's checkouts,
+    so it never stands for an app."""
+    found = origin_repo(root)
+    if not found:
         return None
-    name = url.rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1]
-    return name[:-4] if name.endswith('.git') else name
+    owner, name = found.split('/', 1)
+    return name if owner.lower() == OWNER.lower() else None
 
 
 def origin_repo(root):
@@ -400,13 +403,34 @@ def checkout_app(root=None):
     return override if override and APP_NAME.match(override) else repo
 
 
-def app_repo_here():
-    """The app whose code this checkout is (an app repo has ui-check.yaml or deploy/app.yaml), or None."""
-    top = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)  # nosec B603 B607
-    if top.returncode != 0:
+def app_checkout(root=None):
+    """The app whose code the checkout at `root` (default: here) is, or None: an app repo (ui-check.yaml or
+    deploy/app.yaml at its top) whose origin is github.com/OWNER/REPO. Not the platform repos, not any other
+    directory."""
+    top = checkout_top(root)
+    if not top or not is_app_checkout(top):
         return None
-    root = pathlib.Path(top.stdout.strip())
-    return checkout_app() if (root / 'ui-check.yaml').is_file() or deploy_dir(root) else None
+    return checkout_app(top)
+
+
+def app_repo_here():
+    """The app whose code this checkout is, or None (app_checkout of the current directory)."""
+    return app_checkout()
+
+
+def scoped_app(command, asked=None, root=None, why='', repo_name=False):
+    """The app an app command acts on. In an app's checkout it is that app, and naming another app is refused,
+    so nothing run there reaches another app's keys, data, release or deployment (no app bleed). Outside an app
+    checkout (a platform repo, any other directory) the app is the one named, or the checkout's own. With
+    repo_name, the repo's own name also counts as this checkout (`check` reports a bad deploy/app.yaml `app:`
+    on the checkout CI names by its repo)."""
+    own = app_checkout(root)
+    if own and asked and repo_name and asked == remote_repo(checkout_top(root)):
+        return asked
+    if own and asked and asked != own:
+        die(f'this checkout is {own}\'s code: `magehand {command}` here acts on {own} only, not {asked}'
+            + (f' ({why})' if why else '') + f'. Run it in {asked}\'s checkout, or outside any app checkout')
+    return own or asked or current_app(root)
 
 
 def block_of(app, secret_name):
@@ -531,11 +555,26 @@ def minutes(seconds):
     return 'under 1 min' if seconds < 60 else f'{seconds // 60} min'
 
 
+RENEW_BELOW = 1800  # seconds: a session with less than this left is renewed (for an hour, up to the role's 8h)
+RENEW_FOR = '1h'
+
+
+def renewed(token, left):
+    """Seconds left after renewing a session that is running low (renew-self, as OpenBao's default policy allows),
+    so a working day needs one passkey sign-in, not one an hour. OpenBao never renews past the role's maximum
+    (8h from sign-in): then the time left stays what it was. Unchanged when it isn't low or the renewal fails."""
+    if left is None or left >= RENEW_BELOW or left >= NO_EXPIRY:
+        return left
+    status, body = bao('POST', 'auth/token/renew-self', token, body={'increment': RENEW_FOR}, soft=True)
+    lease = ((body or {}).get('auth') or {}).get('lease_duration')
+    return lease if status == 200 and isinstance(lease, int) and lease > left else left
+
+
 def valid_token():
-    """The session token. Reports the time left (a warning under 10 minutes); an expired session in a terminal
-    offers to sign in again and carries on, otherwise it says how to."""
+    """The session token, renewed when it runs low (renewed()). Reports the time left (a warning under 10 minutes);
+    an expired session in a terminal offers to sign in again and carries on, otherwise it says how to."""
     token = saved_token()
-    left = signin_left(token)
+    left = renewed(token, signin_left(token))
     if left is None and sys.stdin.isatty() and sys.stderr.isatty():
         answer = input('magehand: not signed in, or the session expired. Sign in again now? [Y/n] ').strip().lower()
         if answer in ('', 'y', 'yes'):
@@ -556,7 +595,8 @@ def identity():
 
 
 def login_check(a):
-    left = signin_left()
+    token = saved_token()
+    left = renewed(token, signin_left(token)) if token else None
     need = a.min * 60
     ok = left is not None and left >= need
     if a.json:
@@ -619,7 +659,8 @@ def cmd_login(args):
         print(json.dumps({'signed_in': True, 'email': email, 'policies': auth.get('policies', []),
                           'seconds_left': lease}))
     else:
-        print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {lease // 3600}h).')
+        print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {lease // 3600}h; '
+              'renewed while you use magehand, up to 8h after this sign-in).')
     return auth['client_token']
 
 
@@ -706,7 +747,7 @@ def cmd_guide(a):
 
 
 def cmd_app(a):
-    app = app_here(a.app_flag or a.app)
+    app = app_here(scoped_app('app', a.app_flag or a.app))
     name = app['name']
     source = (app['spec'].get('source') or {}).get('repo') or (remote_repo(app['root']) if app['root'] else None)
     deployed = registration(name) if app['root'] else app['spec']
@@ -1433,7 +1474,7 @@ def status_target(name=None):
 
 
 def cmd_status(a):
-    name, repo = status_target(a.app_flag or a.app)
+    name, repo = status_target(scoped_app('status', a.app_flag or a.app))
     deadline = time.monotonic() + a.timeout * 60
     last = None
     lifecycle, polls, seen = lifecycle_stages(repo, name), 0, None
@@ -1799,7 +1840,7 @@ def cmd_release(a):
     if sum(map(bool, (a.major, a.minor, a.patch))) > 1:
         usage('release', 'choose one of --major, --minor, --patch')
     forced = 'major' if a.major else 'minor' if a.minor else 'patch' if a.patch else None
-    app = app_here(a.app_flag or a.app)
+    app = app_here(scoped_app('release', a.app_flag or a.app, why='it would release that app to production'))
     plan = plan_release(code_repo(app), app['name'], forced, cluster=not a.no_cluster)
     plan['created'] = False
     refuse = f'not releasing {plan["version"]}: ' + '; '.join(plan['problems']) if plan['problems'] else None
@@ -2947,7 +2988,7 @@ def garage_setup(port, token, bucket, key_id=None, wait=30):
 
 def cmd_dev(a):
     action = a.action
-    app = app_here(a.app_flag or a.app)
+    app = app_here(scoped_app('dev', a.app_flag or a.app, why="its local blocks and secrets are that app's"))
     state = local_state(app['name'])
     network = f'magehand-{app["name"]}'
     contained = [b for b, svc in app['services'].items() if (svc or {}).get('type') in ('postgres', 'redis', 'bucket')]
@@ -3259,11 +3300,7 @@ def cmd_run(a):
     args = a.cmd[1:] if a.cmd[:1] == ['--'] else a.cmd
     if not args and not container:
         usage('run', 'give the command after --, e.g. magehand run -- python app.py (or --container)')
-    here = app_repo_here()
-    if a.app_flag and here and a.app_flag != here:
-        die(f'this checkout is {here}\'s code: running it as {a.app_flag} would use {a.app_flag}\'s keys and budget. '
-            f'Run it as itself (`magehand run -- CMD`); `magehand app` shows what {here} has')
-    app = app_here(a.app_flag)
+    app = app_here(scoped_app('run', a.app_flag, why=f"this code would run on {a.app_flag}'s keys and budget"))
     env = resolve_env(app, container=container)
     print(f'magehand: {app["name"]} env: {", ".join(sorted(env))}', file=sys.stderr)
     if proxy:
@@ -5001,7 +5038,7 @@ def cmd_check(a):
     if a.apps_dir:
         APPS_DIR = a.apps_dir
     root = pathlib.Path(a.code)
-    name = a.app_flag or a.app or current_app(root)
+    name = scoped_app('check', a.app_flag or a.app, root, repo_name=True)
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
     pinned_here = []  # a pinned app checked with --apps-dir from a checkout without deploy/app.yaml
@@ -7680,9 +7717,9 @@ def build_parser():
 
     def app_option(p, positional=True):
         if positional:
-            p.add_argument('app', nargs='?', metavar='APP', help='the app (default: the app repo you are in)')
+            p.add_argument('app', nargs='?', metavar='APP', help="the app (default: the app repo you are in; in an app's repo, only that app)")
         p.add_argument('-a', '--app', dest='app_flag', metavar='APP',
-                       help='the app (default: the app repo you are in)')
+                       help="the app (default: the app repo you are in; in an app's repo, only that app)")
 
     def json_option(p):
         p.add_argument('--json', action='store_true', help='print JSON (for scripts and agents)')
@@ -7911,9 +7948,11 @@ def build_parser():
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
     json_option(p)
     # run it locally
-    p = command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, up to 8h)',
-                'The session lasts about an hour; commands that need it show the time left and, in a terminal,\n'
-                'offer to sign in again when it has expired. An agent cannot tap the passkey: check first.\n\n'
+    p = command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, renewed up to 8h)',
+                'One sign-in per machine, for every app. The session is an hour, renewed by itself while you use\n'
+                'magehand (when under 30 minutes are left), up to 8 hours after you signed in: about one passkey\n'
+                'tap a working day. Commands that need it show the time left and, in a terminal, offer to sign\n'
+                'in again when it has expired. An agent cannot tap the passkey: check first (a check renews too).\n\n'
                 'examples:\n  magehand login\n  magehand login --check            exit 1 unless signed in, 10+ min left\n'
                 '  magehand login --check --min 30 --json')
     p.add_argument('--check', action='store_true', help='only report the time left (exit 1 when signed out or low)')

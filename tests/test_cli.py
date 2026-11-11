@@ -1,4 +1,5 @@
 """Unit tests for magehand (no network, no Docker)."""
+import argparse
 import base64
 import contextlib
 import datetime
@@ -939,19 +940,142 @@ class MissingKey(unittest.TestCase):
 
 class RunAsAnotherApp(unittest.TestCase):
     def test_refuses_another_apps_env_in_an_app_checkout(self):
-        saved = magehand.app_repo_here, magehand.load_app
-        magehand.app_repo_here = lambda: 'elvis'
+        saved = magehand.app_checkout, magehand.load_app
+        magehand.app_checkout = lambda root=None: 'elvis'
         magehand.load_app = lambda name, root=None: magehand.die('loaded ' + name)
         try:
             parser = magehand.build_parser()
             with self.assertRaises(SystemExit) as ctx:
                 magehand.cmd_run(parser.parse_args(['run', '-a', 'demo', '--', 'true']))
-            self.assertIn("would use demo's keys", str(ctx.exception.code))
+            self.assertIn("on demo's keys and budget", str(ctx.exception.code))
             with self.assertRaises(SystemExit) as ctx:  # its own name is fine
                 magehand.cmd_run(parser.parse_args(['run', '-a', 'elvis', '--', 'true']))
             self.assertIn('loaded elvis', str(ctx.exception.code))
         finally:
-            magehand.app_repo_here, magehand.load_app = saved
+            magehand.app_checkout, magehand.load_app = saved
+
+
+class AppScope(unittest.TestCase):
+    """In an app's checkout, app commands act on that app only (no app bleed); elsewhere the app is named."""
+
+    def checkout(self, tmp, origin, app=True):
+        root = git_checkout(pathlib.Path(tmp), origin)
+        if app:
+            (root / 'ui-check.yaml').write_text('web_ui: false\n')
+        return root
+
+    def test_the_origin_must_be_the_owners_repo_on_github(self):
+        for origin, expected in (('git@github.com:davidlarrimore/elvis.git', 'elvis'),
+                                 ('https://github.com/davidlarrimore/elvis', 'elvis'),
+                                 ('https://x-access-token:abc@github.com/davidlarrimore/elvis.git', 'elvis'),
+                                 ('https://github.com/example/elvis.git', None),
+                                 ('https://notgithub.com/davidlarrimore/elvis.git', None)):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = self.checkout(tmp, origin)
+                self.assertEqual(magehand.remote_repo(root), expected, origin)
+                self.assertEqual(magehand.app_checkout(root), expected, origin)
+
+    def test_in_an_app_checkout_only_that_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            self.assertEqual(magehand.scoped_app('app', None, root), 'elvis')
+            self.assertEqual(magehand.scoped_app('app', 'elvis', root), 'elvis')
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.scoped_app('release', 'demo', root, why='it would release that app to production')
+            self.assertIn("acts on elvis only, not demo (it would release that app to production)",
+                          str(ctx.exception.code))
+            (root / 'sub').mkdir()  # anywhere inside the checkout
+            with self.assertRaises(SystemExit):
+                magehand.scoped_app('status', 'demo', root / 'sub')
+
+    def test_outside_an_app_checkout_the_app_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:  # a platform repo
+            root = git_checkout(pathlib.Path(tmp), 'git@github.com:davidlarrimore/homelab-apps.git')
+            self.assertEqual(magehand.scoped_app('check', 'demo', root), 'demo')
+        with tempfile.TemporaryDirectory() as tmp:  # another owner's app repo is not an app checkout
+            root = self.checkout(tmp, 'https://github.com/example/elvis.git')
+            self.assertEqual(magehand.scoped_app('status', 'demo', root), 'demo')
+            with self.assertRaises(SystemExit) as ctx:
+                magehand.scoped_app('status', None, root)
+            self.assertIn("not in a checkout of one of davidlarrimore's repos", str(ctx.exception.code))
+        with tempfile.TemporaryDirectory() as tmp:  # not a git checkout at all
+            self.assertEqual(magehand.scoped_app('app', 'demo', pathlib.Path(tmp)), 'demo')
+
+    def test_check_accepts_the_repos_own_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/lab-website.git', app=False)
+            (root / 'deploy').mkdir()
+            (root / 'deploy/app.yaml').write_text('app: lab\nservices: {}\n')
+            self.assertEqual(magehand.scoped_app('check', 'lab-website', root, repo_name=True), 'lab-website')
+            with self.assertRaises(SystemExit):
+                magehand.scoped_app('run', 'lab-website', root)
+            with self.assertRaises(SystemExit):
+                magehand.scoped_app('check', 'demo', root, repo_name=True)
+
+    def test_every_app_command_refuses_another_app_in_a_checkout(self):
+        argvs = (['app', 'demo'], ['status', 'demo', '--no-cluster'], ['release', 'demo', '--dry-run'],
+                 ['dev', 'status', 'demo'], ['check', 'demo'], ['run', '-a', 'demo', '--', 'true'],
+                 ['bucket', '-a', 'demo', 'usage'], ['job', '-a', 'demo', 'ls'])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.checkout(tmp, 'git@github.com:davidlarrimore/elvis.git')
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                with mock.patch.object(magehand, 'load_app', lambda *a, **k: self.fail('loaded an app')), \
+                        mock.patch.dict(os.environ, {'MAGEHAND_NO_UPDATE_CHECK': '1'}):
+                    for argv in argvs:
+                        with self.assertRaises(SystemExit) as ctx, \
+                                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            magehand.main(argv)
+                        self.assertIn("this checkout is elvis's code", str(ctx.exception.code), argv)
+            finally:
+                os.chdir(cwd)
+
+    def test_every_command_that_takes_an_app_goes_through_the_scope(self):
+        """A new command with -a/--app can't skip the check: its function must use one of the resolvers."""
+        import inspect
+        magehand.build_parser()
+        resolvers = ('scoped_app(', 'bucket_app(', 'job_app(', 'app_repo_here(', 'checkout_app(')
+
+        def takes_app(parser):
+            subs = [act for act in parser._actions if isinstance(act, argparse._SubParsersAction)]
+            return (any(act.dest in ('app', 'app_flag') for act in parser._actions)
+                    or any(takes_app(p) for act in subs for p in act.choices.values()))
+        checked = []
+        for name, parser in magehand.SUBPARSERS.items():
+            if takes_app(parser):
+                source = inspect.getsource(parser.get_default('func'))
+                self.assertTrue(any(r in source for r in resolvers), name)
+                checked.append(name)
+        self.assertTrue({'app', 'status', 'release', 'dev', 'check', 'run', 'bucket', 'job'} <= set(checked), checked)
+
+
+class SessionRenewal(unittest.TestCase):
+    """A running session is renewed when it runs low, so a working day needs one sign-in."""
+
+    def renew(self, left, reply):
+        calls = []
+
+        def bao(method, path, token=None, body=None, soft=False):
+            calls.append((method, path, body))
+            return reply
+        with mock.patch.object(magehand, 'bao', bao):
+            return magehand.renewed('tok', left), calls
+
+    def test_renewed_when_low(self):
+        left, calls = self.renew(600, (200, {'auth': {'lease_duration': 3600}}))
+        self.assertEqual(left, 3600)
+        self.assertEqual(calls, [('POST', 'auth/token/renew-self', {'increment': '1h'})])
+
+    def test_left_alone_when_not_low_signed_out_or_never_expiring(self):
+        for before in (3000, None, magehand.NO_EXPIRY):
+            left, calls = self.renew(before, (200, {'auth': {'lease_duration': 3600}}))
+            self.assertEqual((left, calls), (before, []))
+
+    def test_at_the_maximum_or_on_failure_the_time_left_stands(self):
+        self.assertEqual(self.renew(600, (200, {'auth': {'lease_duration': 600}}))[0], 600)  # 8h reached
+        self.assertEqual(self.renew(600, (403, None))[0], 600)
+        self.assertEqual(self.renew(600, (0, None))[0], 600)  # unreachable
 
 
 class Container(unittest.TestCase):
