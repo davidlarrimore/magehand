@@ -3644,6 +3644,31 @@ class PrWatch(unittest.TestCase):
         self.assertIn('--undo', self.step(self.pr(checks=self.FAILED))[2])
         self.assertNotIn('--undo', self.step(self.pr(checks=self.FAILED, draft=True))[2])
 
+    def test_live_test_holds_the_owners_homelab_pr_that_changes_openclaws_runtime(self):
+        H, url = self.HEAD, 'https://github.com/davidlarrimore/homelab/pull/12'
+
+        def pr(files, labels=(), author='davidlarrimore', review=(('APPROVED', H),), url=url):
+            p = self.pr(review=list(review), labels=labels, author=author)
+            p.update(url=url, files=[{'path': f} for f in files])
+            return p
+        vm = ['platform/openclaw/vm/versions.env']
+        result, what, step = self.step(pr(vm))
+        self.assertEqual(result, 'live-test')
+        self.assertIn('versions.env', what)
+        self.assertIn('--add-label live-tested', step)
+        self.assertNotIn(result, magehand.WATCH_DONE)  # the agent has the live test to run
+        for p in (pr(vm, labels=['live-tested']),                        # tested: the queue merges it
+                  pr(['platform/openclaw/skills/x/SKILL.md']),           # not what it runs on its own
+                  pr(vm, url='https://github.com/davidlarrimore/demo/pull/12'),  # not the homelab
+                  pr(vm, author='renovate[bot]')):                       # not the owner's
+            self.assertNotEqual(self.step(p)[0], 'live-test', p['url'])
+        self.assertEqual(self.step(pr(vm, labels=['hold']))[0], 'held')
+        # a push after the label: the next step drops it, as the new head needs its own test
+        for review in ((('COMMENTED', H),), (('APPROVED', 'b' * 40),)):
+            step = self.step(pr(vm, labels=['live-tested'], review=review))[2]
+            self.assertIn('--remove-label live-tested', step)
+        self.assertNotIn('remove-label', self.step(pr(vm, review=(('COMMENTED', H),)))[2])
+
     def test_waits(self):
         H = self.HEAD
         for pr, what in ((self.pr(draft=True, checks=[{'name': 't', 'status': 'IN_PROGRESS'}]), 'checks running'),
