@@ -6913,7 +6913,7 @@ def cmd_pr(a):
 # Exit 0: done (`result` merged, held, green, reviewed); 1: something to do, `next:` says what (findings,
 # failed, closed, stalled, unrequested, live-test, timeout). Usage errors exit 2, as everywhere.
 
-WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels,files'
+WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels,files,comments'
 WATCH_POLL = 30           # seconds between reads
 WATCH_TIMEOUT = 60        # minutes, by default
 WATCH_UNPICKED = 15 * 60  # seconds a requested review may wait unqueued before it is reported
@@ -6922,9 +6922,11 @@ WATCH_READ_TRIES = 5      # failed reads in a row before the watch gives up (Git
 WATCH_DONE = ('merged', 'held', 'green', 'reviewed')
 HOLD = 'hold'
 # The homelab's queue holds the owner's PR that changes what OpenClaw runs on its own until it is labelled
-# `live-tested`: its real entry path ran in OpenClaw's VM on live data (homelab's tools/homelab needs_live_test,
-# and its docs/working-with-openclaw.md "Live tests"). Keep these in step with it.
+# `live-tested` and an owner comment has the line `live-tested: <full head SHA>`: its real entry path ran in
+# OpenClaw's VM on live data, on that commit (homelab's tools/homelab needs_live_test and current_labels, and its
+# docs/working-with-openclaw.md "Live tests"). Keep these in step with it.
 LIVE_TESTED = 'live-tested'
+LIVE_TEST_LINE = re.compile(r'^\s*live-tested: ([0-9a-f]{40})\s*$', re.MULTILINE)
 LIVE_TEST_REPO = f'{OWNER}/homelab'
 LIVE_TEST_PATHS = ('platform/openclaw/tools/', 'platform/openclaw/automations/', 'platform/openclaw/vm/')
 THREADS_QUERY = ('query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$n)'
@@ -6965,6 +6967,14 @@ def live_test_paths(pr):
     return [f.get('path') or '' for f in pr.get('files') or [] if (f.get('path') or '').startswith(LIVE_TEST_PATHS)]
 
 
+def live_tested(pr):
+    """True if the queue counts this PR as live-tested: the label, and an owner comment's line for its head."""
+    head = pr.get('headRefOid') or ''
+    return any((label.get('name') or '') == LIVE_TESTED for label in pr.get('labels') or []) and any(
+        login_of(c.get('author')) == OWNER.lower() and head in LIVE_TEST_LINE.findall(c.get('body') or '')
+        for c in pr.get('comments') or [])
+
+
 def watch_step(pr, memory, now, open_threads=lambda: []):
     """One look at the PR: (result, what, next). result None: still waiting; a WATCH_DONE result: done; any other:
     something for the agent to do. `memory` carries what earlier looks saw (the bot took the PR; since when the
@@ -6974,6 +6984,11 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
     rollup = pr.get('statusCheckRollup')
     failing, running = not_green_checks(rollup), pending_checks(rollup)
     again = f'`magehand pr ready {n}`, then `magehand pr watch {n}`'
+    labels = [label.get('name') or '' for label in pr.get('labels') or []]
+    held = HOLD in labels
+    live = live_test_paths(pr)
+    relabel = (f', remove `{LIVE_TESTED}` (`gh pr edit {n} --remove-label {LIVE_TESTED}`: the new head needs its own '
+               f'live test)' if live and LIVE_TESTED in labels else '')
     if pr.get('state') == 'MERGED':
         return 'merged', 'merged', None
     if pr.get('state') == 'CLOSED':
@@ -6981,16 +6996,11 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
     if failing:
         undo = '' if pr.get('isDraft') else f'`gh pr ready {n} --undo`, '
         return 'failed', f'checks failed on {head[:7]}: {", ".join(failing)}', \
-            f'{undo}read the failed run (`gh pr checks {n}`), fix it and push until green, then {again}'
+            f'{undo}read the failed run (`gh pr checks {n}`){relabel}, fix it and push until green, then {again}'
     if pr.get('isDraft'):
         if running or not rollup:
             return None, 'draft: checks running' if running else 'draft: no checks yet', None
         return 'green', f'draft: checks green on {head[:7]}', again
-    labels = [label.get('name') or '' for label in pr.get('labels') or []]
-    held = HOLD in labels
-    live = live_test_paths(pr)
-    relabel = (f', remove `{LIVE_TESTED}` (`gh pr edit {n} --remove-label {LIVE_TESTED}`: the new head needs its own '
-               f'live test)' if live and LIVE_TESTED in labels else '')
     author = login_of(pr.get('author'))
     if author == BOT.lower():  # OpenClaw's own PR: the owner reviews it and merges it
         verdict = owner_verdict(pr, head)
@@ -7026,13 +7036,14 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
         if held:
             return 'held', f'approved; held (label `{HOLD}`): the queue will not merge it', \
                 'nothing: the owner removes the label when it may merge'
-        if live and LIVE_TESTED not in labels:
+        if live and not live_tested(pr):
             return 'live-test', (f'approved; held for a live test: it changes what OpenClaw runs on its own '
-                                 f'({", ".join(live[:3])}{", ..." if len(live) > 3 else ""}) and has no '
-                                 f'`{LIVE_TESTED}` label'), \
+                                 f'({", ".join(live[:3])}{", ..." if len(live) > 3 else ""}) and {head[:7]} has no '
+                                 f'`{LIVE_TESTED}` label with a `{LIVE_TESTED}: <sha>` comment line for it'), \
                 (f"run the change's real entry path in OpenClaw's VM on live data (homelab "
-                 f'docs/working-with-openclaw.md, "Live tests"), say what you ran in a PR comment, then '
-                 f'`gh pr edit {n} --add-label {LIVE_TESTED}` and `magehand pr watch {n}`: the queue merges it')
+                 f'docs/working-with-openclaw.md, "Live tests"), comment what you ran ending with the line '
+                 f'`{LIVE_TESTED}: {head}`, add the label (`gh pr edit {n} --add-label {LIVE_TESTED}`), then '
+                 f'`magehand pr watch {n}`: the queue merges it')
         if running:
             return None, 'approved; checks still running', None
         memory.setdefault('approved', now)
