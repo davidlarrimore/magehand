@@ -5996,16 +5996,22 @@ def update_notice():
               file=sys.stderr)
 
 
-UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'upgrade', 'magehand'], 'pipx': ['pipx', 'upgrade', 'magehand'],
+# uv: `tool install magehand@latest`, not `tool upgrade`. `tool upgrade` answers from uv's cached package index (a
+# release newer than the cache isn't seen: 0.54.1 on 2026-11-11, `now: magehand 0.54.0`, `next: nothing`) and keeps
+# the version the tool was installed with: after an exact `magehand==X` install it says "Nothing to upgrade" forever
+# and exits 0 (2026-11-12, stuck on 0.54.1). `@latest` with --refresh-package asks the index again and leaves no pin.
+# On the interpreter this copy runs on, so a reinstall never moves it off Apple's Python.
+UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'install', '--force', '--refresh-package', 'magehand',
+                           '--python', os.path.realpath(sys.executable), 'magehand@latest'],
+                    'pipx': ['pipx', 'upgrade', 'magehand'],
                     'venv': [sys.executable, '-m', 'pip', 'install', '--upgrade', 'magehand']}
-# uv answers `tool upgrade` from its cached package index: a release newer than the cache isn't seen, and it exits 0
-# having changed nothing (0.54.1 on 2026-11-11: `now: magehand 0.54.0`, `next: nothing`). Asking for the exact
-# version looks it up. On the interpreter this copy runs on, so a reinstall never moves it off Apple's Python.
-PIN_COMMANDS = {'uv': lambda v: ['uv', 'tool', 'install', '--force', '--python', os.path.realpath(sys.executable),
-                                 f'magehand=={v}'],
+# When that still didn't get the latest: install at least that version. Never `==`: uv and pipx keep the
+# specifier, and an exact one blocks every later upgrade.
+PIN_COMMANDS = {'uv': lambda v: ['uv', 'tool', 'install', '--force', '--refresh-package', 'magehand',
+                                 '--python', os.path.realpath(sys.executable), f'magehand>={v}'],
                 'pipx': lambda v: ['pipx', 'install', '--force', '--python', os.path.realpath(sys.executable),
-                                   f'magehand=={v}'],
-                'venv': lambda v: [sys.executable, '-m', 'pip', 'install', f'magehand=={v}']}
+                                   f'magehand>={v}'],
+                'venv': lambda v: [sys.executable, '-m', 'pip', 'install', f'magehand>={v}']}
 
 
 def exe_version(exe):
@@ -6027,7 +6033,7 @@ def cmd_upgrade(_a):
         print(f'magehand {current} is the latest')
     else:
         upgraded, cmd = True, UPGRADE_COMMANDS[method]
-        print(f'magehand {current or "?"} -> {latest or "latest"}: {" ".join(cmd)}', flush=True)
+        print(f'magehand {current or "?"} -> {latest or "latest"}: {shlex.join(cmd)}', flush=True)
         if subprocess.run(cmd).returncode != 0:  # nosec B603  # fixed commands above
             die('the upgrade failed (see above)')
     # The new version, from this install's own bin (not whatever is first on PATH).
@@ -6041,14 +6047,14 @@ def cmd_upgrade(_a):
                             version_tuple(v) < version_tuple(latest))
     if upgraded and behind(now):
         pin = PIN_COMMANDS[method](latest)
-        print(f'still {now}: `{" ".join(cmd)}` did not see {latest} (its package index is older than the release); '
-              f'installing it by version: {" ".join(pin)}', flush=True)
+        print(f'still {now}: `{shlex.join(cmd)}` did not see {latest} (its package index is older than the release); '
+              f'installing it by version: {shlex.join(pin)}', flush=True)
         if subprocess.run(pin).returncode != 0:  # nosec B603  # fixed commands above, a version from our tags
             die(f'could not install magehand {latest} (PyPI has it a few minutes after the tag): '
-                f'`{" ".join(pin)}` again in a few minutes')
+                f'`{shlex.join(pin)}` again in a few minutes')
         now = exe_version(exe)
         if behind(now):
-            die(f'still magehand {now} after installing {latest}: run `{" ".join(pin)}` and read its output')
+            die(f'still magehand {now} after installing {latest}: run `{shlex.join(pin)}` and read its output')
     print(f'now: magehand {now or "?"}', flush=True)
     # The new version's own setup, quietly: it refreshes the skill and the approvals where setup put them, and
     # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
