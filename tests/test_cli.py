@@ -1302,14 +1302,15 @@ class LocalNetworkBlocked(unittest.TestCase):
 
     def upgrade(self, versions, fails=()):
         """`magehand upgrade` from 0.54.0 with 0.54.1 released; `versions` is what the executable reports after
-        each install; `fails`, the install commands (by first words) that exit 1. Returns (code, out, runs)."""
+        each install; `fails`, the install commands (by first or last words) that exit 1. Returns (code, out, runs)."""
         runs, reported = [], list(versions)
 
         def run(argv, **_k):
             if argv[1:] == ['version']:
                 return subprocess.CompletedProcess(argv, 0, stdout=reported.pop(0) + '\n')
             runs.append(argv)
-            code = 1 if any(argv[:len(f)] == list(f) for f in fails) else 2 if argv[1:2] == ['setup'] else 0
+            code = 1 if any(list(f) in (argv[:len(f)], argv[-len(f):]) for f in fails) \
+                else 2 if argv[1:2] == ['setup'] else 0
             return subprocess.CompletedProcess(argv, code)
         with mock.patch.object(magehand, 'install_method', lambda *a: 'uv'), \
                 mock.patch.object(magehand, 'installed_version', lambda: '0.54.0'), \
@@ -1332,21 +1333,31 @@ class LocalNetworkBlocked(unittest.TestCase):
         # upgrade said `now: magehand 0.54.0`, `next: nothing`
         code, out, runs = self.upgrade(['0.54.0', '0.54.1'])
         self.assertEqual(code, 0, out)
-        self.assertEqual(runs[0], ['uv', 'tool', 'upgrade', 'magehand'])
-        self.assertEqual(runs[1][:4] + runs[1][-1:], ['uv', 'tool', 'install', '--force', 'magehand==0.54.1'])
-        self.assertEqual(runs[1][4:6], ['--python', magehand.os.path.realpath(magehand.sys.executable)])
+        python = magehand.os.path.realpath(magehand.sys.executable)
+        self.assertEqual(runs[0], ['uv', 'tool', 'install', '--force', '--refresh-package', 'magehand',
+                                   '--python', python, 'magehand@latest'])
+        self.assertEqual(runs[1], ['uv', 'tool', 'install', '--force', '--refresh-package', 'magehand',
+                                   '--python', python, 'magehand>=0.54.1'])
         self.assertIn('did not see 0.54.1', out)
         self.assertIn('now: magehand 0.54.1', out)
         # the upgrade saw it: nothing more
         code, out, runs = self.upgrade(['0.54.1'])
-        self.assertEqual((code, [r[:3] for r in runs if r[1:2] != ['setup']]), (0, [['uv', 'tool', 'upgrade']]))
+        self.assertEqual((code, [r[-1] for r in runs if r[1:2] != ['setup']]), (0, ['magehand@latest']))
         self.assertIn('now: magehand 0.54.1', out)
 
+    def test_upgrade_never_pins_an_exact_version(self):
+        # 2026-11-12: the fallback installed magehand==0.54.1; uv keeps that specifier, so every later
+        # `uv tool upgrade` said "Nothing to upgrade", exited 0, and upgrade said `next: nothing`
+        for method in ('uv', 'pipx', 'venv'):
+            self.assertFalse(any('==' in a for a in magehand.UPGRADE_COMMANDS[method] + magehand.PIN_COMMANDS[method]('1.2.3')),
+                             method)
+        self.assertNotIn('upgrade', magehand.UPGRADE_COMMANDS['uv'])  # `tool upgrade` keeps an old pin
+
     def test_upgrade_says_so_when_it_still_cannot_get_the_latest(self):
-        code, out, _ = self.upgrade(['0.54.0'], fails=[('uv', 'tool', 'install')])
+        code, out, _ = self.upgrade(['0.54.0'], fails=[('magehand>=0.54.1',)])
         self.assertEqual(code, 1)  # PyPI not serving it yet: the message names the command to run again
         self.assertIn('again in a few minutes', out)
-        self.assertIn('magehand==0.54.1', out)
+        self.assertIn('magehand>=0.54.1', out)
         code, out, _ = self.upgrade(['0.54.0', '0.54.0'])
         self.assertEqual(code, 1)
         self.assertIn('still magehand 0.54.0 after installing 0.54.1', out)

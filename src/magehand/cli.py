@@ -5996,16 +5996,22 @@ def update_notice():
               file=sys.stderr)
 
 
-UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'upgrade', 'magehand'], 'pipx': ['pipx', 'upgrade', 'magehand'],
+# uv: `tool install magehand@latest`, not `tool upgrade`. `tool upgrade` answers from uv's cached package index (a
+# release newer than the cache isn't seen: 0.54.1 on 2026-11-11, `now: magehand 0.54.0`, `next: nothing`) and keeps
+# the version the tool was installed with: after an exact `magehand==X` install it says "Nothing to upgrade" forever
+# and exits 0 (2026-11-12, stuck on 0.54.1). `@latest` with --refresh-package asks the index again and leaves no pin.
+# On the interpreter this copy runs on, so a reinstall never moves it off Apple's Python.
+UPGRADE_COMMANDS = {'uv': ['uv', 'tool', 'install', '--force', '--refresh-package', 'magehand',
+                           '--python', os.path.realpath(sys.executable), 'magehand@latest'],
+                    'pipx': ['pipx', 'upgrade', 'magehand'],
                     'venv': [sys.executable, '-m', 'pip', 'install', '--upgrade', 'magehand']}
-# uv answers `tool upgrade` from its cached package index: a release newer than the cache isn't seen, and it exits 0
-# having changed nothing (0.54.1 on 2026-11-11: `now: magehand 0.54.0`, `next: nothing`). Asking for the exact
-# version looks it up. On the interpreter this copy runs on, so a reinstall never moves it off Apple's Python.
-PIN_COMMANDS = {'uv': lambda v: ['uv', 'tool', 'install', '--force', '--python', os.path.realpath(sys.executable),
-                                 f'magehand=={v}'],
+# When that still didn't get the latest: install at least that version. Never `==`: uv and pipx keep the
+# specifier, and an exact one blocks every later upgrade.
+PIN_COMMANDS = {'uv': lambda v: ['uv', 'tool', 'install', '--force', '--refresh-package', 'magehand',
+                                 '--python', os.path.realpath(sys.executable), f'magehand>={v}'],
                 'pipx': lambda v: ['pipx', 'install', '--force', '--python', os.path.realpath(sys.executable),
-                                   f'magehand=={v}'],
-                'venv': lambda v: [sys.executable, '-m', 'pip', 'install', f'magehand=={v}']}
+                                   f'magehand>={v}'],
+                'venv': lambda v: [sys.executable, '-m', 'pip', 'install', f'magehand>={v}']}
 
 
 def exe_version(exe):
