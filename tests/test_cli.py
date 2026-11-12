@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -1233,6 +1234,13 @@ class Doctor(unittest.TestCase):
         self.assertIn('magehand setup', out.getvalue())
 
 
+def shell_words(line):
+    """`line` as a POSIX shell splits it, operators (`>`, `|`, `;`) as their own words."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
 class LocalNetworkBlocked(unittest.TestCase):
     """macOS Local Network privacy: "No route to host" for this Python while Apple's curl gets an answer."""
 
@@ -1357,10 +1365,13 @@ class LocalNetworkBlocked(unittest.TestCase):
         code, out, _ = self.upgrade(['0.54.0'], fails=[('magehand>=0.54.1',)])
         self.assertEqual(code, 1)  # PyPI not serving it yet: the message names the command to run again
         self.assertIn('again in a few minutes', out)
-        self.assertIn('magehand>=0.54.1', out)
+        # the command to run again survives a shell: `>=` unquoted would redirect to a file `=0.54.1` (#100 review)
+        again = re.search(r'`([^`]*magehand>=[^`]*)` again', out).group(1)
+        self.assertEqual(shell_words(again)[-1], 'magehand>=0.54.1')
         code, out, _ = self.upgrade(['0.54.0', '0.54.0'])
         self.assertEqual(code, 1)
         self.assertIn('still magehand 0.54.0 after installing 0.54.1', out)
+        self.assertEqual(shell_words(re.search(r'run `([^`]*)`', out).group(1))[-1], 'magehand>=0.54.1')
         self.assertNotIn('now: magehand', out)
 
     def test_doctor_names_the_permission(self):

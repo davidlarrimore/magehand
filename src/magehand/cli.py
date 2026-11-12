@@ -6033,7 +6033,7 @@ def cmd_upgrade(_a):
         print(f'magehand {current} is the latest')
     else:
         upgraded, cmd = True, UPGRADE_COMMANDS[method]
-        print(f'magehand {current or "?"} -> {latest or "latest"}: {" ".join(cmd)}', flush=True)
+        print(f'magehand {current or "?"} -> {latest or "latest"}: {shlex.join(cmd)}', flush=True)
         if subprocess.run(cmd).returncode != 0:  # nosec B603  # fixed commands above
             die('the upgrade failed (see above)')
     # The new version, from this install's own bin (not whatever is first on PATH).
@@ -6047,14 +6047,14 @@ def cmd_upgrade(_a):
                             version_tuple(v) < version_tuple(latest))
     if upgraded and behind(now):
         pin = PIN_COMMANDS[method](latest)
-        print(f'still {now}: `{" ".join(cmd)}` did not see {latest} (its package index is older than the release); '
-              f'installing it by version: {" ".join(pin)}', flush=True)
+        print(f'still {now}: `{shlex.join(cmd)}` did not see {latest} (its package index is older than the release); '
+              f'installing it by version: {shlex.join(pin)}', flush=True)
         if subprocess.run(pin).returncode != 0:  # nosec B603  # fixed commands above, a version from our tags
             die(f'could not install magehand {latest} (PyPI has it a few minutes after the tag): '
-                f'`{" ".join(pin)}` again in a few minutes')
+                f'`{shlex.join(pin)}` again in a few minutes')
         now = exe_version(exe)
         if behind(now):
-            die(f'still magehand {now} after installing {latest}: run `{" ".join(pin)}` and read its output')
+            die(f'still magehand {now} after installing {latest}: run `{shlex.join(pin)}` and read its output')
     print(f'now: magehand {now or "?"}', flush=True)
     # The new version's own setup, quietly: it refreshes the skill and the approvals where setup put them, and
     # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
