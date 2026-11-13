@@ -1599,6 +1599,15 @@ class CheckManifests(unittest.TestCase):
                 ('S3_SECRET', 'secret_access_key'), ('S3_REGION', 'region')]]
         self.assertEqual(magehand.check_manifests(self.bucket_app(env, access='private'), CATALOG), [])
 
+    def test_outbound_mail_keys_map_to_the_connection_secret(self):
+        env = [ref('MAIL_' + key.upper(), 'mail-connection', key)
+               for key in ('host', 'port', 'username', 'password', 'from', 'to')]
+        app = check_app(env, services={'mail': {'type': 'outbound-mail'}})
+        catalog = dict(CATALOG, blocks=dict(CATALOG['blocks'], **{'outbound-mail': {}}))
+        self.assertEqual(magehand.check_manifests(app, catalog), [])
+        app = check_app([ref('X', 'mail-connection', 'uri')], services={'mail': {'type': 'outbound-mail'}})
+        self.assertIn("has no key 'uri'", texts(magehand.check_manifests(app, catalog), 'error')[0])
+
     def test_bucket_unknown_key(self):
         found = magehand.check_manifests(self.bucket_app([ref('X', 'files-connection', 'password')]), CATALOG)
         self.assertIn("has no key 'password'", texts(found, 'error')[0])
