@@ -75,7 +75,7 @@ APPLE_PYTHON = '/usr/bin/python3'  # with the Xcode Command Line Tools; without 
 APPLE_PREFIXES = ('/usr/bin/', '/System/', '/Library/Developer/CommandLineTools/', '/Applications/Xcode')
 RESOLVER = pathlib.Path('/etc/resolver') / LAB
 SECRET_NAME = {'postgres': '{}-connection', 'redis': '{}-connection', 'llm': '{}-connection', 'secret': '{}',
-               'bucket': '{}-connection'}
+               'bucket': '{}-connection', 'outbound-mail': '{}-connection'}
 # Local object storage for `bucket` blocks: the same Garage the platform runs for `internal`
 # buckets (one node, in a container, one bucket and key per block), so code written against it
 # works in the cluster. Pinned by digest; Garage's admin API sets it up (the image has no shell).
@@ -3340,6 +3340,10 @@ def resolve_env(app, container=False):
         var, block, kind, key = entry
         if kind == 'secret' and not container and var in os.environ:
             continue   # a value you set in your shell wins: it is how to keep a generated secret stable
+        if kind == 'outbound-mail':
+            # The relay is in the cluster only: locally the app runs without mail, unless .magehand.env or the
+            # shell supplies the values (an app must start without them, as it does with no bucket).
+            continue
         if kind == 'bucket' and block not in local:
             # No local object store running: keep a value supplied in .magehand.env or the shell,
             # and say how to get one when there is none (it is optional: a bucket is not needed to start).
@@ -3679,6 +3683,7 @@ BLOCK_KEYS = {
     'bucket': {'keys': ['endpoint', 'bucket', 'access_key_id', 'secret_access_key', 'region', 'access',
                         'path_style', 'url'],
                'key_options': {'url': 'access'}},   # url exists only for access: public (ENUM_OPTION_VALUES)
+    'outbound-mail': {'keys': ['host', 'port', 'username', 'password', 'from', 'to']},
 }
 # key_options naming an enumerated option: the value that makes the key exist (a boolean option needs true).
 ENUM_OPTION_VALUES = {'access': 'public'}
