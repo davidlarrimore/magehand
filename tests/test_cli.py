@@ -5299,6 +5299,37 @@ class Release(unittest.TestCase):
         problems = self.plan(**{key + '1': page(first), key + '2': None})['problems']  # page 2 unreadable
         self.assertTrue(any('could not compare' in p for p in problems))
 
+    def test_only_a_real_release_may_wake_dev(self):
+        # Review: a dry run must stay read-only, and nothing is woken for a release other checks refuse.
+        import contextlib
+        import io
+        asked = []
+        app = {'name': 'lab', 'spec': {'source': {'repo': 'app'}}, 'root': None}
+        ok = {'stages': [{'stage': s, 'state': 'ok', 'text': ''} for s in ('build', 'deploy', 'dev')]}
+
+        def collect(repo, name, cluster=True, ref='main', wake=False):
+            asked.append(wake)
+            return json.loads(json.dumps(ok))
+
+        def run(*argv):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    magehand.main(['release', 'lab', *argv])
+                except SystemExit:
+                    pass
+        with self.fake_gh(), mock.patch.object(magehand, 'app_here', lambda name: app), \
+                mock.patch.object(magehand, 'collect_status', collect), \
+                mock.patch.object(magehand, 'gh_cli', lambda *a, stdin=None: (0, 'https://x/r\n', '')), \
+                mock.patch.object(magehand, 'wake_dev') as wake:
+            run('--dry-run')
+            run('--patch')
+        self.assertEqual(asked, [False, True])
+        wake.assert_not_called()
+        with self.fake_gh(), mock.patch.object(magehand, 'collect_status', collect), \
+                mock.patch.object(magehand, 'main_checks_problems', lambda *a: ['main is red']):
+            magehand.plan_release('davidlarrimore/app', 'lab', wake=True)
+        self.assertEqual(asked[-1], False, 'already refused: nothing to wake for')
+
     def test_unreadable_dev_pods_only_warn(self):
         stages = [{'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''},
                   {'stage': 'dev', 'state': 'unknown', 'text': 'not checked'}]
@@ -6086,6 +6117,34 @@ class Status(unittest.TestCase):
             stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD, wake=True)
         self.assertEqual((stage['state'], woken['n']), ('ok', 1))
         self.assertIn('demo-dev is asleep and has no record of sha256:aaaa running: waking it', err.getvalue())
+
+    def test_the_wake_wait_reads_argo_again(self):
+        # Review: an Application that was Progressing when dev was woken must be read again, or the wait never
+        # ends ok; and a problem that appears during the wait is reported.
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        broken = {**self.argo(), 'spec': {'source': {'repoURL': 'https://github.com/davidlarrimore/demo.git'}},
+                  'status': {**self.argo()['status'], 'conditions': [{'type': 'ComparisonError', 'message':
+                             'repository not found: https://github.com/davidlarrimore/demo.git'}]}}
+        for later, want in ((self.argo(), 'ok'), (broken, 'failed')):
+            woken = {'n': 0}
+            apps = [self.argo(health='Progressing')]
+
+            def kubectl(*a):
+                if a[0] == 'pods':
+                    return {'items': [self.pod()] if woken['n'] else []}, None
+                if a[0] == 'deployments':
+                    return {'items': [{'metadata': {'name': 'demo', 'labels': {magehand.SLEEP_LABEL: 'true'}},
+                                       'spec': {'replicas': 0}}]}, None
+                return (apps.pop(0) if apps else later), None
+
+            def wake(name):
+                woken['n'] += 1
+                return True
+            with mock.patch.object(magehand, 'gh_query', self.recorded('x', statuses=False)), \
+                    mock.patch.object(magehand, 'kubectl_json', kubectl), mock.patch.object(magehand, 'wake_dev', wake), \
+                    mock.patch.object(magehand.time, 'sleep'), contextlib.redirect_stderr(io.StringIO()):
+                stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD, wake=True)
+            self.assertEqual(stage['state'], want, later)
 
     def test_no_pods_without_sleep_is_still_pending(self):
         # Scaled to 0 by hand, or not labelled for sleep: not asleep, so a record does not stand in for pods.

@@ -1283,8 +1283,8 @@ def dev_stage(name, deploy, cluster=True, repo=None, head=None, wake=False):
                             f'({clock(recorded["at"])}, the platform\'s record)'}
         if not wake:
             return {'stage': 'dev', 'state': 'pending', 'asleep': True,
-                    'text': f'asleep (idle), and the platform has no record of {deploy["digest"]} running; '
-                            f'`magehand release` wakes it, or open https://{name}-dev.{LAB}/'}
+                    'text': f'asleep (idle), and the platform has no record of {deploy["digest"]} running: '
+                            f'`magehand release` (not --dry-run) wakes it first, or open https://{name}-dev.{LAB}/'}
         print(f'{name}-dev is asleep and has no record of {deploy["digest"]} running: waking it '
               f'(up to {WAKE_WAIT // 60} minutes)', file=sys.stderr)
         if not wake_dev(name):
@@ -1297,7 +1297,11 @@ def dev_stage(name, deploy, cluster=True, repo=None, head=None, wake=False):
             pods, err = kubectl_json('pods', '-n', f'{name}-dev')
             if err:
                 return unknown(err)
+            application, argo_error = kubectl_json('application.argoproj.io', f'{name}-dev', '-n', 'argocd')
+            problem = argo_problem(application)
             stage = pod_stage(pods, application, deploy['image'], argo_error)
+            if problem and not (stage['state'] == 'failed' and problem['state'] != 'failed'):
+                return {'stage': 'dev', **problem}
     return stage
 
 
@@ -1797,7 +1801,7 @@ def read_spec(repo, ref, problems, required):
         return {}
 
 
-def plan_release(repo, name, forced=None, cluster=True):
+def plan_release(repo, name, forced=None, cluster=True, wake=False):
     """Everything `release` decides, from reads only: {app, repo, commit, previous, version, bump, why,
     changes, notes, problems, warnings}. A problem is a reason the release would not deploy."""
     problems, warnings = [], []
@@ -1852,7 +1856,9 @@ def plan_release(repo, name, forced=None, cluster=True):
     if ref and not err:
         problems.append(f'the tag {version} already exists (a draft or prerelease?): delete it or pick a bump')
     problems += main_checks_problems(repo, head)
-    stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head, wake=True)['stages']}
+    # Wake a sleeping dev only for a real release that nothing else already refuses: a dry run stays read-only.
+    stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head,
+                                                       wake=wake and not problems)['stages']}
     for stage in ('build', 'deploy'):
         if stages[stage]['state'] != 'ok':
             problems.append(f'{stage} of {head[:7]} is not done: {stages[stage]["text"]}')
@@ -1892,7 +1898,7 @@ def cmd_release(a):
         usage('release', 'choose one of --major, --minor, --patch')
     forced = 'major' if a.major else 'minor' if a.minor else 'patch' if a.patch else None
     app = app_here(scoped_app('release', a.app_flag or a.app, why='it would release that app to production'))
-    plan = plan_release(code_repo(app), app['name'], forced, cluster=not a.no_cluster)
+    plan = plan_release(code_repo(app), app['name'], forced, cluster=not a.no_cluster, wake=not a.dry_run)
     plan['created'] = False
     refuse = f'not releasing {plan["version"]}: ' + '; '.join(plan['problems']) if plan['problems'] else None
     plan['next'] = release_next(plan, refuse)

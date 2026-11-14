@@ -13,9 +13,13 @@
   `check --ui` runs CI's browser check in containers: the runtime pulls the
   Playwright and Postgres images build-app.yaml pins, and the Playwright
   container installs that pinned Playwright and PyYAML from PyPI and
-  axe-core from npm (checked against the pinned SHA-256), as CI does. The
-  one cluster call is read-only `kubectl get` (`status`: dev's pods and Argo
-  application), skipped without kubectl and by `--no-cluster`. Its writes
+  axe-core from npm (checked against the pinned SHA-256), as CI does. Its
+  cluster calls are read-only `kubectl get` (`status`: dev's pods and Argo
+  application), skipped without kubectl and by `--no-cluster`, with one
+  exception: `release` (never `--dry-run`, never `status`) asks Sablier to
+  wake a sleeping dev that has no record of running the commit, the same
+  request opening the app makes, changing nothing but how long dev stays
+  up (owner's decision, 2026-11-14). Its writes
   are `magehand new` (an app's repo on GitHub, and its platform setup: the
   bot with write and the approval ruleset, made true on any non-archived repo
   from the template; it never removes anything, edits an existing ruleset or
