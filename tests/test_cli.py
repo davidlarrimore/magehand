@@ -5209,7 +5209,7 @@ class Release(unittest.TestCase):
                 return real(*args)
             with mock.patch.object(magehand, 'gh_query', query), mock.patch.object(
                     magehand, 'collect_status',
-                    lambda repo, name, cluster=True, ref='main': seen.append(ref) or {'stages': [
+                    lambda repo, name, cluster=True, ref='main', wake=False: seen.append(ref) or {'stages': [
                         {'stage': 'build', 'state': 'ok', 'text': ''}, {'stage': 'deploy', 'state': 'ok', 'text': ''},
                         {'stage': 'dev', 'state': 'ok', 'text': ''}]}):
                 plan = magehand.plan_release('davidlarrimore/app', 'lab')
@@ -6040,6 +6040,64 @@ class Status(unittest.TestCase):
                 mock.patch.object(magehand, 'kubectl_json', lambda *a: ({'items': []} if a[0] == 'pods' else self.argo(), None)):
             self.assertEqual(magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD)['state'],
                              'pending', 'no pods now: not running, whatever was recorded')
+
+    def asleep_cluster(self, replicas=0, pods_after_wake=None):
+        """kubectl answers for a dev Sablier has put to sleep; after a wake, `pods_after_wake` (else none)."""
+        woken = {'n': 0}
+
+        def kubectl(*a):
+            if a[0] == 'pods':
+                return {'items': pods_after_wake if woken['n'] else []}, None
+            if a[0] == 'deployments':
+                return {'items': [{'metadata': {'name': 'demo', 'labels': {magehand.SLEEP_LABEL: 'true'}},
+                                   'spec': {'replicas': replicas}}]}, None
+            return self.argo(), None
+        return kubectl, woken
+
+    def test_asleep_dev_counts_as_running_when_the_platform_recorded_it(self):
+        kubectl, woken = self.asleep_cluster()
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        with mock.patch.object(magehand, 'gh_query', self.recorded('success')), \
+                mock.patch.object(magehand, 'kubectl_json', kubectl), \
+                mock.patch.object(magehand, 'wake_dev') as wake:
+            stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD, wake=True)
+        self.assertEqual((stage['state'], stage.get('asleep')), ('ok', True))
+        self.assertIn('asleep (idle); ran sha256:aaaa with every pod Ready (09:15Z', stage['text'])
+        wake.assert_not_called()  # the record is the proof: nothing to wake
+
+    def test_asleep_dev_without_a_record_says_so_or_is_woken_by_release(self):
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        kubectl, woken = self.asleep_cluster()
+        with mock.patch.object(magehand, 'gh_query', self.recorded('x', statuses=False)), \
+                mock.patch.object(magehand, 'kubectl_json', kubectl), \
+                mock.patch.object(magehand, 'wake_dev') as wake:
+            stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD)
+        self.assertEqual(stage['state'], 'pending')
+        self.assertIn('asleep (idle), and the platform has no record', stage['text'])
+        wake.assert_not_called()  # status reads; only release wakes
+        kubectl, woken = self.asleep_cluster(pods_after_wake=[self.pod()])
+
+        def wake(name):
+            woken['n'] += 1
+            return True
+        with mock.patch.object(magehand, 'gh_query', self.recorded('x', statuses=False)), \
+                mock.patch.object(magehand, 'kubectl_json', kubectl), mock.patch.object(magehand, 'wake_dev', wake), \
+                mock.patch.object(magehand.time, 'sleep'), contextlib.redirect_stderr(io.StringIO()) as err:
+            stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD, wake=True)
+        self.assertEqual((stage['state'], woken['n']), ('ok', 1))
+        self.assertIn('demo-dev is asleep and has no record of sha256:aaaa running: waking it', err.getvalue())
+
+    def test_no_pods_without_sleep_is_still_pending(self):
+        # Scaled to 0 by hand, or not labelled for sleep: not asleep, so a record does not stand in for pods.
+        deploy = {'digest': 'sha256:aaaa', 'image': self.IMAGE}
+        for kubectl in (self.asleep_cluster(replicas=1)[0],
+                        lambda *a: ({'items': [{'metadata': {'name': 'demo'}, 'spec': {'replicas': 0}}]}
+                                    if a[0] == 'deployments' else {'items': []} if a[0] == 'pods' else self.argo(), None)):
+            with mock.patch.object(magehand, 'gh_query', self.recorded('success')), \
+                    mock.patch.object(magehand, 'kubectl_json', kubectl):
+                stage = magehand.dev_stage('demo', deploy, repo='davidlarrimore/demo', head=self.HEAD, wake=True)
+            self.assertEqual(stage['state'], 'pending')
+            self.assertNotIn('asleep', stage['text'])
 
     def test_only_the_platforms_own_records_count(self):
         for payload in ('a string payload', {}, {'image': self.IMAGE}, {'image': self.IMAGE, 'application': 'other-dev'},

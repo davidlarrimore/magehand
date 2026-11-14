@@ -996,6 +996,11 @@ def prod_stage(tag, ahead, prs):
 
 
 BLOCK_LABEL = 'homelab.davidlarrimore.com/block'  # on a building block's pods (postgres, redis): not the app's image
+# Dev sleeps after two idle hours (homelab platform/sablier): Sablier labels the app's workloads and scales them to 0.
+SLEEP_LABEL = 'sablierapp.dev/enable'
+SABLIER_POKE = ('/api/v1/namespaces/sablier/services/http:sablier:10000/proxy/api/strategies/poke'
+                '?group={name}-dev&session_duration=30m')
+WAKE_WAIT = 240  # seconds: a sleeping app with a database is usually ready in one to two minutes
 
 STUCK_PODS = ('CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateContainerConfigError',
               'InvalidImageName', 'RunContainerError')
@@ -1003,7 +1008,7 @@ STUCK_PODS = ('CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull', 'CreateCon
 
 def kubectl_json(*args):
     """(parsed JSON, None) of a read-only `kubectl get ARGS -o json`, or (None, why): no kubectl, no context,
-    no access. The one call magehand makes to the cluster, and it only reads."""
+    no access. magehand's cluster calls only read, except wake_dev (`release` waking a sleeping dev)."""
     if not shutil.which('kubectl'):
         return None, 'kubectl is not installed'
     try:
@@ -1217,7 +1222,26 @@ def platform_deployment(repo, environment, sha, application, image=None):
             'at': latest.get('created_at') or mine[0].get('created_at')}
 
 
-def dev_stage(name, deploy, cluster=True, repo=None, head=None):
+def dev_asleep(name):
+    """True when the platform has put <name>-dev to sleep: its Sablier-labelled Deployments are all at 0."""
+    found, err = kubectl_json('deployments', '-n', f'{name}-dev')
+    managed = [d for d in (found or {}).get('items') or []
+               if ((d.get('metadata') or {}).get('labels') or {}).get(SLEEP_LABEL) == 'true']
+    return not err and bool(managed) and all((d.get('spec') or {}).get('replicas') == 0 for d in managed)
+
+
+def wake_dev(name):
+    """Ask Sablier (through the API server's Service proxy) to start <name>-dev for 30 minutes. Like opening
+    the app: it changes nothing but how long dev stays up. True when the request was accepted."""
+    try:
+        out = subprocess.run(['kubectl', 'get', '--raw', SABLIER_POKE.format(name=name), '--request-timeout=10s'],  # nosec B603 B607
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0
+
+
+def dev_stage(name, deploy, cluster=True, repo=None, head=None, wake=False):
     """The running pods for a merged dev deploy, read through kubectl when this machine can (current, and the
     most specific). When it can't, the platform's GitHub Deployment for `head` says how the rollout ended
     (readable from any machine: running, failed, or still rolling out), else an unknown stage says why the
@@ -1250,6 +1274,30 @@ def dev_stage(name, deploy, cluster=True, repo=None, head=None):
     stage = pod_stage(pods, application, deploy['image'], argo_error)
     if problem and not (stage['state'] == 'failed' and problem['state'] != 'failed'):
         return {'stage': 'dev', **problem}  # a pod that cannot start is more specific than a render still pending
+    if stage['state'] == 'pending' and stage['text'].startswith('no pods yet') and dev_asleep(name):
+        # Asleep is not "not deployed": the platform recorded the rollout when it happened, and that record is
+        # the proof `release` needs. Only without one is dev woken (release) or the reader told how.
+        if recorded and recorded['state'] == 'success':
+            return {'stage': 'dev', 'state': 'ok', 'asleep': True,
+                    'text': f'asleep (idle); ran {deploy["digest"]} with every pod Ready '
+                            f'({clock(recorded["at"])}, the platform\'s record)'}
+        if not wake:
+            return {'stage': 'dev', 'state': 'pending', 'asleep': True,
+                    'text': f'asleep (idle), and the platform has no record of {deploy["digest"]} running; '
+                            f'`magehand release` wakes it, or open https://{name}-dev.{LAB}/'}
+        print(f'{name}-dev is asleep and has no record of {deploy["digest"]} running: waking it '
+              f'(up to {WAKE_WAIT // 60} minutes)', file=sys.stderr)
+        if not wake_dev(name):
+            return {'stage': 'dev', 'state': 'pending', 'asleep': True,
+                    'text': f'asleep, and it could not be woken from here: open https://{name}-dev.{LAB}/ '
+                            'and run this again'}
+        deadline = time.monotonic() + WAKE_WAIT
+        while stage['state'] == 'pending' and time.monotonic() < deadline:
+            time.sleep(10)
+            pods, err = kubectl_json('pods', '-n', f'{name}-dev')
+            if err:
+                return unknown(err)
+            stage = pod_stage(pods, application, deploy['image'], argo_error)
     return stage
 
 
@@ -1299,7 +1347,7 @@ def post_deploy_stage(repo, sha, name):
                if state == 'failed' else {})}
 
 
-def collect_status(repo, name, cluster=True, ref='main'):
+def collect_status(repo, name, cluster=True, ref='main', wake=False):
     """The stages for the app `name` whose code is `repo` (OWNER/NAME) at `ref` (main, or the one commit
     `release` is about to tag); a failed query is a stage in state 'error' naming what could not be read."""
     commit, err = gh_query('api', f'repos/{repo}/commits/{ref}')
@@ -1333,7 +1381,7 @@ def collect_status(repo, name, cluster=True, ref='main'):
                 prod = prod_running(prod, platform_deployment(repo, 'production', tagged['sha'], f'{name}-prod'))
     stages = [build, deploy, prod]
     if deploy['state'] == 'ok':
-        stages.insert(2, dev_stage(name, deploy, cluster, repo, head))
+        stages.insert(2, dev_stage(name, deploy, cluster, repo, head, wake=wake))
         stages.insert(3, post_deploy_stage(repo, head, name))
     return {'app': name, 'repo': repo, 'commit': head, 'subject': subject, 'stages': stages}
 
@@ -1804,7 +1852,7 @@ def plan_release(repo, name, forced=None, cluster=True):
     if ref and not err:
         problems.append(f'the tag {version} already exists (a draft or prerelease?): delete it or pick a bump')
     problems += main_checks_problems(repo, head)
-    stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head)['stages']}
+    stages = {st['stage']: st for st in collect_status(repo, name, cluster, ref=head, wake=True)['stages']}
     for stage in ('build', 'deploy'):
         if stages[stage]['state'] != 'ok':
             problems.append(f'{stage} of {head[:7]} is not done: {stages[stage]["text"]}')
