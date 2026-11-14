@@ -6766,6 +6766,11 @@ def check_job_documents(app, catalog, documents, own, base, listed, fetch=False)
         if not spec.get('startingDeadlineSeconds'):
             found.append(finding('error', where, f'{label}: startingDeadlineSeconds is required: without it the '
                                  'controller stops scheduling the job for good after 100 missed runs', JOB_SEE))
+        if spec.get('suspend') is False:
+            found.append(finding('error', where, f'{label}: remove `suspend: false`: the platform suspends a dev '
+                                 "app's jobs while it sleeps, and with the field written Argo CD undoes that, so "
+                                 'the job starts without its database and fails. Leave `suspend` out; '
+                                 '`suspend: true` switches a job off', JOB_SEE))
         if not job.get('activeDeadlineSeconds'):
             found.append(finding('error', where, f'{label}: jobTemplate.spec.activeDeadlineSeconds (the timeout) is '
                                  'required: with Forbid, a run that hangs blocks every later run', JOB_SEE))
