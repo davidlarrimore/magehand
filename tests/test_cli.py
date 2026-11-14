@@ -6819,6 +6819,15 @@ class Jobs(unittest.TestCase):
                     "the app's own image"):
             self.assertTrue(any(why in e for e in errors), why)
 
+    def test_check_refuses_suspend_false_only(self):
+        # The platform pauses a sleeping dev app's jobs; `suspend: false` in Git makes Argo CD undo the pause.
+        self.write(self.cronjob(spec__suspend=False))
+        errors = texts(magehand.check_jobs(self.app(), CATALOG_MODELS), 'error')
+        self.assertTrue(any('remove `suspend: false`' in e for e in errors), errors)
+        for allowed in (True, None):
+            self.write(self.cronjob(spec__suspend=allowed))
+            self.assertFalse(any('suspend' in e for e in texts(magehand.check_jobs(self.app(), CATALOG_MODELS), 'error')))
+
     def test_check_finds_a_job_the_service_selects_secrets_nothing_makes_and_an_unlisted_file(self):
         doc = self.cronjob(spec__schedule='*/2 * * * *',
                            container__env=[ref('X', 'missing-connection', 'uri')])
