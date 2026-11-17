@@ -876,6 +876,8 @@ def cmd_api(a):
     if not a.path.startswith('/'):
         usage('api', f'PATH starts with /: did you mean /{a.path}?')
     name = scoped_app('api', a.app_flag, why='it would call that app as you')
+    if not APP_NAME.fullmatch(name or ''):  # the name becomes the host: nothing else may reach the URL
+        usage('api', f'{name!r} is not an app name (lowercase letters, digits and -)')
     extra = {}
     for item in a.header or []:
         key, sep, value = item.partition(':')
@@ -883,6 +885,8 @@ def cmd_api(a):
             usage('api', f'a header is "Name: value", not {item!r}')
         if key.strip().lower() == 'authorization' or key.strip().lower().startswith('x-authentik-'):
             usage('api', f'{key.strip()} is set by the platform from your sign-in; leave it out')
+        if key.strip().lower() == 'host':  # Traefik routes by Host: it would reach another app with your token
+            usage('api', 'Host is the app\'s own; choose the app with -a and production with --prod')
         extra[key.strip()] = value.strip()
     body = api_body(a.data)
     method = (a.method or ('POST' if body is not None else 'GET')).upper()
@@ -892,7 +896,10 @@ def cmd_api(a):
             extra['Content-Type'] = 'application/json'
         except ValueError:
             pass
-    url = api_base(name, a.prod) + a.path
+    base = api_base(name, a.prod)
+    url = base + a.path
+    if urllib.parse.urlsplit(url).netloc != urllib.parse.urlsplit(base).netloc:  # the token goes to the app only
+        usage('api', f'{a.path!r} would leave {urllib.parse.urlsplit(base).netloc}')
     if a.prod and method not in ('GET', 'HEAD', 'OPTIONS'):
         print(f'magehand: {method} to production: this changes {name}\'s real data, as you', file=sys.stderr)
     # Cloudflare (public production hosts) refuses Python's default User-Agent with a 403.

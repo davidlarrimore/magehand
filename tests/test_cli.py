@@ -5790,11 +5790,30 @@ class AppApi(unittest.TestCase):
     def test_usage_errors(self):
         for argv, why in ((('api', '-a', 'demo', 'api/x'), 'did you mean /api/x'),
                           (('api', '-a', 'demo', '/x', '-H', 'Authorization: Bearer mine'), 'set by the platform'),
-                          (('api', '-a', 'demo', '/x', '-H', 'nocolon'), 'Name: value')):
+                          (('api', '-a', 'demo', '/x', '-H', 'nocolon'), 'Name: value'),
+                          (('api', '-a', 'demo', '/x', '-H', 'host: other-dev.lab.davidlarrimore.com'), 'Host is'),
+                          (('api', '-a', 'demo', '/x', '-H', 'HOST: demo.davidlarrimore.com'), 'Host is'),
+                          (('api', '-a', 'example.com/', '/'), 'not an app name'),
+                          (('api', '-a', 'demo@example.com', '/'), 'not an app name'),
+                          (('api', '-a', 'Demo', '/'), 'not an app name')):
             code, _, err = self.run_main(*argv)
             self.assertEqual(code, 2)
             self.assertIn(why, err)
         self.assertEqual(self.calls, [])
+
+    def test_bad_input_never_reads_the_token(self):
+        read = []
+        with mock.patch.object(magehand, 'api_session_token', lambda: read.append(1) or 'tok'):
+            for argv in (('api', '-a', 'example.com/', '/'), ('api', '-a', 'demo', '/', '-H', 'Host: x')):
+                self.assertEqual(self.run_main(*argv)[0], 2)
+        self.assertEqual((read, self.calls), ([], []))
+
+    def test_the_url_stays_on_the_apps_host(self):
+        self.replies = [(200, {}, b'')] * 2
+        for path in ('//example.com/x', '/@example.com'):
+            self.assertEqual(self.run_main('api', '-a', 'demo', path)[0], 0)
+        self.assertEqual({urllib.parse.urlsplit(c[0]).hostname for c in self.calls},
+                         {'demo-dev.lab.davidlarrimore.com'})
 
     def test_in_an_app_checkout_only_that_app(self):
         with mock.patch.object(magehand, 'app_checkout', lambda root=None: 'mine'):
