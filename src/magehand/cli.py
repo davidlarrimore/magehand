@@ -5721,7 +5721,12 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    a failed check or review, a timeout): do its `next:` step every time,
    which ends in watching again until it is done. Base every PR on `main` (the repo's ruleset only guards the
    default branch).
-7. When `magehand check` warns that AGENTS.md is behind the template, run
+7. After a change deploys to dev, test its API as the owner:
+   `magehand api /path --json` (dev; it wakes a sleeping app; `-d` for a
+   body). It needs the owner's `magehand login`: when it says you are not
+   signed in, ask them to run it (you can't tap the passkey). `--prod`
+   (real data) only when the user asks for that call.
+8. When `magehand check` warns that AGENTS.md is behind the template, run
    `magehand update-agents`, review the diff and commit it. Never edit
    AGENTS.md above its `## This app` heading: that edit is lost.
 
