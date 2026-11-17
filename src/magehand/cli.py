@@ -18,6 +18,7 @@ platform/openbao/policies/dev-read.hcl).
 import argparse
 import base64
 import colorsys
+import contextlib
 import datetime
 import difflib
 import errno
@@ -805,18 +806,25 @@ def api_left():
     return left if token else None
 
 
-def api_session_token(below=API_RENEW_BELOW):
-    """(app-API access token, seconds left), or exit saying how to sign in (in a terminal, offer to sign in
-    now)."""
+def api_session_token(below=API_RENEW_BELOW, need=0):
+    """(app-API access token, seconds left), with at least `need` seconds left, or exit saying how to sign in. In
+    a terminal it offers to sign in now; that dialogue and the login's output go to stderr, so stdout stays the
+    command's result (a token captured by `$(magehand api token)`, a response body, JSON)."""
     token, left = api_token(below=below)
-    if not token and sys.stdin.isatty() and sys.stderr.isatty():
-        answer = input('magehand: not signed in for app APIs. Sign in now? [Y/n] ').strip().lower()
-        if answer in ('', 'y', 'yes'):
-            cmd_login(None)
+    if (not token or left < need) and sys.stdin.isatty() and sys.stderr.isatty():
+        why = 'not signed in for app APIs' if not token else (
+            f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed')
+        print(f'magehand: {why}. Sign in now? [Y/n] ', end='', file=sys.stderr, flush=True)
+        if sys.stdin.readline().strip().lower() in ('', 'y', 'yes'):
+            with contextlib.redirect_stdout(sys.stderr):
+                cmd_login(None)
             token, left = api_token(below=below)
     if not token:
         die('not signed in for app APIs, or the 8 hours are up: run `magehand login` '
             '(an agent: ask the owner to run it)')
+    if left < need:
+        die(f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed (the 8 hours since '
+            'sign-in are nearly up, or authentik refused): run `magehand login` (an agent: ask the owner)')
     if left < SIGNIN_WARN:
         print(f'magehand: app-API sign-in has {minutes(left)} left; `magehand login` renews it', file=sys.stderr)
     return token, left
@@ -826,7 +834,7 @@ def api_print_token(a):
     """`magehand api token`: the access token on stdout, for your own HTTP client (like `gh auth token`). Only
     the 1-hour access token, renewed first so at least 10 minutes are left; the refresh token never leaves
     the Keychain."""
-    token, left = api_session_token(below=SIGNIN_WARN)
+    token, left = api_session_token(below=SIGNIN_WARN, need=SIGNIN_WARN)
     expires = int(time.time()) + left
     if a.json:
         print(json.dumps({'token': token, 'expires_at': expires, 'seconds_left': left}))
