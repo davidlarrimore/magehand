@@ -18,6 +18,7 @@ platform/openbao/policies/dev-read.hcl).
 import argparse
 import base64
 import colorsys
+import contextlib
 import datetime
 import difflib
 import errno
@@ -782,14 +783,14 @@ def api_signin():
     return True, 'signed in (1h, renewed while you use it, up to 8h)'
 
 
-def api_token(renew=True):
-    """(access token, seconds left) for app APIs, renewed when it runs low and the 8 hours aren't up; (None, 0)
-    when signed out or expired."""
+def api_token(renew=True, below=API_RENEW_BELOW):
+    """(access token, seconds left) for app APIs, renewed when under `below` seconds are left and the 8 hours
+    aren't up; (None, 0) when signed out or expired."""
     session, now = api_session(), int(time.time())
     expires, started = session.get('expires_at') or 0, session.get('signed_in_at') or 0
     token = secret_get('api-access-token') if expires > now else None
     # The last renewal must end by the 8-hour mark: an access token lasts an hour.
-    if renew and expires - now < API_RENEW_BELOW and now + 3600 <= started + API_SESSION_MAX:
+    if renew and expires - now < below and now + 3600 <= started + API_SESSION_MAX:
         refresh = secret_get('api-refresh-token')
         if refresh:
             status, tokens = authentik_token({'grant_type': 'refresh_token', 'refresh_token': refresh,
@@ -805,20 +806,42 @@ def api_left():
     return left if token else None
 
 
-def api_session_token():
-    """The app-API access token, or exit saying how to sign in (in a terminal, offer to sign in now)."""
-    token, left = api_token()
-    if not token and sys.stdin.isatty() and sys.stderr.isatty():
-        answer = input('magehand: not signed in for app APIs. Sign in now? [Y/n] ').strip().lower()
-        if answer in ('', 'y', 'yes'):
-            cmd_login(None)
-            token, left = api_token()
+def api_session_token(below=API_RENEW_BELOW, need=0):
+    """(app-API access token, seconds left), with at least `need` seconds left, or exit saying how to sign in. In
+    a terminal it offers to sign in now; that dialogue and the login's output go to stderr, so stdout stays the
+    command's result (a token captured by `$(magehand api token)`, a response body, JSON)."""
+    token, left = api_token(below=below)
+    if (not token or left < need) and sys.stdin.isatty() and sys.stderr.isatty():
+        why = 'not signed in for app APIs' if not token else (
+            f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed')
+        print(f'magehand: {why}. Sign in now? [Y/n] ', end='', file=sys.stderr, flush=True)
+        if sys.stdin.readline().strip().lower() in ('', 'y', 'yes'):
+            with contextlib.redirect_stdout(sys.stderr):
+                cmd_login(None)
+            token, left = api_token(below=below)
     if not token:
         die('not signed in for app APIs, or the 8 hours are up: run `magehand login` '
             '(an agent: ask the owner to run it)')
+    if left < need:
+        die(f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed (the 8 hours since '
+            'sign-in are nearly up, or authentik refused): run `magehand login` (an agent: ask the owner)')
     if left < SIGNIN_WARN:
         print(f'magehand: app-API sign-in has {minutes(left)} left; `magehand login` renews it', file=sys.stderr)
-    return token
+    return token, left
+
+
+def api_print_token(a):
+    """`magehand api token`: the access token on stdout, for your own HTTP client (like `gh auth token`). Only
+    the 1-hour access token, renewed first so at least 10 minutes are left; the refresh token never leaves
+    the Keychain."""
+    token, left = api_session_token(below=SIGNIN_WARN, need=SIGNIN_WARN)
+    expires = int(time.time()) + left
+    if a.json:
+        print(json.dumps({'token': token, 'expires_at': expires, 'seconds_left': left}))
+    else:
+        print(token)
+    print(f'magehand: app-API token, {minutes(left)} left: works on every app (dev and production) as you; '
+          "keep it out of files, logs and commits", file=sys.stderr)
 
 
 def production_exposure(name):
@@ -873,6 +896,9 @@ def signin_redirect(status, headers):
 
 
 def cmd_api(a):
+    if a.path == 'token':
+        api_print_token(a)
+        return
     if not a.path.startswith('/'):
         usage('api', f'PATH starts with /: did you mean /{a.path}?')
     name = scoped_app('api', a.app_flag, why='it would call that app as you')
@@ -904,7 +930,7 @@ def cmd_api(a):
         print(f'magehand: {method} to production: this changes {name}\'s real data, as you', file=sys.stderr)
     # Cloudflare (public production hosts) refuses Python's default User-Agent with a 403.
     headers = dict({'User-Agent': 'magehand'}, **extra)
-    headers['Authorization'] = f'Bearer {api_session_token()}'
+    headers['Authorization'] = f'Bearer {api_session_token()[0]}'
     started, deadline = time.monotonic(), time.monotonic() + a.wait
     error = None
     while True:
@@ -5725,7 +5751,9 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    `magehand api /path --json` (dev; it wakes a sleeping app; `-d` for a
    body). It needs the owner's `magehand login`: when it says you are not
    signed in, ask them to run it (you can't tap the passkey). `--prod`
-   (real data) only when the user asks for that call.
+   (real data) only when the user asks for that call. For your own HTTP
+   client (curl, a test suite): `magehand api token` prints the 1-hour token;
+   send it as `Authorization: Bearer`, and never write it to a file or log.
 8. When `magehand check` warns that AGENTS.md is behind the template, run
    `magehand update-agents`, review the diff and commit it. Never edit
    AGENTS.md above its `## This app` heading: that edit is lost.
@@ -8569,8 +8597,14 @@ def build_parser():
                 'examples:\n  magehand api /api/health\n  magehand api -a career-scout /api/jobs --json\n'
                 "  magehand api /api/items -d '{\"name\": \"x\"}'          POST, JSON\n"
                 '  magehand api /api/items/7 -X DELETE\n'
-                '  magehand api /api/import -d @items.json --prod     production: real data')
-    p.add_argument('path', metavar='PATH', help='the path on the app, from / (with any ?query)')
+                '  magehand api /api/import -d @items.json --prod     production: real data\n\n'
+                'Your own HTTP client (curl, requests, a test suite): `magehand api token` prints the access\n'
+                'token (1h, renewed first so 10+ minutes are left; the same for every app). Send it as\n'
+                '`Authorization: Bearer TOKEN` to the app\'s URL (`magehand app` lists them); get a new one\n'
+                'when it expires. Keep it out of files, logs and commits.\n'
+                '  curl -H "Authorization: Bearer $(magehand api token)" https://APP-dev.lab.davidlarrimore.com/api/x\n'
+                '  magehand api token --json                          {token, expires_at, seconds_left}')
+    p.add_argument('path', metavar='PATH', help="the path on the app, from / (with any ?query); or `token`")
     app_option(p, positional=False)
     p.add_argument('--prod', action='store_true', help='call production (default: dev)')
     p.add_argument('-X', '--method', metavar='METHOD', help='HTTP method (default: GET, or POST with --data)')
