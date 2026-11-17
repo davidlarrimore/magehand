@@ -5425,9 +5425,10 @@ class SignIn(unittest.TestCase):
     """Time left on the session: shown, warned about, and renewed in place in a terminal."""
 
     def setUp(self):
-        self.names = ('bao', 'saved_token', 'cmd_login')
+        self.names = ('bao', 'saved_token', 'cmd_login', 'api_left')
         self.saved = {n: getattr(magehand, n) for n in self.names}
         self.ttl = {'tok': 720}
+        magehand.api_left = lambda: 1500
         magehand.saved_token = lambda: 'tok'
         magehand.bao = lambda method, path, token=None, body=None, soft=False: (
             (200, {'data': {'ttl': self.ttl[token]}}) if token in self.ttl else (403, None))
@@ -5465,6 +5466,7 @@ class SignIn(unittest.TestCase):
     def test_check_json_and_signed_out(self):
         code, out, _ = self.run_main('login', '--check', '--json')
         self.assertEqual((code, json.loads(out)['seconds_left']), (0, 720))
+        self.assertEqual((json.loads(out)['api_signed_in'], json.loads(out)['api_seconds_left']), (True, 1500))
         magehand.saved_token = lambda: None
         code, out, err = self.run_main('login', '--check', '--json')
         self.assertEqual(code, 1)
@@ -5558,15 +5560,266 @@ class SignIn(unittest.TestCase):
         magehand.webbrowser.open = lambda url: True
         magehand.http.server.HTTPServer = Server
         try:
-            code, out, err = self.run_main('login', '--json')
+            with mock.patch.object(magehand, 'api_signin', lambda: (False, 'not signed in: no client')):
+                code, out, err = self.run_main('login', '--json')
         finally:
             magehand.bao, magehand.store_token, magehand.webbrowser.open, magehand.http.server.HTTPServer = saved
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 0)  # the app-API sign-in failing never fails the OpenBao one
         result = json.loads(out)  # stdout is the JSON object only; progress went to stderr
         self.assertEqual((result['signed_in'], result['email']), (True, 'me@example.com'))
+        self.assertEqual((result['api'], result['api_note']), (False, 'not signed in: no client'))
         self.assertNotIn('secret-token', out + err)
         self.assertEqual(stored, ['secret-token'])
         self.assertIn('Sign in through authentik', err)
+
+
+class AppApiSession(unittest.TestCase):
+    """The app-API tokens: kept like the OpenBao one, renewed when low, never past 8 hours from sign-in."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = {}
+        for name, value in (('STATE', pathlib.Path(self.tmp.name) / 'state'),
+                            ('secret_put', lambda account, token, what='': self.store.__setitem__(account, token)),
+                            ('secret_get', lambda account: self.store.get(account))):
+            patch = mock.patch.object(magehand, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        magehand.STATE.mkdir(parents=True)
+        self.posts = []
+
+    def session(self, started_ago, expires_in):
+        now = int(time.time())
+        magehand.api_store({'access_token': 'old-access', 'refresh_token': 'old-refresh', 'expires_in': 3600},
+                           now - started_ago)
+        data = json.loads((magehand.STATE / 'api-session.json').read_text())
+        data['expires_at'] = now + expires_in
+        (magehand.STATE / 'api-session.json').write_text(json.dumps(data))
+
+    def token(self, reply=(200, {'access_token': 'new-access', 'refresh_token': 'new-refresh', 'expires_in': 3600})):
+        def post(form):
+            self.posts.append(form)
+            return reply
+        with mock.patch.object(magehand, 'authentik_token', post):
+            return magehand.api_token()
+
+    def test_a_fresh_token_is_used_as_is(self):
+        self.session(600, 3000)
+        token, left = self.token()
+        self.assertEqual((token, self.posts), ('old-access', []))
+        self.assertGreater(left, 2900)
+
+    def test_renewed_when_low_with_the_refresh_token(self):
+        self.session(3600, 120)
+        token, left = self.token()
+        self.assertEqual(token, 'new-access')
+        self.assertEqual(self.posts, [{'grant_type': 'refresh_token', 'refresh_token': 'old-refresh',
+                                       'client_id': 'magehand'}])
+        self.assertEqual(self.store['api-refresh-token'], 'new-refresh')  # authentik rotates it
+        started = json.loads((magehand.STATE / 'api-session.json').read_text())['signed_in_at']
+        self.assertLess(started, time.time() - 3500)  # the sign-in time is kept, so the 8 hours still count
+
+    def test_not_renewed_past_eight_hours(self):
+        self.session(7 * 3600 + 60, 120)  # a renewal now would end after the 8-hour mark
+        token, _ = self.token()
+        self.assertEqual((token, self.posts), ('old-access', []))
+        self.session(8 * 3600, -5)
+        self.assertEqual(self.token(), (None, 0))
+
+    def test_expired_and_refused_is_signed_out(self):
+        self.session(3600, -5)
+        self.assertEqual(self.token(reply=(400, None)), (None, 0))
+
+    def test_signed_out_without_a_session(self):
+        self.assertEqual(self.token(), (None, 0))
+        self.assertEqual(self.posts, [])
+
+    def test_signin_skips_when_the_homelab_has_no_client(self):
+        class Page:
+            status = 400
+        opened = []
+        with mock.patch.object(magehand, 'no_redirect_open', lambda req, timeout=30: Page()), \
+                mock.patch.object(magehand, 'browser_code', lambda *a, **k: opened.append(a) or {}):
+            ok, note = magehand.api_signin()
+        self.assertFalse(ok)
+        self.assertIn('no `magehand` sign-in client', note)
+        self.assertEqual(opened, [])  # no browser left on an error page
+
+    def test_signin_uses_pkce_and_stores_both_tokens(self):
+        class Redirect:
+            status = 302
+        seen = {}
+
+        def browser(url, path, wait=300):
+            query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+            seen.update(query, path=path)
+            return {'code': 'c', 'state': query['state']}
+
+        def post(form):
+            seen['form'] = form
+            return 200, {'access_token': 'a', 'refresh_token': 'r', 'expires_in': 3600}
+        with mock.patch.object(magehand, 'no_redirect_open', lambda req, timeout=30: Redirect()), \
+                mock.patch.object(magehand, 'browser_code', browser), \
+                mock.patch.object(magehand, 'authentik_token', post), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ok, _ = magehand.api_signin()
+        self.assertTrue(ok)
+        self.assertEqual((seen['client_id'], seen['code_challenge_method'], seen['path']),
+                         ('magehand', 'S256', '/authentik/callback'))
+        verifier = seen['form']['code_verifier']
+        digest = base64.urlsafe_b64encode(__import__('hashlib').sha256(verifier.encode()).digest()).rstrip(b'=')
+        self.assertEqual(digest.decode(), seen['code_challenge'])
+        self.assertEqual((self.store['api-access-token'], self.store['api-refresh-token']), ('a', 'r'))
+
+    def test_signin_refused_in_the_browser(self):
+        class Redirect:
+            status = 302
+        with mock.patch.object(magehand, 'no_redirect_open', lambda req, timeout=30: Redirect()), \
+                mock.patch.object(magehand, 'browser_code', lambda *a, **k: {'error': 'access_denied'}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ok, note = magehand.api_signin()
+        self.assertFalse(ok)
+        self.assertIn('access_denied', note)
+
+
+class AppApi(unittest.TestCase):
+    """magehand api: the app's URL, the token as a Bearer, a sleeping dev woken, sign-in failures named."""
+
+    def setUp(self):
+        self.calls = []
+        self.replies = []
+        for name, value in (('api_session_token', lambda: 'tok'), ('app_checkout', lambda root=None: None),
+                            ('current_app', lambda root=None: 'demo'), ('api_call', self.fake_call)):
+            patch = mock.patch.object(magehand, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        sleep = mock.patch.object(magehand.time, 'sleep', lambda s: None)
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    def fake_call(self, url, method, headers, body):
+        self.calls.append((url, method, headers, body))
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        out.buffer = io.BytesIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                magehand.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code if isinstance(exit_.code, int) else 1
+                if isinstance(exit_.code, str):  # die(): Python prints the message to stderr on exit
+                    err.write(exit_.code)
+        return code, out.getvalue() + out.buffer.getvalue().decode(), err.getvalue()
+
+    def test_get_on_dev_with_the_bearer(self):
+        self.replies = [(200, {'Content-Type': 'application/json'}, b'{"ok": true}')]
+        code, out, err = self.run_main('api', '-a', 'demo', '/api/health')
+        self.assertEqual(code, 0)
+        url, method, headers, body = self.calls[0]
+        self.assertEqual((url, method, headers['Authorization'], body),
+                         ('https://demo-dev.lab.davidlarrimore.com/api/health', 'GET', 'Bearer tok', None))
+        self.assertEqual(headers['User-Agent'], 'magehand')  # Cloudflare refuses Python's default
+        self.assertIn('{"ok": true}', out)
+        self.assertNotIn('tok', err.replace('-> 200', ''))
+
+    def test_json_data_posts_as_json(self):
+        self.replies = [(201, {}, b'')]
+        code, out, _ = self.run_main('api', '-a', 'demo', '/api/items', '-d', '{"name": "x"}', '--json')
+        self.assertEqual(code, 0)
+        _, method, headers, body = self.calls[0]
+        self.assertEqual((method, headers['Content-Type'], body), ('POST', 'application/json', b'{"name": "x"}'))
+        self.assertEqual(json.loads(out)['status'], 201)
+
+    def test_a_sleeping_dev_is_woken_not_returned(self):
+        waiting = (200, {'Content-Type': 'text/html'}, b'<html><head><title>Sablier</title>')
+        self.replies = [waiting, waiting, (200, {}, b'real')]
+        code, out, err = self.run_main('api', '-a', 'demo', '/')
+        self.assertEqual((code, out.strip(), len(self.calls)), (0, 'real', 3))
+        self.assertIn('asleep', err)
+
+    def test_still_asleep_after_the_wait(self):
+        self.replies = [(200, {}, b'<title>Sablier</title>')] * 3
+        code, out, _ = self.run_main('api', '-a', 'demo', '/', '--wait', '0', '--json')
+        self.assertEqual((code, json.loads(out)['error']), (1, 'asleep'))
+
+    def test_a_redirect_to_sign_in_is_signed_out(self):
+        self.replies = [(302, {'Location': 'https://auth.davidlarrimore.com/application/o/authorize/?x=1'}, b'')]
+        code, out, err = self.run_main('api', '-a', 'demo', '/', '--json')
+        self.assertEqual((code, json.loads(out)['error']), (1, 'signed_out'))
+        self.assertIn('magehand login', err)
+
+    def test_the_apps_own_redirect_is_returned(self):
+        self.replies = [(302, {'Location': '/next'}, b'')]
+        code, out, _ = self.run_main('api', '-a', 'demo', '/old', '--json')
+        self.assertEqual((code, json.loads(out)['headers']['Location']), (0, '/next'))
+
+    def test_app_errors_exit_1_with_the_body(self):
+        self.replies = [(422, {}, b'{"detail": "bad"}')]
+        code, out, _ = self.run_main('api', '-a', 'demo', '/api/x', '--json')
+        self.assertEqual((code, json.loads(out)['body']), (1, {'detail': 'bad'}))
+
+    def test_unreachable_lab_names_the_home_network(self):
+        self.replies = [urllib.error.URLError(OSError('no route'))]
+        with mock.patch.object(magehand, 'local_network_blocked', lambda e=None: False):
+            code, out, err = self.run_main('api', '-a', 'demo', '/', '--json')
+        self.assertEqual((code, json.loads(out)['error']), (1, 'unreachable'))
+        self.assertIn('home network', err)
+
+    def test_production_url_follows_the_register(self):
+        for exposure, host in (('external', 'demo.davidlarrimore.com'), ('internal', 'demo.lab.davidlarrimore.com')):
+            self.calls, self.replies = [], [(200, {}, b'')]
+            text = f'demo:\n  exposure: {exposure}\n'
+            with mock.patch.object(magehand, 'file_at', lambda repo, path, ref: (text, None)):
+                code, _, err = self.run_main('api', '-a', 'demo', '/x', '--prod', '-X', 'delete')
+            self.assertEqual((code, self.calls[0][0], self.calls[0][1]), (0, f'https://{host}/x', 'DELETE'))
+            self.assertIn('production', err)
+
+    def test_not_in_production(self):
+        with mock.patch.object(magehand, 'file_at', lambda repo, path, ref: ('other:\n  exposure: internal\n', None)):
+            code, _, err = self.run_main('api', '-a', 'demo', '/x', '--prod')
+        self.assertEqual((code, self.calls), (1, []))
+        self.assertIn('not in production', err)
+
+    def test_usage_errors(self):
+        for argv, why in ((('api', '-a', 'demo', 'api/x'), 'did you mean /api/x'),
+                          (('api', '-a', 'demo', '/x', '-H', 'Authorization: Bearer mine'), 'set by the platform'),
+                          (('api', '-a', 'demo', '/x', '-H', 'nocolon'), 'Name: value'),
+                          (('api', '-a', 'demo', '/x', '-H', 'host: other-dev.lab.davidlarrimore.com'), 'Host is'),
+                          (('api', '-a', 'demo', '/x', '-H', 'HOST: demo.davidlarrimore.com'), 'Host is'),
+                          (('api', '-a', 'example.com/', '/'), 'not an app name'),
+                          (('api', '-a', 'demo@example.com', '/'), 'not an app name'),
+                          (('api', '-a', 'Demo', '/'), 'not an app name')):
+            code, _, err = self.run_main(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn(why, err)
+        self.assertEqual(self.calls, [])
+
+    def test_bad_input_never_reads_the_token(self):
+        read = []
+        with mock.patch.object(magehand, 'api_session_token', lambda: read.append(1) or 'tok'):
+            for argv in (('api', '-a', 'example.com/', '/'), ('api', '-a', 'demo', '/', '-H', 'Host: x')):
+                self.assertEqual(self.run_main(*argv)[0], 2)
+        self.assertEqual((read, self.calls), ([], []))
+
+    def test_the_url_stays_on_the_apps_host(self):
+        self.replies = [(200, {}, b'')] * 2
+        for path in ('//example.com/x', '/@example.com'):
+            self.assertEqual(self.run_main('api', '-a', 'demo', path)[0], 0)
+        self.assertEqual({urllib.parse.urlsplit(c[0]).hostname for c in self.calls},
+                         {'demo-dev.lab.davidlarrimore.com'})
+
+    def test_in_an_app_checkout_only_that_app(self):
+        with mock.patch.object(magehand, 'app_checkout', lambda root=None: 'mine'):
+            code, _, err = self.run_main('api', '-a', 'other', '/x')
+        self.assertEqual((code, self.calls), (1, []))
+        self.assertIn("mine's code", err)
 
 
 class Status(unittest.TestCase):
