@@ -6,8 +6,11 @@
 - One module, `src/magehand/cli.py`: stdlib plus PyYAML, Python 3.9+ (no
   `match`, no `X | Y` types).
 - It reads and runs locally; it never deploys or changes the homelab's
-  configuration. Keep every network call to GitHub and `*.lab`, with one
-  scoped exception: `magehand bucket` talks to the S3 endpoint the platform
+  configuration. Keep every network call to GitHub and `*.lab`, with two
+  scoped exceptions: `magehand login` and `api` talk to authentik's sign-in
+  host (`MAGEHAND_AUTHENTIK`) for the app-API tokens, and `magehand api`
+  calls the app's own public production host when it is `exposure:
+  external`. And one more: `magehand bucket` talks to the S3 endpoint the platform
   hands the app for *its own* bucket (R2 for dev and prod, the local
   Garage for `--env local`), because that is where the app's data is.
   `check --ui` runs CI's browser check in containers: the runtime pulls the
@@ -31,6 +34,9 @@
   `magehand bucket cp` / `sync`, which put objects into that app's own
   bucket only (the app of the checkout you are in; `--app` may only name it), on an explicit command, with the keys of the environment
   asked for (`--env prod` writes production data), and never delete.
+  `magehand api` sends the one request it is given to the app's dev URL, or
+  with `--prod` its production URL, as the owner (a non-GET changes the
+  app's data; it says so for production).
 - Secrets never touch argv (`-e NAME` for docker; the token goes to the
   Keychain on stdin, `security -i`) and never touch disk, except the token's
   0600 file off macOS, where the standard library has no credential store.

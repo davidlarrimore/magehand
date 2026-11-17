@@ -489,28 +489,43 @@ TOKEN_CHARS = re.compile(r'^[A-Za-z0-9._~+/=-]+$')  # what an OpenBao token is m
 _warned_env = []
 
 
-def keychain_add(token):
+def keychain_add(token, account='openbao-token', what='OpenBao'):
     """Put the token in the macOS Keychain without it ever being an argument: `security -i` reads the
     command from stdin, so `ps` never shows the token."""
     if not TOKEN_CHARS.match(token):
-        die('OpenBao returned a token in a form magehand will not store; sign in again: magehand login')
-    command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a openbao-token -w {token}\n'
+        die(f'{what} returned a token in a form magehand will not store; sign in again: magehand login')
+    command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w {token}\n'
     subprocess.run(['security', '-i'], input=command, text=True,  # nosec B603 B607
                    check=True, capture_output=True)
 
 
-def store_token(token, identity):
+def secret_put(account, token, what='OpenBao'):
+    """Keep a token: the Keychain on macOS, else a file in STATE only its owner can read."""
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     STATE.chmod(0o700)  # an older release made it world-readable
     if sys.platform == 'darwin':
-        keychain_add(token)
-    else:
-        # No credential store in the standard library: a file only its owner can read, never created wider.
-        path = STATE / 'openbao-token'
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w') as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(token)
+        keychain_add(token, account, what)
+        return
+    if not TOKEN_CHARS.match(token):
+        die(f'{what} returned a token in a form magehand will not store; sign in again: magehand login')
+    # No credential store in the standard library: a file only its owner can read, never created wider.
+    fd = os.open(STATE / account, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(token)
+
+
+def secret_get(account):
+    if sys.platform == 'darwin':
+        out = subprocess.run(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE,  # nosec B603 B607
+                              '-a', account, '-w'], capture_output=True, text=True)
+        return out.stdout.strip() if out.returncode == 0 else None
+    path = STATE / account
+    return path.read_text().strip() if path.is_file() else None
+
+
+def store_token(token, identity):
+    secret_put('openbao-token', token)
     (STATE / 'identity.json').write_text(json.dumps(identity))
 
 
@@ -521,12 +536,7 @@ def saved_token():
             print('magehand: MAGEHAND_BAO_TOKEN is deprecated and will be ignored in 1.0; '
                   'unset it and sign in with `magehand login`', file=sys.stderr)
         return os.environ['MAGEHAND_BAO_TOKEN']
-    if sys.platform == 'darwin':
-        out = subprocess.run(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE,  # nosec B603 B607
-                              '-a', 'openbao-token', '-w'], capture_output=True, text=True)
-        return out.stdout.strip() if out.returncode == 0 else None
-    path = STATE / 'openbao-token'
-    return path.read_text().strip() if path.is_file() else None
+    return secret_get('openbao-token')
 
 
 SIGNIN_WARN = 600  # seconds: warn when the session has less than this left
@@ -599,30 +609,28 @@ def login_check(a):
     left = renewed(token, signin_left(token)) if token else None
     need = a.min * 60
     ok = left is not None and left >= need
+    api = api_left() if left is not None else None
     if a.json:
-        print(json.dumps({'signed_in': left is not None, 'seconds_left': left or 0, 'min_minutes': a.min, 'ok': ok}))
+        print(json.dumps({'signed_in': left is not None, 'seconds_left': left or 0, 'min_minutes': a.min, 'ok': ok,
+                          'api_signed_in': api is not None, 'api_seconds_left': api or 0}))
     elif left is None:
         print('magehand: not signed in: run `magehand login`', file=sys.stderr)
     else:
         print(f'signed in, {minutes(left)} left' + ('' if ok else f' (less than {a.min} min): run `magehand login`'))
+        print('app APIs: ' + (f'{minutes(api)} left' if api is not None else 'signed out (`magehand login`)'),
+              file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
-def cmd_login(args):
-    """Sign in through authentik; returns the new token (kept in the Keychain, never printed)."""
-    if getattr(args, 'check', False):
-        login_check(args)
-    as_json = getattr(args, 'json', False)
-    status, body = bao('POST', 'auth/oidc/oidc/auth_url', body={'role': 'dev', 'redirect_uri': CALLBACK})
-    url = ((body or {}).get('data') or {}).get('auth_url')
-    if status != 200 or not url:
-        die(f'OpenBao gave no login URL (HTTP {status}); is the `dev` OIDC role set up? (scripts/setup-openbao.py)')
+def browser_code(url, path, wait=300):
+    """Open `url` in the browser and wait for authentik to send it back to http://localhost:8250`path`: the
+    callback's query parameters ({} when it timed out)."""
     params = {}
 
     class Callback(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path != '/oidc/callback':
+            if parsed.path != path:
                 self.send_response(404)
                 self.end_headers()
                 return
@@ -637,11 +645,24 @@ def cmd_login(args):
 
     with http.server.HTTPServer(('localhost', 8250), Callback) as server:
         server.timeout = 5
-        print('Sign in through authentik in your browser (passkey)...', file=sys.stderr)
         webbrowser.open(url)
-        deadline = time.monotonic() + 300
-        while 'code' not in params and time.monotonic() < deadline:
+        deadline = time.monotonic() + wait
+        while not params and time.monotonic() < deadline:
             server.handle_request()
+    return params
+
+
+def cmd_login(args):
+    """Sign in through authentik; returns the new token (kept in the Keychain, never printed)."""
+    if getattr(args, 'check', False):
+        login_check(args)
+    as_json = getattr(args, 'json', False)
+    status, body = bao('POST', 'auth/oidc/oidc/auth_url', body={'role': 'dev', 'redirect_uri': CALLBACK})
+    url = ((body or {}).get('data') or {}).get('auth_url')
+    if status != 200 or not url:
+        die(f'OpenBao gave no login URL (HTTP {status}); is the `dev` OIDC role set up? (scripts/setup-openbao.py)')
+    print('Sign in through authentik in your browser (passkey)...', file=sys.stderr)
+    params = browser_code(url, '/oidc/callback')
     if 'code' not in params:
         die('sign-in timed out or was refused')
     query = urllib.parse.urlencode({k: params[k] for k in ('state', 'code') if k in params})
@@ -655,13 +676,281 @@ def cmd_login(args):
            'name': meta.get('name') or email.split('@')[0], 'groups': 'homelab-admins'}
     store_token(auth['client_token'], who)
     lease = auth.get('lease_duration', 3600)
+    api_ok, api_note = api_signin()
     if as_json:
         print(json.dumps({'signed_in': True, 'email': email, 'policies': auth.get('policies', []),
-                          'seconds_left': lease}))
+                          'seconds_left': lease, 'api': api_ok, 'api_note': api_note}))
     else:
         print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {lease // 3600}h; '
               'renewed while you use magehand, up to 8h after this sign-in).')
+        print(f'App APIs (magehand api): {api_note}')
     return auth['client_token']
+
+
+# --- App APIs (authentik client `magehand`: homelab platform/authentik/blueprints/magehand.yaml) -----------
+# `magehand login` signs in to authentik a second time, as magehand's own client, right after the OpenBao
+# sign-in (same browser, step-up just done: no second passkey tap). The access token goes to apps as
+# `Authorization: Bearer` through their forward auth, which accepts it; the app sees the owner's usual
+# X-authentik-* headers. Tokens live in the Keychain; STATE/api-session.json holds only times.
+
+AUTHENTIK = os.environ.get('MAGEHAND_AUTHENTIK', 'https://auth.davidlarrimore.com')
+API_CLIENT = 'magehand'
+API_CALLBACK_PATH = '/authentik/callback'
+API_CALLBACK = 'http://localhost:8250' + API_CALLBACK_PATH
+API_SESSION_MAX = 8 * 3600  # like the OpenBao session: renewed while used, never past 8h from sign-in
+API_RENEW_BELOW = 300       # seconds left on the access token below which it is renewed
+API_SIGNIN_WAIT = 60        # the second sign-in should pass by itself; don't keep the person waiting
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def no_redirect_open(req, timeout=30):
+    """urlopen that returns 3xx responses instead of following them (an HTTPError carrying the response)."""
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        return opener.open(req, timeout=timeout)  # nosec B310  # https URLs magehand builds
+    except urllib.error.HTTPError as error:
+        return error
+
+
+def authentik_token(form):
+    """POST to authentik's token endpoint: (status, body)."""
+    req = urllib.request.Request(f'{AUTHENTIK}/application/o/token/', method='POST',
+                                 data=urllib.parse.urlencode(form).encode(),
+                                 headers={'Content-Type': 'application/x-www-form-urlencoded',
+                                          'User-Agent': 'magehand'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310  # the homelab's authentik (https)
+            return resp.status, json.loads(resp.read() or b'{}')
+    except urllib.error.HTTPError as error:
+        return error.code, None
+    except (OSError, ValueError):
+        return 0, None
+
+
+def api_session():
+    path = STATE / 'api-session.json'
+    try:
+        data = json.loads(path.read_text()) if path.is_file() else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def api_store(tokens, signed_in_at):
+    if not tokens.get('access_token') or not tokens.get('refresh_token'):
+        return False
+    secret_put('api-access-token', tokens['access_token'], 'authentik')
+    secret_put('api-refresh-token', tokens['refresh_token'], 'authentik')
+    expires = int(time.time()) + int(tokens.get('expires_in') or 3600)
+    (STATE / 'api-session.json').write_text(json.dumps({'signed_in_at': signed_in_at, 'expires_at': expires}))
+    return True
+
+
+def api_signin():
+    """Sign in to authentik as magehand's client (PKCE). (True, note) or (False, why): a failure never fails
+    `magehand login`, whose OpenBao session stands on its own."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+    state = secrets.token_urlsafe(16)
+    url = f'{AUTHENTIK}/application/o/authorize/?' + urllib.parse.urlencode({
+        'client_id': API_CLIENT, 'response_type': 'code', 'redirect_uri': API_CALLBACK,
+        'scope': 'openid email profile offline_access', 'state': state,
+        'code_challenge': challenge, 'code_challenge_method': 'S256'})
+    # A known client answers with a redirect into the sign-in flow; an unknown one (a homelab without the
+    # client yet) with an error page the browser would sit on. Ask first.
+    try:
+        probe = no_redirect_open(urllib.request.Request(url, headers={'User-Agent': 'magehand'}), timeout=15)
+        known = probe.status in (301, 302, 303, 307, 308)
+    except OSError:
+        return False, f'not signed in: cannot reach {AUTHENTIK}'
+    if not known:
+        return False, "not signed in: the homelab has no `magehand` sign-in client yet"
+    print('Signing in for app APIs (should pass by itself)...', file=sys.stderr)
+    params = browser_code(url, API_CALLBACK_PATH, wait=API_SIGNIN_WAIT)
+    if params.get('state') != state or 'code' not in params:
+        return False, ('not signed in: ' + (params.get('error_description') or params.get('error')
+                                             or 'the browser did not come back') + '; run `magehand login` again')
+    status, tokens = authentik_token({'grant_type': 'authorization_code', 'code': params['code'],
+                                      'redirect_uri': API_CALLBACK, 'client_id': API_CLIENT,
+                                      'code_verifier': verifier})
+    if status != 200 or not api_store(tokens or {}, int(time.time())):
+        return False, f'not signed in: authentik refused the token (HTTP {status})'
+    return True, 'signed in (1h, renewed while you use it, up to 8h)'
+
+
+def api_token(renew=True):
+    """(access token, seconds left) for app APIs, renewed when it runs low and the 8 hours aren't up; (None, 0)
+    when signed out or expired."""
+    session, now = api_session(), int(time.time())
+    expires, started = session.get('expires_at') or 0, session.get('signed_in_at') or 0
+    token = secret_get('api-access-token') if expires > now else None
+    # The last renewal must end by the 8-hour mark: an access token lasts an hour.
+    if renew and expires - now < API_RENEW_BELOW and now + 3600 <= started + API_SESSION_MAX:
+        refresh = secret_get('api-refresh-token')
+        if refresh:
+            status, tokens = authentik_token({'grant_type': 'refresh_token', 'refresh_token': refresh,
+                                              'client_id': API_CLIENT})
+            if status == 200 and api_store(tokens or {}, started):
+                return api_token(renew=False)
+    return (token, expires - now) if token else (None, 0)
+
+
+def api_left():
+    """Seconds left on the app-API sign-in (renewing it), or None when signed out."""
+    token, left = api_token()
+    return left if token else None
+
+
+def api_session_token():
+    """The app-API access token, or exit saying how to sign in (in a terminal, offer to sign in now)."""
+    token, left = api_token()
+    if not token and sys.stdin.isatty() and sys.stderr.isatty():
+        answer = input('magehand: not signed in for app APIs. Sign in now? [Y/n] ').strip().lower()
+        if answer in ('', 'y', 'yes'):
+            cmd_login(None)
+            token, left = api_token()
+    if not token:
+        die('not signed in for app APIs, or the 8 hours are up: run `magehand login` '
+            '(an agent: ask the owner to run it)')
+    if left < SIGNIN_WARN:
+        print(f'magehand: app-API sign-in has {minutes(left)} left; `magehand login` renews it', file=sys.stderr)
+    return token
+
+
+def production_exposure(name):
+    """'internal' or 'external' from homelab's production register, or exit when the app isn't in it."""
+    text, err = file_at(f'{OWNER}/homelab', 'platform/prod-apps/apps.yaml', 'main')
+    if err:
+        die(f'cannot read the production register: {err}')
+    try:
+        entry = (yaml.safe_load(text or '') or {}).get(name)
+    except (yaml.YAMLError, AttributeError):
+        die('platform/prod-apps/apps.yaml is not valid YAML')
+    if not isinstance(entry, dict):
+        die(f'{name} is not in production (homelab platform/prod-apps/apps.yaml); drop --prod to call dev')
+    return 'external' if entry.get('exposure') == 'external' else 'internal'
+
+
+def api_base(name, prod):
+    if not prod:
+        return f'https://{name}-dev.{LAB}'
+    return f'https://{name}.davidlarrimore.com' if production_exposure(name) == 'external' else f'https://{name}.{LAB}'
+
+
+SABLIER_PAGE = re.compile(rb'<title>[^<]*sablier', re.I)  # dev's waiting page while the app wakes (a 200)
+
+
+def api_body(data):
+    if data is None:
+        return None
+    if data == '@-':
+        return sys.stdin.buffer.read()
+    if data.startswith('@'):
+        try:
+            return pathlib.Path(data[1:]).read_bytes()
+        except OSError as error:
+            usage('api', f'cannot read {data[1:]}: {error.strerror}')
+    return data.encode()
+
+
+def api_call(url, method, headers, body):
+    """One request without following redirects: (status, headers, body bytes)."""
+    req = urllib.request.Request(url, method=method, headers=headers, data=body)
+    resp = no_redirect_open(req, timeout=60)
+    with resp:
+        return resp.status if hasattr(resp, 'status') else resp.code, dict(resp.headers.items()), resp.read()
+
+
+def signin_redirect(status, headers):
+    """Whether a response is forward auth sending the client to sign in (the token was not accepted)."""
+    where = headers.get('Location') or headers.get('location') or ''
+    return 300 <= status < 400 and ('/application/o/authorize' in where or 'outpost.goauthentik.io' in where
+                                    or where.startswith(AUTHENTIK))
+
+
+def cmd_api(a):
+    if not a.path.startswith('/'):
+        usage('api', f'PATH starts with /: did you mean /{a.path}?')
+    name = scoped_app('api', a.app_flag, why='it would call that app as you')
+    extra = {}
+    for item in a.header or []:
+        key, sep, value = item.partition(':')
+        if not sep or not key.strip():
+            usage('api', f'a header is "Name: value", not {item!r}')
+        if key.strip().lower() == 'authorization' or key.strip().lower().startswith('x-authentik-'):
+            usage('api', f'{key.strip()} is set by the platform from your sign-in; leave it out')
+        extra[key.strip()] = value.strip()
+    body = api_body(a.data)
+    method = (a.method or ('POST' if body is not None else 'GET')).upper()
+    if body is not None and not any(k.lower() == 'content-type' for k in extra):
+        try:
+            json.loads(body)
+            extra['Content-Type'] = 'application/json'
+        except ValueError:
+            pass
+    url = api_base(name, a.prod) + a.path
+    if a.prod and method not in ('GET', 'HEAD', 'OPTIONS'):
+        print(f'magehand: {method} to production: this changes {name}\'s real data, as you', file=sys.stderr)
+    # Cloudflare (public production hosts) refuses Python's default User-Agent with a 403.
+    headers = dict({'User-Agent': 'magehand'}, **extra)
+    headers['Authorization'] = f'Bearer {api_session_token()}'
+    started, deadline = time.monotonic(), time.monotonic() + a.wait
+    error = None
+    while True:
+        try:
+            status, got, data = api_call(url, method, headers, body)
+        except OSError as failed:
+            on_lab = urllib.parse.urlparse(url).hostname.endswith(LAB)
+            why = (f'{LOCAL_NETWORK}: {local_network_step()}' if local_network_blocked(failed)
+                   else 'the *.lab names work only on the home network (or its VPN)' if on_lab
+                   else str(getattr(failed, 'reason', failed)))
+            status, got, data, error = 0, {}, b'', 'unreachable'
+            print(f'magehand: cannot reach {url}: {why}', file=sys.stderr)
+            break
+        asleep = not a.prod and status == 200 and SABLIER_PAGE.search(data[:4096])
+        if not asleep:
+            break
+        if time.monotonic() >= deadline:
+            error = 'asleep'
+            print(f'magehand: {name}-dev is still waking after {a.wait}s; try again shortly (or --wait more)',
+                  file=sys.stderr)
+            break
+        if not error:
+            print(f'magehand: {name}-dev was asleep; waking it...', file=sys.stderr)
+            error = 'waking'
+        time.sleep(5)
+    if error == 'waking':
+        error = None
+    if not error and signin_redirect(status, got):
+        error = 'signed_out'
+        print('magehand: the app did not accept your sign-in (it sent you to sign in); run `magehand login`',
+              file=sys.stderr)
+    elif not error and status == 403 and not data.strip().startswith((b'{', b'[')):
+        print(f'magehand: 403 from the platform: your user may not be allowed on {name}', file=sys.stderr)
+    ok = not error and 200 <= status < 400
+    took = time.monotonic() - started
+    if a.json:
+        text = data.decode('utf-8', 'replace')
+        try:
+            parsed = json.loads(text) if text.strip() else None
+        except ValueError:
+            parsed = text
+        keep = ('Content-Type', 'Location', 'Retry-After')
+        print(json.dumps({'ok': ok, 'status': status, 'method': method, 'url': url, 'error': error,
+                          'headers': {k: v for k, v in got.items() if k.title() in keep},
+                          'body': parsed}))
+    else:
+        print(f'magehand: {method} {url} -> {status or "no answer"} ({took:.1f}s)', file=sys.stderr)
+        if data:
+            sys.stdout.buffer.write(data)
+            if not data.endswith(b'\n') and sys.stdout.isatty():
+                sys.stdout.buffer.write(b'\n')
+            sys.stdout.flush()
+    sys.exit(0 if ok else 1)
 
 
 # --- guide and app --------------------------------------------------------------
@@ -7964,7 +8253,7 @@ def cmd_job(a):
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new', 'icon')),
-          ('learn the platform and check an app', ('guide', 'app', 'status', 'check')),
+          ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'api')),
           ('ship an app', ('pr', 'release', 'job', 'fetch')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'upgrade')))
@@ -7973,7 +8262,7 @@ GROUPS = (('start an app', ('new', 'icon')),
 PLUMBING = ('update-agents', 'skill', 'version', 'help')
 # Commands whose output is the result itself (data, or your own command's output): no `next:` line. Every
 # other command ends its human output with next_line() and puts "next" in its --json.
-NO_NEXT = ('guide', 'run', 'bucket', 'runtime', 'login', 'skill', 'version', 'help')
+NO_NEXT = ('guide', 'run', 'bucket', 'runtime', 'login', 'api', 'skill', 'version', 'help')
 SHORT = {}
 
 
@@ -8247,7 +8536,7 @@ def build_parser():
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
     json_option(p)
     # run it locally
-    p = command('login', cmd_login, 'sign in to OpenBao with your passkey', 'sign in to OpenBao through authentik with your passkey (1h, renewed up to 8h)',
+    p = command('login', cmd_login, 'sign in to OpenBao and app APIs with your passkey', 'sign in through authentik with your passkey: OpenBao (keys for `run`) and app APIs (`api`); 1h, renewed up to 8h',
                 'One sign-in per machine, for every app. The session is an hour, renewed by itself while you use\n'
                 'magehand (when under 30 minutes are left), up to 8 hours after you signed in: about one passkey\n'
                 'tap a working day. Commands that need it show the time left and, in a terminal, offer to sign\n'
@@ -8257,6 +8546,26 @@ def build_parser():
     p.add_argument('--check', action='store_true', help='only report the time left (exit 1 when signed out or low)')
     p.add_argument('--min', type=int, default=SIGNIN_WARN // 60, metavar='N',
                    help='with --check: minutes that must remain (default: %(default)s)')
+    json_option(p)
+    p = command('api', cmd_api, "call the app's API on dev or production, as you",
+                "send one HTTP request to the app's dev (or --prod) URL, signed in as you (`magehand login`)",
+                'The request goes through the platform\'s sign-in like your browser: the app sees you in its\n'
+                'X-authentik-* headers. A sleeping dev app is woken first (its waiting page is never the answer).\n'
+                'The body goes to stdout and a status line to stderr; exit 0 on 2xx/3xx, 1 otherwise (--json\n'
+                'says why: signed_out, asleep, unreachable). Redirects are not followed. In an app\'s checkout it\n'
+                'calls that app only. *.lab hosts need the home network.\n\n'
+                'examples:\n  magehand api /api/health\n  magehand api -a career-scout /api/jobs --json\n'
+                "  magehand api /api/items -d '{\"name\": \"x\"}'          POST, JSON\n"
+                '  magehand api /api/items/7 -X DELETE\n'
+                '  magehand api /api/import -d @items.json --prod     production: real data')
+    p.add_argument('path', metavar='PATH', help='the path on the app, from / (with any ?query)')
+    app_option(p, positional=False)
+    p.add_argument('--prod', action='store_true', help='call production (default: dev)')
+    p.add_argument('-X', '--method', metavar='METHOD', help='HTTP method (default: GET, or POST with --data)')
+    p.add_argument('-d', '--data', metavar='DATA', help='request body: text, @FILE or @- for stdin')
+    p.add_argument('-H', '--header', action='append', metavar='"NAME: VALUE"', help='an extra header (repeatable)')
+    p.add_argument('--wait', type=int, default=120, metavar='SECONDS',
+                   help='how long to wait for a sleeping dev app (default: %(default)s)')
     json_option(p)
     p = command('dev', cmd_dev, 'local postgres/redis/bucket blocks: up, down, status', "start, stop or show local containers for the app's postgres/redis/bucket blocks",
                 'Also makes local values for secret blocks. llm keys need nothing here: they come from\n'
