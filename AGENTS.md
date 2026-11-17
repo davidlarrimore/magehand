@@ -40,6 +40,9 @@
 - Secrets never touch argv (`-e NAME` for docker; the token goes to the
   Keychain on stdin, `security -i`) and never touch disk, except the token's
   0600 file off macOS, where the standard library has no credential store.
+  The one secret magehand prints is the 1-hour app-API access token, on an
+  explicit `magehand api token` (like `gh auth token`); never the refresh
+  token or the OpenBao token.
 - `check` rules: each is a mistake an app can make about the platform, with a
   guide section to point at (`see`) and a unit test. Errors only for what
   certainly breaks; anything heuristic is a warning. When the platform changes

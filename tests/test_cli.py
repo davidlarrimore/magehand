@@ -5610,6 +5610,13 @@ class AppApiSession(unittest.TestCase):
         self.assertEqual((token, self.posts), ('old-access', []))
         self.assertGreater(left, 2900)
 
+    def test_a_caller_can_ask_for_more_time_left(self):
+        self.session(600, 500)  # 8 min left: fine for a request, too little for a printed token
+        self.assertEqual(self.token()[0], 'old-access')
+        with mock.patch.object(magehand, 'authentik_token', lambda form: self.posts.append(form) or
+                               (200, {'access_token': 'new-access', 'refresh_token': 'r2', 'expires_in': 3600})):
+            self.assertEqual(magehand.api_token(below=600)[0], 'new-access')
+
     def test_renewed_when_low_with_the_refresh_token(self):
         self.session(3600, 120)
         token, left = self.token()
@@ -5689,7 +5696,8 @@ class AppApi(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.replies = []
-        for name, value in (('api_session_token', lambda: 'tok'), ('app_checkout', lambda root=None: None),
+        self.real_session_token = magehand.api_session_token
+        for name, value in (('api_session_token', lambda below=300: ('tok', 3000)), ('app_checkout', lambda root=None: None),
                             ('current_app', lambda root=None: 'demo'), ('api_call', self.fake_call)):
             patch = mock.patch.object(magehand, name, value)
             patch.start()
@@ -5803,10 +5811,31 @@ class AppApi(unittest.TestCase):
 
     def test_bad_input_never_reads_the_token(self):
         read = []
-        with mock.patch.object(magehand, 'api_session_token', lambda: read.append(1) or 'tok'):
+        with mock.patch.object(magehand, 'api_session_token', lambda below=300: read.append(1) or ('tok', 3000)):
             for argv in (('api', '-a', 'example.com/', '/'), ('api', '-a', 'demo', '/', '-H', 'Host: x')):
                 self.assertEqual(self.run_main(*argv)[0], 2)
         self.assertEqual((read, self.calls), ([], []))
+
+    def test_token_prints_only_the_token(self):
+        asked = []
+        with mock.patch.object(magehand, 'api_session_token', lambda below=300: asked.append(below) or ('tok', 2400)):
+            code, out, err = self.run_main('api', 'token')
+            self.assertEqual((code, out, asked), (0, 'tok\n', [600]))  # renewed first when under 10 min
+            self.assertIn('40 min left', err)
+            self.assertNotIn('tok', err.replace('token', ''))
+            code, out, _ = self.run_main('api', 'token', '--json')
+        result = json.loads(out)
+        self.assertEqual((code, result['token'], result['seconds_left']), (0, 'tok', 2400))
+        self.assertAlmostEqual(result['expires_at'], time.time() + 2400, delta=5)
+        self.assertEqual(self.calls, [])  # nothing sent anywhere
+
+    def test_token_when_signed_out(self):
+        with mock.patch.object(magehand, 'api_session_token', self.real_session_token), \
+                mock.patch.object(magehand, 'api_token', lambda renew=True, below=300: (None, 0)), \
+                mock.patch.object(magehand.sys.stdin, 'isatty', lambda: False):
+            code, out, err = self.run_main('api', 'token')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('magehand login', err)
 
     def test_the_url_stays_on_the_apps_host(self):
         self.replies = [(200, {}, b'')] * 2
