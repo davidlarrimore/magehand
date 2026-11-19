@@ -2603,7 +2603,8 @@ class AppNameOverride(unittest.TestCase):
         # verify's record) passed a rename CI rejects. Here the registrations come from GitHub, at one commit.
         probe, calls = self.gh_registry({'old-name': 'source: {repo: lab-website}\nservices: {}\n'})
         with mock.patch.object(magehand, 'APPS_DIR', None), mock.patch.object(magehand, 'gh_probe', probe), \
-                tempfile.TemporaryDirectory() as tmp:
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: None), \
+                tempfile.TemporaryDirectory() as tmp:  # github_file: new-name itself isn't registered (no network)
             errors = texts(magehand.check_app_name(self.load(tmp, 'app: new-name\nservices: {}\n', name='new-name')),
                            'error')
         self.assertTrue(any('registered as the app old-name' in e for e in errors), errors)
