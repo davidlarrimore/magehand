@@ -2578,24 +2578,30 @@ class AppNameOverride(unittest.TestCase):
             errors = texts(magehand.check_app_name(self.load(tmp, 'services: {}\n', name='lab-website')), 'error')
         self.assertTrue(any('registered as the app lab' in e and 'restore `app: lab`' in e for e in errors), errors)
 
-    def gh_registry(self, files, sha='c' * 40, fail=()):
-        """A gh_probe that answers homelab-apps' main at `sha`, apps/ at it, and each apps/<name>/app.yaml at it
-        (HTTP 503 for those in `fail`); anything at another ref is an error, so a test sees reads stay on one commit."""
+    def gh_registry(self, files, sha='c' * 40, fail=(), tree_fails=False):
+        """A gh_probe for homelab-apps at one commit: main at `sha`, its git tree (apps/<name>/app.yaml per entry in
+        `files`), and each manifest's blob (HTTP 404 for those in `fail`: on a private repo that is how lost access
+        looks). A read at another commit is an error, so a test sees reads stay on one commit."""
         calls = []
+        blobs = {f'blob-{name}': text for name, text in files.items()}
 
         def probe(*args):
             calls.append(args)
             path = next(a for a in args if a.startswith('repos/'))
             if path == f'repos/{magehand.APPS_REPO}/commits/main':
                 return 0, sha + '\n', ''
-            m = re.match(rf'repos/{re.escape(magehand.APPS_REPO)}/contents/apps(?:/([^/]+)/app\.yaml)?\?ref=(\w+)$', path)
-            if not m or m.group(2) != sha:
-                return 1, '', f'unexpected read: {path}'
-            if m.group(1) is None:
-                return 0, json.dumps([{'name': n} for n in sorted(files)]), ''
-            if m.group(1) in fail:
-                return 1, '', 'HTTP 503: Service Unavailable'
-            return 0, files[m.group(1)], ''
+            if path == f'repos/{magehand.APPS_REPO}/git/trees/{sha}?recursive=1':
+                if tree_fails:
+                    return 1, '', 'HTTP 404: Not Found'
+                items = [{'path': f'apps/{n}/app.yaml', 'type': 'blob', 'sha': f'blob-{n}'} for n in sorted(files)]
+                return 0, json.dumps({'tree': items + [{'path': 'apps/x/README.md', 'type': 'blob', 'sha': 'r'}],
+                                      'truncated': False}), ''
+            m = re.fullmatch(rf'repos/{re.escape(magehand.APPS_REPO)}/git/blobs/(blob-(.+))', path)
+            if m:
+                if m.group(2) in fail:
+                    return 1, '', 'HTTP 404: Not Found'
+                return 0, json.dumps({'content': base64.b64encode(blobs[m.group(1)].encode()).decode()}), ''
+            return 1, '', f'unexpected read: {path}'
         return probe, calls
 
     def test_a_rename_is_caught_without_a_homelab_apps_checkout(self):
@@ -2611,10 +2617,13 @@ class AppNameOverride(unittest.TestCase):
         self.assertFalse(any('unexpected read' in str(c) for c in calls))
 
     def test_unreadable_registrations_fail_only_strict(self):
-        # A listing that works, then one entry that doesn't (magehand#110's review: a cached copy of it named another
-        # repo and the strict check passed): unreadable, never the cache.
+        # A listing that works, then one entry that doesn't (magehand#110's reviews: a cached copy of it named another
+        # repo, and a 404, which on a private repo can mean lost access, read as "not a registration"): unreadable.
         files = {'lab': 'source: {repo: lab-website}\nservices: {}\n', 'old-name': 'source: {repo: lab-website}\n'}
         probe, _ = self.gh_registry(files, fail=('old-name',))
+        lost, _ = self.gh_registry(files, tree_fails=True)  # the listing itself: a 404 is not "no apps"
+        with mock.patch.object(magehand, 'APPS_DIR', None), mock.patch.object(magehand, 'gh_probe', lost):
+            self.assertIsNone(magehand.registered_apps())
         cached = mock.patch.object(magehand, 'github_file', lambda *a, **k: 'source: {repo: someone-else}\n')
         for strict, expected in ((True, 1), (False, 0)):
             with mock.patch.object(magehand, 'APPS_DIR', None), mock.patch.object(magehand, 'CHECK_STRICT', strict), \

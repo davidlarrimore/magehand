@@ -340,19 +340,30 @@ def registered_apps():
     sha = (sha or '').strip()
     if code != 0 or not re.fullmatch(r'[0-9a-f]{40}', sha):
         return None
-    names, _ = github_listing(APPS_REPO, 'apps', ref=sha)
-    if names is None:
+    # The manifests come from the commit's git tree, one complete listing: a 404 for a private repo can mean lost
+    # access, so a missing listing or a manifest that can't be read is never "no registration" (magehand#110's review).
+    code, out, _ = gh_probe('api', f'repos/{APPS_REPO}/git/trees/{sha}?recursive=1')
+    try:
+        tree = json.loads(out) if code == 0 else None
+    except ValueError:
+        tree = None
+    if not isinstance(tree, dict) or tree.get('truncated') or not isinstance(tree.get('tree'), list):
         return None
     found = {}
-    for app in names:
-        code, text, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
-                                   f'repos/{APPS_REPO}/contents/apps/{urllib.parse.quote(app)}/app.yaml?ref={sha}')
-        if code != 0:
-            if code is not None and 'HTTP 404' in (err or ''):
-                continue  # a directory without app.yaml is not a registration
+    for item in tree['tree']:
+        m = re.fullmatch(r'apps/([^/]+)/app\.yaml', str(item.get('path', '')))
+        if not m or item.get('type') != 'blob':
+            continue
+        code, out, _ = gh_probe('api', f'repos/{APPS_REPO}/git/blobs/{item.get("sha")}')
+        try:
+            blob = json.loads(out) if code == 0 else None
+            text = base64.b64decode(blob['content']).decode() if isinstance(blob, dict) else None
+        except (ValueError, KeyError, TypeError):
+            text = None
+        if text is None:
             return None
         try:
-            found[app] = source(yaml.safe_load(text or '') or {})
+            found[m.group(1)] = source(yaml.safe_load(text) or {})
         except yaml.YAMLError:
             return None
     return found
