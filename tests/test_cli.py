@@ -7900,34 +7900,101 @@ class PostDeployChecks(unittest.TestCase):
             self.assertEqual(magehand.post_deploy_stage('example/demo', 'abc', 'demo')['state'], 'error')
 
 
-class Verify(unittest.TestCase):
-    """`verify` and `hooks` (homelab#611): the platform's checks before a push, at the commit CI uses."""
 
-    def repo(self, origin='https://github.com/davidlarrimore/demo.git'):
+
+# A stand-in for pre-commit (homelab#611 tests): it fails when a file the range changes holds BAD in the directory it
+# runs in. That's how real pre-commit behaves: it reads the files of its checkout, so a check of the wrong
+# directory's files gives the wrong answer (magehand#110's review).
+FAKE_PRE_COMMIT = '''#!/bin/sh
+echo "fake pre-commit: checking"
+from=""; to=""; all=""
+while [ $# -gt 0 ]; do
+  case "$1" in --from-ref) from="$2"; shift;; --to-ref) to="$2"; shift;; --all-files) all=1;; esac; shift
+done
+if [ -n "$all" ]; then files=$(git ls-files); else files=$(git diff --name-only "$from...$to"); fi
+for f in $files; do [ -f "$f" ] && grep -q BAD "$f" && { echo "BAD in $f"; exit 1; }; done
+exit 0
+'''
+
+
+class Verify(unittest.TestCase):
+    """`verify` and `hooks` (homelab#611): the platform's checks before a push, on the exact commit, as CI checks it."""
+
+    def git(self, top, *args):
+        return subprocess.run(['git', '-C', str(top), *args], check=True, capture_output=True, text=True,
+                              env={k: v for k, v in os.environ.items() if not k.startswith('GIT_')}).stdout.strip()
+
+    def repo(self, origin='https://github.com/davidlarrimore/demo.git', files=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        top = pathlib.Path(tmp.name).resolve()
-        run = lambda *args: subprocess.run(['git', '-C', str(top), *args], check=True, capture_output=True)  # noqa: E731
-        run('init', '-q', '-b', 'main')
-        run('config', 'user.email', 't@example.com')
-        run('config', 'user.name', 't')
-        run('remote', 'add', 'origin', origin)
-        (top / 'a.py').write_text('x = 1\n')
-        run('add', 'a.py')
-        run('commit', '-q', '-m', 'one')
-        run('update-ref', 'refs/remotes/origin/main', 'HEAD')  # as if fetched: the branch starts here
+        top = pathlib.Path(tmp.name).resolve() / 'demo'
+        top.mkdir()
+        self.git(top, 'init', '-q', '-b', 'main')
+        self.git(top, 'config', 'user.email', 't@example.com')
+        self.git(top, 'config', 'user.name', 't')
+        self.git(top, 'remote', 'add', 'origin', origin)
+        for name, text in (files or {'a.py': 'x = 1\n'}).items():
+            (top / name).parent.mkdir(parents=True, exist_ok=True)
+            (top / name).write_text(text)
+        self.git(top, 'add', '-A')
+        self.git(top, 'commit', '-q', '-m', 'one')
+        self.git(top, 'update-ref', 'refs/remotes/origin/main', 'HEAD')  # as if fetched: branches start here
         return top
 
-    def test_the_pin_is_checks_yaml_s_tools_commit(self):
+    def commit(self, top, name, text, branch=None):
+        if branch:
+            self.git(top, 'checkout', '-q', '-B', branch)
+        (top / name).write_text(text)
+        self.git(top, 'add', name)
+        self.git(top, 'commit', '-q', '-m', f'{name}')
+        return self.git(top, 'rev-parse', 'HEAD')
+
+    def setup_verify(self, top, fake=True, workflows=None, app=False):
+        """Mocks GitHub and the installs; with `fake`, runs the stand-in pre-commit for real in the worktree."""
+        quality = top.parent / 'quality'
+        quality.mkdir(exist_ok=True)
+        pc = top.parent / 'pre-commit'
+        pc.write_text(FAKE_PRE_COMMIT)
+        pc.chmod(0o755)
+        refs = []
+        patches = [mock.patch.object(magehand, 'quality_pin', lambda ref='main': refs.append(ref) or 'f' * 40),
+                   mock.patch.object(magehand, 'quality_tree', lambda sha: quality),
+                   mock.patch.object(magehand, 'ensure_eslint', lambda q, t: None),
+                   mock.patch.object(magehand, 'pre_commit_bin', lambda q: pc),
+                   mock.patch.object(magehand, 'CACHE', top.parent / 'cache'),
+                   mock.patch.object(magehand, 'APPS_DIR', None)]  # `check --apps-dir` tests leave it set
+        if app:
+            patches.append(mock.patch.object(magehand.subprocess, 'run', wraps=subprocess.run))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        cwd = os.getcwd()
+        os.chdir(top)
+        self.addCleanup(os.chdir, cwd)
+        return refs
+
+    def main(self, *argv, stdin=''):
+        with mock.patch.object(magehand.sys, 'stdin', io.StringIO(stdin)):
+            return CommandLine.run_main(self, *argv)
+
+    def test_the_pin_is_the_tools_commit_of_the_checks_yaml_the_repo_calls(self):
         sha = 'c' * 40
-        text = f'      - uses: {magehand.APPS_REPO}/.github/actions/tools@{sha} # main\n'
-        with mock.patch.object(magehand, 'github_file', lambda repo, path, **k: text):
-            self.assertEqual(magehand.quality_pin(), sha)
-        with mock.patch.object(magehand, 'github_file', lambda repo, path, **k: 'jobs: {}\n'), \
-                self.assertRaises(SystemExit):
+        seen = []
+
+        def file(repo, path, ref='main', **k):
+            seen.append(ref)
+            return f'      - uses: {magehand.APPS_REPO}/.github/actions/tools@{sha} # main\n'
+        with mock.patch.object(magehand, 'github_file', file):
+            self.assertEqual(magehand.quality_pin('v3'), sha)
+        self.assertEqual(seen, ['v3'])  # the caller's ref, not homelab-apps' main (magehand#110's review)
+        top = self.repo(files={'.github/workflows/build.yaml':
+                               f'jobs:\n  checks:\n    uses: {magehand.APPS_REPO}/.github/workflows/checks.yaml@abc123\n'})
+        self.assertEqual(magehand.checks_ref(top), 'abc123')
+        self.assertIsNone(magehand.checks_ref(self.repo()))
+        with mock.patch.object(magehand, 'github_file', lambda *a, **k: 'jobs: {}\n'), self.assertRaises(SystemExit):
             magehand.quality_pin()
 
-    def test_the_config_is_fetched_once_per_commit(self):
+    def test_the_config_is_fetched_once_per_commit_and_a_finished_copy_is_kept(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         sha, fetched = 'd' * 40, []
@@ -7945,7 +8012,7 @@ class Verify(unittest.TestCase):
         self.assertEqual(first, again)
         self.assertEqual(sorted(fetched), ['.github/quality/ast-grep/scan.py', '.github/quality/pre-commit-config.yaml'])
         self.assertTrue(os.access(first / 'ast-grep' / 'scan.py', os.X_OK))
-        self.assertFalse((first / 'node_modules').exists())
+        self.assertEqual([p.name for p in first.parent.iterdir()], [sha])  # no staging left behind
 
     def test_a_commit_without_the_config_says_so(self):
         tmp = tempfile.TemporaryDirectory()
@@ -7956,110 +8023,92 @@ class Verify(unittest.TestCase):
             magehand.quality_tree('e' * 40)
         self.assertIn('predate homelab#611', str(exit_.exception.code))
 
-    def test_the_link_is_excluded_from_git_and_follows_the_commit(self):
+    def test_the_commit_is_checked_not_the_working_tree(self):
+        # magehand#110's review: pre-commit reads the checkout's files, so a bad commit on another branch passed
+        # while a good file was checked out. Checks run in a worktree of the exact commit.
         top = self.repo()
-        old, new = top.parent / 'q-old', top.parent / 'q-new'
-        old.mkdir(exist_ok=True)
-        new.mkdir(exist_ok=True)
-        magehand.link_quality(top, old)
-        magehand.link_quality(top, new)
-        self.assertEqual(pathlib.Path(os.readlink(top / '.platform-quality')), new)
-        self.assertIn('/.platform-quality', (top / '.git' / 'info' / 'exclude').read_text().splitlines())
-        status = subprocess.run(['git', '-C', str(top), 'status', '--porcelain'], capture_output=True, text=True).stdout
-        self.assertEqual(status, '')  # the link is never something to commit
-        (top / '.platform-quality').unlink()
-        (top / '.platform-quality').mkdir()  # a copy made by hand, as CI makes one
-        with self.assertRaises(SystemExit):
-            magehand.link_quality(top, new)
-
-    def test_pushed_ranges(self):
-        top = self.repo()
-        head = subprocess.run(['git', '-C', str(top), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
-        z, a, b = magehand.ZERO_SHA, 'a' * 40, 'b' * 40
-        with mock.patch.object(magehand, 'git_out', lambda args, root=None: head if args[0] == 'merge-base' else None):
-            ranges = magehand.pushed_ranges([
-                f'refs/heads/x {a} refs/heads/x {b}',        # an update: from what the remote has
-                f'refs/heads/gone {z} refs/heads/gone {b}',  # a deletion: nothing to check
-                f'refs/tags/v1 {a} refs/tags/v1 {z}',        # a tag: nothing to check
-                f'refs/heads/new {a} refs/heads/new {z}',    # a new branch: from its merge base on origin
-                f'refs/heads/same {a} refs/heads/same {a}',  # nothing new
-                'garbage'], top)
-        self.assertEqual(ranges, [(b, a), (head, a)])
-
-    def test_a_pass_is_recorded_for_the_last_commits(self):
-        top = self.repo()
-        for n in range(magehand.VERIFIED_KEEP + 3):
-            magehand.record_verified(top, f'{n:040d}')
-        kept = magehand.verified_commits(top)
-        self.assertEqual(len(kept), magehand.VERIFIED_KEEP)
-        self.assertEqual(kept[-1], f'{magehand.VERIFIED_KEEP + 2:040d}')
-        self.assertTrue(magehand.clean_checkout(top))
-        (top / 'a.py').write_text('x = 2\n')
-        self.assertFalse(magehand.clean_checkout(top))
-
-    def verify(self, *argv, ok=True, clean=True, stdin='', app=None):
-        top = self.repo()
-        calls = []
-
-        def run_pc(pc, root, rng, only):
-            calls.append((rng, only))
-            return ok
-        patches = [mock.patch.object(magehand, 'quality_pin', lambda: 'f' * 40),
-                   mock.patch.object(magehand, 'quality_tree', lambda sha: top.parent),
-                   mock.patch.object(magehand, 'ensure_eslint', lambda q, t: None),
-                   mock.patch.object(magehand, 'pre_commit_bin', lambda q: pathlib.Path('/bin/pre-commit')),
-                   mock.patch.object(magehand, 'run_pre_commit', run_pc),
-                   mock.patch.object(magehand, 'checkout_app', lambda root=None: app),
-                   mock.patch.object(magehand, 'clean_checkout', lambda root: clean),
-                   mock.patch.object(magehand.sys, 'stdin', io.StringIO(stdin))]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
-        cwd = os.getcwd()
-        os.chdir(top)
-        self.addCleanup(os.chdir, cwd)
-        code, out, err = CommandLine.run_main(self, 'verify', *argv)
-        return code, out, err, calls, top
-
-    def test_verify_checks_the_branch_and_records_a_clean_pass(self):
-        code, out, _, calls, top = self.verify('--json')
-        self.assertEqual(code, 0)
-        result = json.loads(out)
-        self.assertTrue(result['ok'] and result['recorded'])
-        self.assertIn(result['commit'], magehand.verified_commits(top))
-        (rng, only), = calls
-        self.assertEqual((rng[0], rng[2], rng[3], only), ('--from-ref', '--to-ref', 'HEAD', None))
-
-    def test_a_failure_or_a_dirty_checkout_records_nothing(self):
-        code, out, _, _, top = self.verify(ok=False)
+        bad = self.commit(top, 'b.py', 'BAD\n', branch='feature')
+        self.git(top, 'checkout', '-q', 'main')
+        (top / 'b.py').write_text('fine\n')  # a good file of that name in the working tree
+        self.setup_verify(top)
+        code, _, err = self.main('verify', '--pre-push', 'origin', 'u',
+                                 stdin=f'refs/heads/feature {bad} refs/heads/feature {"0" * 40}\n')
         self.assertEqual(code, 1)
-        self.assertIn('checks FAILED', out)
-        self.assertEqual(magehand.verified_commits(top), [])
-        code, out, _, _, top = self.verify(clean=False)
-        self.assertEqual(code, 0)
-        self.assertIn('a pass is recorded only for a clean checkout', out)
-        self.assertEqual(magehand.verified_commits(top), [])
-
-    def test_only_one_check_is_never_recorded(self):
-        code, out, _, calls, top = self.verify('--only', 'eslint')
-        self.assertEqual((code, calls[0][1], magehand.verified_commits(top)), (0, 'eslint', []))
-
-    def test_all_checks_every_file(self):
-        _, _, _, calls, _ = self.verify('--all')
-        self.assertEqual(calls[0][0], ['--all-files'])
-
-    def test_the_pre_push_hook_checks_what_is_pushed_and_stops_a_failure(self):
-        a, b = 'a' * 40, 'b' * 40
-        code, out, err, calls, _ = self.verify('--pre-push', 'origin', 'git@github.com:x/y.git', ok=False,
-                                               stdin=f'refs/heads/x {a} refs/heads/x {b}\n')
-        self.assertEqual(code, 1)
-        self.assertEqual(calls[0][0], ['--from-ref', b, '--to-ref', a])
         self.assertIn('push stopped', err)
-        self.assertEqual(out, '')  # git shows the hook's stderr; nothing else to say
-        code, _, _, calls, _ = self.verify('--pre-push', 'origin', 'u', stdin=f'refs/tags/v1 {a} refs/tags/v1 {"0" * 40}\n')
-        self.assertEqual((code, calls), (0, []))  # a tag: nothing to check, the push goes on
+        self.assertNotIn(bad, magehand.verified_commits(top))
+        # and the other way round: a staged fix of a bad commit doesn't make the commit pass
+        self.git(top, 'checkout', '-q', '-f', 'feature')
+        (top / 'b.py').write_text('fixed\n')
+        self.git(top, 'add', 'b.py')
+        code, out, _ = self.main('verify', '--json')
+        self.assertEqual((code, json.loads(out)['ok']), (1, False))
+        self.assertEqual(self.git(top, 'worktree', 'list').count('\n'), 0)  # the temporary worktree is gone
 
-    def test_verify_outside_the_homelab_s_repos_says_so(self):
+    def test_a_pass_records_the_commit_over_ci_s_range_only(self):
+        # magehand#110's review: an incremental push checked only the new commits, and recorded HEAD as verified.
+        top = self.repo()
+        first = self.commit(top, 'b.py', 'BAD\n', branch='feature')  # pushed earlier, never verified
+        second = self.commit(top, 'c.py', 'fine\n')
+        self.setup_verify(top)
+        code, _, _ = self.main('verify', '--pre-push', 'origin', 'u',
+                               stdin=f'refs/heads/feature {second} refs/heads/feature {first}\n')
+        self.assertEqual(code, 1)  # CI's range (from origin/main) still has b.py's BAD
+        self.git(top, 'rm', '-q', 'b.py')
+        self.git(top, 'commit', '-q', '-m', 'drop it')
+        fixed = self.git(top, 'rev-parse', 'HEAD')
+        code, _, _ = self.main('verify', '--pre-push', 'origin', 'u',
+                               stdin=f'refs/heads/feature {fixed} refs/heads/feature {second}\n')
+        self.assertEqual(code, 0)
+        self.assertEqual(magehand.verified_commits(top), [fixed])
+
+    def test_targets(self):
+        top = self.repo()
+        base = self.git(top, 'rev-parse', 'HEAD')
+        a = self.commit(top, 'b.py', 'x\n', branch='x')
+        z = magehand.ZERO_SHA
+        targets = magehand.verify_targets(top, [
+            f'refs/heads/x {a} refs/heads/x {base}',      # an update: CI's range, from the merge base
+            f'refs/heads/gone {z} refs/heads/gone {a}',   # a deletion: nothing to check
+            f'refs/tags/v1 {a} refs/tags/v1 {z}',         # a tag: nothing to check
+            f'refs/heads/main {a} refs/heads/main {base}',  # straight to the default branch: the new commits, no record
+            f'refs/heads/same {a} refs/heads/same {a}',   # nothing new
+            'garbage'])
+        self.assertEqual(targets, [(a, base, a, True), (a, base, a, False)])
+        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True)])
+
+    def test_verify_json_is_only_json(self):
+        # magehand#110's review: pre-commit's own output went to stdout before the JSON object.
+        top = self.repo()
+        self.commit(top, 'b.py', 'fine\n', branch='feature')
+        refs = self.setup_verify(top)
+        code, out, err = self.main('verify', '--json')
+        result = json.loads(out)  # nothing but the object
+        self.assertTrue(result['ok'] and result['recorded'])
+        self.assertIn('fake pre-commit: checking', err)
+        self.assertEqual(refs, ['main'])  # no checks.yaml call in this repo: homelab-apps' main
+
+    def test_only_and_apps_dir_never_record(self):
+        top = self.repo()
+        self.commit(top, 'b.py', 'fine\n', branch='feature')
+        self.setup_verify(top)
+        code, out, _ = self.main('verify', '--only', 'eslint')
+        self.assertIn('not recorded: --only runs one check', out)
+        with mock.patch.object(magehand, 'APPS_DIR', str(top.parent)):
+            code, out, _ = self.main('verify', '--apps-dir', str(top.parent))
+        self.assertIn('not recorded: --apps-dir is not what CI runs', out)
+        self.assertEqual(magehand.verified_commits(top), [])
+
+    def test_a_tool_repo_is_not_checked_as_an_app(self):
+        # magehand#110's review: any owner repo but homelab and homelab-apps was run through `magehand check`.
+        top = self.repo(origin='https://github.com/davidlarrimore/magehand.git')
+        self.commit(top, 'b.py', 'fine\n', branch='feature')
+        self.setup_verify(top)
+        with mock.patch.object(magehand.subprocess, 'run', wraps=subprocess.run) as run:
+            self.assertEqual(self.main('verify')[0], 0)
+        self.assertFalse(any('check' in (c.args[0] if c.args else []) and '-m' in (c.args[0] if c.args else [])
+                             for c in run.call_args_list))
+
+    def test_outside_the_homelab_s_repos(self):
         top = self.repo(origin='https://github.com/someone-else/demo.git')
         cwd = os.getcwd()
         os.chdir(top)
@@ -8067,6 +8116,8 @@ class Verify(unittest.TestCase):
         with self.assertRaises(SystemExit) as exit_:
             magehand.main(['verify'])
         self.assertIn('checks only those', str(exit_.exception.code))
+        # a hook in a shared hooks directory must not stop another repo's push (magehand#110's review)
+        self.assertEqual(self.main('verify', '--pre-push', 'origin', 'u', stdin='x y z w\n')[0], 0)
 
     def test_hooks_install_status_remove(self):
         top = self.repo()
@@ -8076,17 +8127,16 @@ class Verify(unittest.TestCase):
         hook = top / '.git' / 'hooks' / 'pre-push'
         code, out, _ = CommandLine.run_main(self, 'hooks', 'status', '--json')
         self.assertEqual((code, json.loads(out)['state']), (0, 'missing'))
-        code, out, _ = CommandLine.run_main(self, 'hooks', 'install')
-        self.assertEqual(code, 0)
+        self.assertEqual(CommandLine.run_main(self, 'hooks', 'install')[0], 0)
         self.assertEqual(hook.read_text(), magehand.HOOK_SCRIPT)
         self.assertTrue(os.access(hook, os.X_OK))
-        self.assertEqual(magehand.doctor_hook()[1], True)
+        self.assertTrue(magehand.doctor_hook()[1])
         hook.write_text(magehand.HOOK_SCRIPT.replace('exec', '# an older line\nexec'))
         self.assertEqual(json.loads(CommandLine.run_main(self, 'hooks', 'status', '--json')[1])['state'], 'outdated')
         CommandLine.run_main(self, 'hooks', 'install')
-        self.assertEqual(hook.read_text(), magehand.HOOK_SCRIPT)  # updated
-        code, out, _ = CommandLine.run_main(self, 'hooks', 'remove')
-        self.assertEqual((code, hook.exists()), (0, False))
+        self.assertEqual(hook.read_text(), magehand.HOOK_SCRIPT)
+        self.assertEqual(CommandLine.run_main(self, 'hooks', 'remove')[0], 0)
+        self.assertFalse(hook.exists())
 
     def test_another_tool_s_hook_is_never_replaced(self):
         top = self.repo()
@@ -8099,12 +8149,26 @@ class Verify(unittest.TestCase):
         code, out, _ = CommandLine.run_main(self, 'hooks', 'install')
         self.assertEqual(code, 1)
         self.assertIn('magehand verify --pre-push', out)
-        self.assertEqual(hook.read_text(), '#!/bin/sh\nnpx husky-run pre-push\n')
         CommandLine.run_main(self, 'hooks', 'remove')
-        self.assertTrue(hook.exists())  # not ours: never removed
-        label, ok, fix = magehand.doctor_hook()
-        self.assertFalse(ok)
-        self.assertIn('add `magehand verify --pre-push', fix)
+        self.assertEqual(hook.read_text(), '#!/bin/sh\nnpx husky-run pre-push\n')
+        self.assertFalse(magehand.doctor_hook()[1])
+
+    def test_a_shared_hooks_path_gets_nothing_installed(self):
+        # magehand#110's review: core.hooksPath shared by several repos made one repo's install everyone's.
+        top = self.repo()
+        shared = top.parent / 'shared-hooks'
+        shared.mkdir()
+        self.git(top, 'config', 'core.hooksPath', str(shared))
+        cwd = os.getcwd()
+        os.chdir(top)
+        self.addCleanup(os.chdir, cwd)
+        code, out, _ = CommandLine.run_main(self, 'hooks', 'install')
+        self.assertEqual(code, 1)
+        self.assertIn('core.hooksPath', out)
+        self.assertEqual(list(shared.iterdir()), [])
+        self.assertFalse((top / '.git' / 'hooks' / 'pre-push').exists())
+        self.assertEqual(json.loads(CommandLine.run_main(self, 'hooks', 'status', '--json')[1])['state'], 'shared')
+        self.assertFalse(magehand.doctor_hook()[1])
 
     def test_the_hook_script_lets_a_push_through_without_magehand(self):
         tmp = tempfile.TemporaryDirectory()

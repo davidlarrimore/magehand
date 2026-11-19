@@ -38,9 +38,9 @@
   as) and `magehand release` (a tag
   and release on an app's repo), both as the owner through `gh`, and
   in a checkout of one of the homelab's repos only, `magehand verify`'s
-  `.platform-quality` symlink to the cached checks, its line in
-  `.git/info/exclude`, and `.git/magehand/verified` (the commits that
-  passed), and `magehand hooks install` (and `new`), which writes
+  temporary worktree of the commit it checks (`git worktree add --detach`
+  under the system's temp directory, removed when it is done) and
+  `.git/magehand/verified` (the commits that passed), and `magehand hooks install` (and `new`), which writes
   `.git/hooks/pre-push` and never replaces a hook it didn't write; `pr ready
   --force` also comments on the PR that it skipped `verify`; and
   `magehand bucket cp` / `sync`, which put objects into that app's own
