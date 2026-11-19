@@ -5897,12 +5897,14 @@ def verify_targets(top, pre_push_lines=None, everything=False):
         local_ref, local_sha, remote_ref, remote_sha = parts
         if local_sha == ZERO_SHA or local_ref.startswith('refs/tags/') or local_sha == remote_sha:
             continue
-        if remote_ref == default_branch:
-            if remote_sha != ZERO_SHA:
-                targets.append((local_sha, remote_sha, local_sha, False))
+        if remote_ref == default_branch:  # the commits it adds (every file for a new default branch), no record
+            targets.append((local_sha, None, None, False) if remote_sha == ZERO_SHA else
+                           (local_sha, remote_sha, local_sha, False))
             continue
         base = git_out(['merge-base', local_sha, base_ref], top)
-        if base and base != local_sha:  # nothing on origin to compare with (a new repo): CI checks it
+        if base is None:  # no origin/<default> here, or no shared history: check every file (magehand#110's review)
+            targets.append((local_sha, None, None, True))
+        elif base != local_sha:
             targets.append((local_sha, base, local_sha, True))
     return targets
 
@@ -5941,7 +5943,11 @@ def clean_checkout(top):
 
 
 def child_env():
-    return {k: v for k, v in os.environ.items() if k not in GIT_ENV}
+    """The environment for the checks: without git's variables (the worktree's checks see their own repo) and
+    without the ones that change what pre-commit runs (SKIP leaves hooks out; magehand#110's review). PRE_COMMIT_HOME
+    (where its tools are cached) stays."""
+    return {k: v for k, v in os.environ.items()
+            if k not in GIT_ENV and k != 'SKIP' and not (k.startswith('PRE_COMMIT_') and k != 'PRE_COMMIT_HOME')}
 
 
 def run_to(cmd, out, **kwargs):
@@ -5957,8 +5963,8 @@ def run_to(cmd, out, **kwargs):
 
 
 @contextlib.contextmanager
-def commit_checkout(top, sha, quality):
-    """A temporary worktree of commit `sha` (detached, removed afterwards) with the checks linked in."""
+def commit_checkout(top, sha):
+    """A temporary worktree of commit `sha` (detached, removed afterwards)."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix='magehand-verify-'))
     path = tmp / 'src'
     out = subprocess.run(['git', '-C', str(top), 'worktree', 'add', '--detach', '--quiet', str(path), sha],  # nosec B603 B607
@@ -5967,7 +5973,6 @@ def commit_checkout(top, sha, quality):
         shutil.rmtree(tmp, ignore_errors=True)
         die(f'cannot check out {sha[:7]} to check it: {out.stderr.strip()[:200]}')
     try:
-        (path / PLATFORM_LINK).symlink_to(quality, target_is_directory=True)
         yield path
     finally:
         subprocess.run(['git', '-C', str(top), 'worktree', 'remove', '--force', str(path)],  # nosec B603 B607
@@ -5998,21 +6003,27 @@ def cmd_verify(a):
         if a.pre_push:
             sys.exit(0)  # a tag, a deleted branch or nothing new: nothing to check
     out = sys.stderr if a.json or a.pre_push else sys.stdout  # --json: the tools' output must not mix with the JSON
-    ref = checks_ref(top)
-    with setup_lock():
-        quality = quality_tree(quality_pin(ref or 'main'))
-        ensure_eslint(quality, top)
-        pc = pre_commit_bin(quality)
     results = []
     for sha, frm, to, ci_range in targets:
-        with commit_checkout(top, sha, quality) as work:
+        with commit_checkout(top, sha) as work:
+            # Everything about the checks comes from the commit itself: the checks.yaml ref its workflows call, and
+            # whether it has JS/TS for ESLint (magehand#110's review), not from the checkout you are in.
+            ref = checks_ref(work)
+            with setup_lock():
+                quality = quality_tree(quality_pin(ref or 'main'))
+                ensure_eslint(quality, work)
+                pc = pre_commit_bin(quality)
+            (work / PLATFORM_LINK).symlink_to(quality, target_is_directory=True)
             rng = ['--all-files'] if frm is None else ['--from-ref', frm, '--to-ref', to]
             ok = run_pre_commit(pc, work, rng, a.only, out)
-            if ok and not a.only and is_app_checkout(work):  # an app repo: the platform's rules too, as CI checks them
-                ok = run_to([sys.executable, '-m', 'magehand', 'check'], out, cwd=work, env=child_env()) == 0
+            if ok and not a.only and is_app_checkout(work):
+                # An app repo: the platform's rules too, strict as CI runs them (a rule whose tool is missing here
+                # fails instead of being skipped, so a record means they all ran; magehand#110's review).
+                ok = run_to([sys.executable, '-m', 'magehand', 'check', '--strict'], out, cwd=work,
+                            env=child_env()) == 0
         # A record stands for "CI's checks pass on this commit": the CI range, every check, the config CI uses.
         recorded = bool(ok and ci_range and not a.only and not APPS_DIR and record_verified(top, sha))
-        results.append({'commit': sha, 'ok': ok, 'recorded': recorded})
+        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref})
     ok = all(r['ok'] for r in results)
     if a.pre_push:
         if not ok:
@@ -6029,7 +6040,7 @@ def cmd_verify(a):
             'fix what the checks found (each names its file and line), commit, then `magehand verify` again')
     if a.json:
         print(json.dumps({'ok': ok, 'checked': scope, 'commit': head['commit'], 'only': a.only,
-                          'recorded': head['recorded'], 'ci_ref': ref, 'uncommitted': dirty, 'next': step}))
+                          'recorded': head['recorded'], 'ci_ref': head['ci_ref'], 'uncommitted': dirty, 'next': step}))
     else:
         print(f'checks {"passed" if ok else "FAILED"} on {head["commit"][:7]} ({scope}'
               f'{", " + a.only + " only" if a.only else ""})'
@@ -7903,17 +7914,24 @@ def cmd_pr(a):
                f'`gh pr checks {number} --watch`, then `magehand pr ready {number}` again')
     # The platform's checks ran on this commit here first (homelab#611): a review or a CI run is not spent on a head
     # that `magehand verify` would have stopped. --force readies it anyway and says so on the PR.
+    # Outside a checkout (gh found the repo through GH_REPO) or without a head there is nothing to verify against:
+    # that is unverified too (magehand#110's review).
     top = checkout_top()
-    if head and top and head not in verified_commits(top):
+    if not (head and top and head in verified_commits(top)):
         if not a.force:
-            finish(False, f'not readied: its head {head[:7]} has not passed `magehand verify` in this checkout',
-                   f'check out {head[:7]} (`git pull`), `magehand verify`, then `magehand pr ready {number}` again '
-                   '(--force readies it without, and says so on the PR)')
+            where = (f'its head {head[:7]} has not passed `magehand verify` in this checkout' if head and top else
+                     'there is no checkout here to look for its `magehand verify`' if head else
+                     'its head commit could not be read')
+            finish(False, f'not readied: {where}',
+                   f'in the PR\'s checkout, at {head[:7] if head else "its head"} (`git pull`): `magehand verify`, then '
+                   f'`magehand pr ready {number}` again (--force readies it without, and says so on the PR)')
         code, _, err = gh_cli('pr', 'comment', str(number), '-R', repo, '--body',
-                              f'Readied with `magehand pr ready --force`: `{head[:7]}` has not passed `magehand verify` '
-                              'locally (the platform\'s checks still run in CI).')
-        changed.append('readied without a local `magehand verify` (--force; said so on the PR)' if code == 0 else
-                       f'readied without a local `magehand verify` (--force; the PR comment failed: {err or "gh failed"})')
+                              f'Readied with `magehand pr ready --force`: `{(head or "its head")[:7]}` has not passed '
+                              '`magehand verify` locally (the platform\'s checks still run in CI).')
+        if code != 0:  # the disclosure is the condition of --force: without it, nothing is readied
+            finish(False, f'not readied: the --force comment could not be posted ({err or "gh failed"})',
+                   f'`magehand pr ready {number} --force` again, or `magehand verify` first')
+        changed.append('readied without a local `magehand verify` (--force; said so on the PR)')
     own = (pr.get('author') or {}).get('login', '').lower() == BOT.lower()  # OpenClaw's own PR: the owner reviews it
     # The request first, on the draft (OpenClaw ignores drafts), confirmed; only then mark it ready, so a request
     # that didn't stick never leaves a ready PR without its reviewer.
