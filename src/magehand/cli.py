@@ -323,20 +323,38 @@ def registration(name):
 
 def registered_apps():
     """{app: its source repo (None: code kept in homelab-apps)} for every app in homelab-apps apps/: the checkout's
-    with --apps-dir, else GitHub's main. None when GitHub's list couldn't be read."""
+    with --apps-dir, else GitHub's, all read at one commit of main and never from the offline cache (a cached copy
+    of one entry could name another repo; magehand#110's review). None when any of it couldn't be read."""
+    def source(spec):
+        src = spec.get('source') if isinstance(spec, dict) else None
+        return src.get('repo') if isinstance(src, dict) else None
     if APPS_DIR:
-        names = sorted(f.parent.name for f in pathlib.Path(APPS_DIR, 'apps').glob('*/app.yaml'))
-    else:
-        names, why = github_listing(APPS_REPO, 'apps')
-        if names is None:
-            return None
+        found = {}
+        for f in sorted(pathlib.Path(APPS_DIR, 'apps').glob('*/app.yaml')):
+            try:
+                found[f.parent.name] = source(yaml.safe_load(f.read_text()) or {})
+            except (OSError, yaml.YAMLError):
+                return None
+        return found
+    code, sha, _ = gh_probe('api', f'repos/{APPS_REPO}/commits/main', '--jq', '.sha')
+    sha = (sha or '').strip()
+    if code != 0 or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        return None
+    names, _ = github_listing(APPS_REPO, 'apps', ref=sha)
+    if names is None:
+        return None
     found = {}
     for app in names:
-        spec = registration(app)
-        if spec is None:
-            continue
-        source = spec.get('source') if isinstance(spec, dict) else None
-        found[app] = source.get('repo') if isinstance(source, dict) else None
+        code, text, err = gh_probe('api', '-H', 'Accept: application/vnd.github.raw',
+                                   f'repos/{APPS_REPO}/contents/apps/{urllib.parse.quote(app)}/app.yaml?ref={sha}')
+        if code != 0:
+            if code is not None and 'HTTP 404' in (err or ''):
+                continue  # a directory without app.yaml is not a registration
+            return None
+        try:
+            found[app] = source(yaml.safe_load(text or '') or {})
+        except yaml.YAMLError:
+            return None
     return found
 
 

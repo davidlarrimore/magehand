@@ -2578,25 +2578,49 @@ class AppNameOverride(unittest.TestCase):
             errors = texts(magehand.check_app_name(self.load(tmp, 'services: {}\n', name='lab-website')), 'error')
         self.assertTrue(any('registered as the app lab' in e and 'restore `app: lab`' in e for e in errors), errors)
 
+    def gh_registry(self, files, sha='c' * 40, fail=()):
+        """A gh_probe that answers homelab-apps' main at `sha`, apps/ at it, and each apps/<name>/app.yaml at it
+        (HTTP 503 for those in `fail`); anything at another ref is an error, so a test sees reads stay on one commit."""
+        calls = []
+
+        def probe(*args):
+            calls.append(args)
+            path = next(a for a in args if a.startswith('repos/'))
+            if path == f'repos/{magehand.APPS_REPO}/commits/main':
+                return 0, sha + '\n', ''
+            m = re.match(rf'repos/{re.escape(magehand.APPS_REPO)}/contents/apps(?:/([^/]+)/app\.yaml)?\?ref=(\w+)$', path)
+            if not m or m.group(2) != sha:
+                return 1, '', f'unexpected read: {path}'
+            if m.group(1) is None:
+                return 0, json.dumps([{'name': n} for n in sorted(files)]), ''
+            if m.group(1) in fail:
+                return 1, '', 'HTTP 503: Service Unavailable'
+            return 0, files[m.group(1)], ''
+        return probe, calls
+
     def test_a_rename_is_caught_without_a_homelab_apps_checkout(self):
         # magehand#110's review: the reverse lookup ran only with --apps-dir (CI), so a local `check --strict` (and
-        # verify's record) passed a rename CI rejects. Here the registrations come from GitHub.
-        regs = {'apps/old-name/app.yaml': 'source: {repo: lab-website}\nservices: {}\n'}
-        with mock.patch.object(magehand, 'APPS_DIR', None), \
-                mock.patch.object(magehand, 'github_listing', lambda repo, path: (['old-name'], None)), \
-                mock.patch.object(magehand, 'github_file', lambda repo, path, required=True, ref='main': regs.get(path)), \
+        # verify's record) passed a rename CI rejects. Here the registrations come from GitHub, at one commit.
+        probe, calls = self.gh_registry({'old-name': 'source: {repo: lab-website}\nservices: {}\n'})
+        with mock.patch.object(magehand, 'APPS_DIR', None), mock.patch.object(magehand, 'gh_probe', probe), \
                 tempfile.TemporaryDirectory() as tmp:
             errors = texts(magehand.check_app_name(self.load(tmp, 'app: new-name\nservices: {}\n', name='new-name')),
                            'error')
         self.assertTrue(any('registered as the app old-name' in e for e in errors), errors)
+        self.assertFalse(any('unexpected read' in str(c) for c in calls))
 
     def test_unreadable_registrations_fail_only_strict(self):
+        # A listing that works, then one entry that doesn't (magehand#110's review: a cached copy of it named another
+        # repo and the strict check passed): unreadable, never the cache.
+        files = {'lab': 'source: {repo: lab-website}\nservices: {}\n', 'old-name': 'source: {repo: lab-website}\n'}
+        probe, _ = self.gh_registry(files, fail=('old-name',))
+        cached = mock.patch.object(magehand, 'github_file', lambda *a, **k: 'source: {repo: someone-else}\n')
         for strict, expected in ((True, 1), (False, 0)):
             with mock.patch.object(magehand, 'APPS_DIR', None), mock.patch.object(magehand, 'CHECK_STRICT', strict), \
-                    mock.patch.object(magehand, 'github_listing', lambda repo, path: (None, 'HTTP 502')), \
-                    mock.patch.object(magehand, 'github_file', lambda *a, **k: None), \
-                    tempfile.TemporaryDirectory() as tmp:
-                errors = texts(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), 'error')
+                    mock.patch.object(magehand, 'gh_probe', probe), cached, tempfile.TemporaryDirectory() as tmp:
+                self.assertIsNone(magehand.registered_apps())
+                errors = texts(magehand.check_app_name(self.load(tmp, 'app: new-name\nservices: {}\n', name='new-name')),
+                               'error')
             self.assertEqual(len([e for e in errors if "couldn't read homelab-apps' app registrations" in e]), expected)
 
 
