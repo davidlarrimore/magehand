@@ -13,6 +13,12 @@
   external`. And one more: `magehand bucket` talks to the S3 endpoint the platform
   hands the app for *its own* bucket (R2 for dev and prod, the local
   Garage for `--env local`), because that is where the app's data is.
+  `verify` (and the pre-push hook) runs the platform's checks as CI does:
+  pre-commit installs each pinned hook's tool from GitHub and PyPI into its
+  own cache (`~/.cache/pre-commit`), pre-commit itself comes from PyPI by
+  the config's hashes, and in a repo with JS/TS npm installs the config's
+  hash-locked ESLint from the npm registry; all only on first use of a
+  pinned version (homelab#611).
   `check --ui` runs CI's browser check in containers: the runtime pulls the
   Playwright and Postgres images build-app.yaml pins, and the Playwright
   container installs that pinned Playwright and PyYAML from PyPI and
@@ -31,6 +37,12 @@
   OpenClaw's review requested, then read back; as whoever `gh` is signed in
   as) and `magehand release` (a tag
   and release on an app's repo), both as the owner through `gh`, and
+  in a checkout of one of the homelab's repos only, `magehand verify`'s
+  `.platform-quality` symlink to the cached checks, its line in
+  `.git/info/exclude`, and `.git/magehand/verified` (the commits that
+  passed), and `magehand hooks install` (and `new`), which writes
+  `.git/hooks/pre-push` and never replaces a hook it didn't write; `pr ready
+  --force` also comments on the PR that it skipped `verify`; and
   `magehand bucket cp` / `sync`, which put objects into that app's own
   bucket only (the app of the checkout you are in; `--app` may only name it), on an explicit command, with the keys of the environment
   asked for (`--env prod` writes production data), and never delete.

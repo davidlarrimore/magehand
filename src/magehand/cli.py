@@ -3143,6 +3143,12 @@ def cmd_new(a):
         elif text != current:
             (pathlib.Path(work) / 'AGENTS.md').write_text(text)
             wrote.append('AGENTS.md')
+        # The pre-push hook that runs `magehand verify` (homelab#611): into .git/hooks, never over another's hook.
+        before, what = install_hook(pathlib.Path(work))
+        if before in ('missing', 'outdated'):
+            wrote.append('.git/hooks/pre-push')
+        elif before == 'other':
+            print(f'{work}: {what}', file=sys.stderr)
         if wrote:
             print(f'{work}: wrote {", ".join(wrote)} (nothing existing was changed but AGENTS.md\'s platform rules)'
                   if 'AGENTS.md' in wrote else f'{work}: wrote {", ".join(wrote)}', file=sys.stderr)
@@ -3998,6 +4004,9 @@ def cmd_doctor(a):
                     print(f'--   {label}: {note}')
             else:
                 check(label, value, hint)
+    hook = doctor_hook()
+    if hook:
+        check(*hook)
     # The owner's other app repos: their AGENTS.md changes only through a PR in each, so doctor lists the ones
     # behind the template (not a failure of this machine; the managed copy works on whatever repo it was given).
     stale, unread = (None, None) if managed else stale_agents()
@@ -5670,6 +5679,372 @@ def agents_text(path):
                                f'from this app\'s notes. Put the heading above the app\'s own notes (see '
                                f'{TEMPLATE_REPO}), then run it again')
     return current, platform + own, None
+
+
+# --- verify and hooks: the platform's checks before a push (homelab#611) --------------------------------------
+# One definition of the static checks: homelab-apps' .github/quality/pre-commit-config.yaml (ruff's bug rules,
+# ESLint's, shellcheck, the lab's own ast-grep rules). CI runs it through homelab-apps' reusable checks.yaml; verify
+# runs the same config, at the same homelab-apps commit (checks.yaml's tools pin), on this machine, so a local pass
+# predicts CI's. The config is fetched once per commit into the cache and linked into the checkout as
+# .platform-quality (excluded from git in .git/info/exclude, never committed). pre-commit (Python 3.10+, hash-locked)
+# gets a venv of its own in the cache; ESLint and its plugins come from the config's package-lock.json (npm ci),
+# only in a repo with JS/TS. A pass of a clean checkout is recorded (.git/magehand/verified): `pr ready` asks for it.
+# The pre-push hook (`hooks install`) runs `verify --pre-push` on the commits being pushed.
+
+QUALITY_DIR = '.github/quality'
+CHECKS_WORKFLOW = '.github/workflows/checks.yaml'
+TOOLS_PIN = re.compile(r'\b' + re.escape(APPS_REPO) + r'/\.github/actions/tools@([0-9a-f]{40})\b')
+PLATFORM_LINK = '.platform-quality'
+PRE_COMMIT_CONFIG = f'{PLATFORM_LINK}/pre-commit-config.yaml'
+JS_TS = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts')
+HOOKS = ('ruff-check', 'eslint', 'shellcheck', 'platform-rules')
+ZERO_SHA = '0' * 40
+VERIFIED_KEEP = 20  # commits kept in .git/magehand/verified
+HOOK_MARK = '# magehand pre-push hook (homelab#611)'
+HOOK_SCRIPT = f'''#!/bin/sh
+{HOOK_MARK}: the platform's checks on the commits you push, as CI runs them.
+# `magehand hooks remove` takes it out. In an emergency, `git push --no-verify` skips it (CI still checks the PR).
+if ! command -v magehand >/dev/null 2>&1; then
+  echo "magehand pre-push: magehand is not on PATH, so this push is not checked (CI still checks the PR)" >&2
+  exit 0
+fi
+exec magehand verify --pre-push "$@"
+'''
+
+
+def lab_checkout(command):
+    """The top of this checkout when it is one of the homelab's repos (origin github.com/OWNER/NAME), else exits."""
+    top = checkout_top()
+    if top is None:
+        usage(command, 'run it in a git checkout of one of the homelab\'s repos')
+    if remote_repo(top) is None:
+        die(f"{top} isn't a checkout of {OWNER}'s repos (its origin): `magehand {command}` checks only those")
+    return top
+
+
+def quality_pin():
+    """The homelab-apps commit whose .github/quality CI's checks.yaml uses: its tools pin on main."""
+    text = github_file(APPS_REPO, CHECKS_WORKFLOW)
+    m = TOOLS_PIN.search(text or '')
+    if not m:
+        die(f'{APPS_REPO}: {CHECKS_WORKFLOW} pins no tools commit, so there are no platform checks to run')
+    return m.group(1)
+
+
+def github_tree(repo, sha):
+    """[(path, mode)] of the blobs in `repo` at commit `sha` (the git trees API, recursive)."""
+    req = urllib.request.Request(f'https://api.github.com/repos/{repo}/git/trees/{sha}?recursive=1',
+                                 headers={'Authorization': f'Bearer {github_token()}', 'User-Agent': 'magehand',
+                                          'Accept': 'application/vnd.github+json'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310  # fixed https URL
+            tree = json.load(resp)
+    except (urllib.error.HTTPError, OSError, ValueError) as error:
+        die(f'cannot list {repo} at {sha[:7]} on GitHub: {error}')
+    if tree.get('truncated'):
+        die(f'{repo} at {sha[:7]}: GitHub truncated the file list')
+    return [(item['path'], item.get('mode', '100644')) for item in tree.get('tree', []) if item.get('type') == 'blob']
+
+
+def quality_tree(sha):
+    """A directory holding homelab-apps' .github/quality at commit `sha`: the cache's copy (a commit never
+    changes, so it is fetched once), or with --apps-dir / MAGEHAND_APPS_DIR that checkout's own, as it is."""
+    if APPS_DIR:
+        local = pathlib.Path(APPS_DIR) / QUALITY_DIR
+        if not (local / 'pre-commit-config.yaml').is_file():
+            die(f'{local}: no pre-commit-config.yaml (is {APPS_DIR} a homelab-apps checkout?)')
+        return local.resolve()
+    target = CACHE / 'quality' / sha
+    if (target / '.complete').is_file():
+        return target
+    prefix = QUALITY_DIR + '/'
+    files = [(p, m) for p, m in github_tree(APPS_REPO, sha) if p.startswith(prefix) and '/node_modules/' not in p]
+    if not any(p == prefix + 'pre-commit-config.yaml' for p, _ in files):
+        die(f'{APPS_REPO} at {sha[:7]} has no {prefix}pre-commit-config.yaml: its checks predate homelab#611')
+    staging = CACHE / 'quality' / f'.{sha}.partial'
+    shutil.rmtree(staging, ignore_errors=True)
+    for path, mode in files:
+        out = staging / path[len(prefix):]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(github_file(APPS_REPO, path, ref=sha))
+        if mode == '100755':
+            out.chmod(0o755)
+    (staging / '.complete').write_text(sha + '\n')
+    shutil.rmtree(target, ignore_errors=True)
+    staging.rename(target)
+    return target
+
+
+def link_quality(top, quality):
+    """Point TOP/.platform-quality at `quality` (a symlink, excluded from git). A real directory there (a copy
+    made by hand, as CI makes one) is left alone: verify stops and says so."""
+    link = top / PLATFORM_LINK
+    if link.is_symlink():
+        if pathlib.Path(os.readlink(link)) != quality:
+            link.unlink()
+    elif link.exists():
+        die(f'{link} exists and is not magehand\'s link (a copy of the checks?): remove it, then run verify again')
+    if not link.is_symlink():
+        link.symlink_to(quality, target_is_directory=True)
+    git_dir = git_out(['rev-parse', '--absolute-git-dir'], top)
+    if git_dir:
+        exclude = pathlib.Path(git_dir) / 'info' / 'exclude'
+        lines = exclude.read_text().splitlines() if exclude.is_file() else []
+        if f'/{PLATFORM_LINK}' not in lines:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text('\n'.join(lines + [f'/{PLATFORM_LINK}']) + '\n')
+    return link
+
+
+def python_for_pre_commit():
+    """(command to make a venv) for Python 3.10+, which pre-commit needs: uv's (it fetches a Python if there is
+    none), else a python3.1x on PATH. None if neither is there."""
+    if shutil.which('uv'):
+        return 'uv'
+    for name in ('python3.13', 'python3.12', 'python3.11', 'python3.10', 'python3'):
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        out = subprocess.run([exe, '-c', 'import sys; print(sys.version_info >= (3, 10))'],  # nosec B603
+                             capture_output=True, text=True)
+        if out.stdout.strip() == 'True':
+            return exe
+    return None
+
+
+def pre_commit_bin(quality):
+    """pre-commit, installed from the config's hash-locked requirements into a venv of its own in the cache (one
+    per requirements file)."""
+    req = quality / 'pre-commit-requirements.txt'
+    venv = CACHE / 'pre-commit' / hashlib.sha256(req.read_bytes()).hexdigest()[:16]
+    exe = venv / 'bin' / 'pre-commit'
+    if exe.is_file():
+        return exe
+    maker = python_for_pre_commit()
+    if maker is None:
+        die('the platform\'s checks run pre-commit, which needs Python 3.10 or newer: `brew install uv` '
+            '(magehand makes its venv with it)')
+    print('magehand: installing pre-commit (hash-locked, once)', file=sys.stderr)
+    shutil.rmtree(venv, ignore_errors=True)
+    steps = ([['uv', 'venv', '-q', '--python', '3.12', str(venv)],
+              ['uv', 'pip', 'install', '-q', '--python', str(venv / 'bin' / 'python'), '--require-hashes', '--no-deps',
+               '-r', str(req)]] if maker == 'uv' else
+             [[maker, '-m', 'venv', str(venv)],
+              [str(venv / 'bin' / 'pip'), 'install', '-q', '--require-hashes', '--no-deps', '-r', str(req)]])
+    for step in steps:
+        if subprocess.run(step).returncode != 0:  # nosec B603  # fixed argv
+            shutil.rmtree(venv, ignore_errors=True)
+            die(f'could not install pre-commit ({" ".join(step[:3])} failed)')
+    return exe
+
+
+def ensure_eslint(quality, top):
+    """npm ci the config's ESLint and plugins (hash-locked, no scripts) when the checkout has JS/TS to check."""
+    if (quality / 'node_modules' / '.bin' / 'eslint').exists():
+        return
+    tracked = git_out(['ls-files'], top) or ''
+    if not any(name.endswith(JS_TS) for name in tracked.splitlines()):
+        return
+    if not shutil.which('npm'):
+        die('this repo has JavaScript/TypeScript, and the platform\'s ESLint check needs npm: `brew install node`')
+    print('magehand: installing ESLint and its plugins (hash-locked, once)', file=sys.stderr)
+    if subprocess.run(['npm', 'ci', '--prefix', str(quality), '--ignore-scripts', '--no-audit', '--no-fund',  # nosec B603 B607
+                       '--loglevel', 'error']).returncode != 0:
+        die(f'npm ci in {quality} failed')
+
+
+def default_base(top):
+    """The ref a branch is compared with: origin's default branch (origin/HEAD), else origin/main."""
+    head = git_out(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], top)
+    return head or 'origin/main'
+
+
+def pushed_ranges(lines, top):
+    """[(from, to)] to check for a pre-push hook's stdin lines (`local_ref local_sha remote_ref remote_sha`): a
+    deleted ref and a tag have nothing to check; a new branch is compared with its merge base on origin."""
+    ranges = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, _, remote_sha = parts
+        if local_sha == ZERO_SHA or local_ref.startswith('refs/tags/'):
+            continue
+        if remote_sha == ZERO_SHA:
+            base = git_out(['merge-base', local_sha, default_base(top)], top)
+            if not base:
+                continue  # nothing on origin to compare with (a new repo): CI checks it
+            remote_sha = base
+        if remote_sha != local_sha:
+            ranges.append((remote_sha, local_sha))
+    return ranges
+
+
+def verified_path(top):
+    git_dir = git_out(['rev-parse', '--absolute-git-dir'], top)
+    return pathlib.Path(git_dir) / 'magehand' / 'verified' if git_dir else None
+
+
+def verified_commits(top):
+    path = verified_path(top)
+    try:
+        return [line.split()[0] for line in path.read_text().splitlines() if line.strip()] if path else []
+    except OSError:
+        return []
+
+
+def record_verified(top, sha):
+    path = verified_path(top)
+    if path is None:
+        return False
+    kept = [s for s in verified_commits(top) if s != sha][-(VERIFIED_KEEP - 1):] + [sha]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(kept) + '\n')
+    return True
+
+
+def clean_checkout(top):
+    """True when no tracked file differs from HEAD (what was checked is the commit)."""
+    out = subprocess.run(['git', '-C', str(top), 'status', '--porcelain', '--untracked-files=no'],  # nosec B603 B607
+                         capture_output=True, text=True)
+    return out.returncode == 0 and not out.stdout.strip()
+
+
+def run_pre_commit(pc, top, rng, only):
+    """pre-commit with the platform's config, then the repo's own (CI runs both); True if every check passed."""
+    configs = [PRE_COMMIT_CONFIG] + (['.pre-commit-config.yaml'] if (top / '.pre-commit-config.yaml').is_file() else [])
+    ok = True
+    for config in configs:
+        if only and config != PRE_COMMIT_CONFIG:
+            continue
+        cmd = [str(pc), 'run', '--config', config, *([only] if only else []), *rng, '--color',
+               'always' if sys.stdout.isatty() else 'never']
+        ok = subprocess.run(cmd, cwd=top).returncode == 0 and ok  # nosec B603  # fixed argv
+    return ok
+
+
+def cmd_verify(a):
+    global APPS_DIR
+    if a.apps_dir:
+        APPS_DIR = a.apps_dir
+    top = lab_checkout('verify')
+    if a.pre_push:
+        ranges = pushed_ranges(sys.stdin.read().splitlines(), top)
+        if not ranges:
+            sys.exit(0)  # a tag, a deleted branch or nothing new: nothing to check
+    elif a.all:
+        ranges = [None]
+    else:
+        base = git_out(['merge-base', 'HEAD', default_base(top)], top)
+        if not base:
+            die(f'cannot find where this branch starts on {default_base(top)}: `git fetch`, or `magehand verify --all`')
+        ranges = [(base, 'HEAD')]
+    quality = quality_tree(quality_pin())
+    link_quality(top, quality)
+    ensure_eslint(quality, top)
+    pc = pre_commit_bin(quality)
+    ok = all([run_pre_commit(pc, top, ['--all-files'] if r is None else ['--from-ref', r[0], '--to-ref', r[1]],
+                             a.only) for r in ranges])
+    app = checkout_app(top)
+    if ok and app and not a.only:  # an app repo: the platform's rules too, as its CI checks them
+        ok = subprocess.run([sys.executable, '-m', 'magehand', 'check'], cwd=top).returncode == 0  # nosec B603
+    head = git_out(['rev-parse', 'HEAD'], top)
+    recorded = bool(ok and not a.only and head and clean_checkout(top) and record_verified(top, head))
+    if a.pre_push:
+        if not ok:
+            print('magehand: push stopped: fix what the checks found, commit, and push again (`magehand verify` '
+                  'shows the same; in an emergency `git push --no-verify`, and CI still checks the PR)', file=sys.stderr)
+        sys.exit(0 if ok else 1)
+    scope = 'every file' if a.all else f'the files changed since {default_base(top)}'
+    step = (f'`magehand pr ready` once the PR\'s checks are green' if ok and recorded else
+            'commit, then `magehand verify` again (a pass is recorded only for a clean checkout)' if ok else
+            'fix what the checks found (each names its file and line), commit, then `magehand verify` again')
+    if a.json:
+        print(json.dumps({'ok': ok, 'checked': scope, 'only': a.only, 'commit': head, 'recorded': recorded,
+                          'next': step}))
+    else:
+        print(f'checks {"passed" if ok else "FAILED"} ({scope}{", " + a.only + " only" if a.only else ""})'
+              + (f'; recorded for {head[:7]}' if recorded else ''))
+        print(next_line(step))
+    sys.exit(0 if ok else 1)
+
+
+def hook_path(top):
+    """The pre-push hook's path (git's hooks dir, core.hooksPath included), and whether it is core.hooksPath."""
+    custom = git_out(['config', '--get', 'core.hooksPath'], top)
+    path = git_out(['rev-parse', '--git-path', 'hooks/pre-push'], top)
+    return (top / path if path and not os.path.isabs(path) else pathlib.Path(path or '')), bool(custom)
+
+
+def hook_state(path):
+    """'missing', 'installed', 'outdated' (ours, older text) or 'other' (someone else's hook)."""
+    if not path.is_file():
+        return 'missing'
+    text = path.read_text(errors='replace')
+    if HOOK_MARK not in text:
+        return 'other'
+    return 'installed' if text == HOOK_SCRIPT else 'outdated'
+
+
+def install_hook(top):
+    """Write magehand's pre-push hook unless another hook is there; returns (state before, what happened)."""
+    path, custom = hook_path(top)
+    state = hook_state(path)
+    if state == 'installed':
+        return state, f'already installed ({path})'
+    if state == 'other':
+        return state, (f'{path} is another tool\'s hook, left as it is: add `magehand verify --pre-push "$@"` '
+                       'to it')
+    if custom and not path.parent.is_dir():
+        return state, f'core.hooksPath points to {path.parent}, which does not exist: create it, or unset it'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(HOOK_SCRIPT)
+    path.chmod(0o755)
+    return state, f'{"updated" if state == "outdated" else "installed"} {path}'
+
+
+def doctor_hook():
+    """doctor's line for the pre-push hook (homelab#611) in one of the homelab's checkouts: (label, ok, fix), or
+    None outside one."""
+    top = checkout_top()
+    repo = remote_repo(top) if top else None
+    if repo is None:
+        return None
+    state = hook_state(hook_path(top)[0])
+    return (f'{repo}: pre-push hook runs `magehand verify`', state == 'installed',
+            '`magehand hooks install`' if state != 'other' else
+            'another tool\'s pre-push hook is there: add `magehand verify --pre-push "$@"` to it')
+
+
+def cmd_hooks(a):
+    top = lab_checkout('hooks')
+    path, _ = hook_path(top)
+    state = hook_state(path)
+    if a.hooks_action == 'install':
+        before, what = install_hook(top)
+        ok = before != 'other' and 'does not exist' not in what
+        step = ('push as usual: the hook checks what you push' if ok else
+                'add the line to that hook, or remove it and run `magehand hooks install` again')
+    elif a.hooks_action == 'remove':
+        if state in ('installed', 'outdated'):
+            path.unlink()
+            what, ok, step = f'removed {path}', True, '`magehand hooks install` puts it back'
+        else:
+            what = 'no magehand hook to remove' + (f' ({path} is another tool\'s, left as it is)' if state == 'other' else '')
+            ok, step = True, None
+    else:
+        ok = state == 'installed'
+        what = {'installed': f'installed ({path})', 'missing': 'not installed',
+                'outdated': f'installed, but older than this magehand ({path})',
+                'other': f'{path} is another tool\'s hook (magehand\'s is not in it)'}[state]
+        step = None if ok else ('`magehand hooks install`' if state != 'other' else
+                                'add `magehand verify --pre-push "$@"` to that hook')
+    if a.json:
+        print(json.dumps({'hook': str(path), 'state': hook_state(path), 'ok': ok, 'result': what, 'next': step}))
+    else:
+        print(f'pre-push hook: {what}')
+        print(next_line(step))
+    sys.exit(0 if ok or a.hooks_action == 'status' else 1)  # status reports; --json carries ok
 
 
 def cmd_agents(a):
@@ -7447,6 +7822,19 @@ def cmd_pr(a):
                'not readied: no checks have reported yet',
                f'fix them and push, then `magehand pr ready {number}` again' if failing else
                f'`gh pr checks {number} --watch`, then `magehand pr ready {number}` again')
+    # The platform's checks ran on this commit here first (homelab#611): a review or a CI run is not spent on a head
+    # that `magehand verify` would have stopped. --force readies it anyway and says so on the PR.
+    top = checkout_top()
+    if head and top and head not in verified_commits(top):
+        if not a.force:
+            finish(False, f'not readied: its head {head[:7]} has not passed `magehand verify` in this checkout',
+                   f'check out {head[:7]} (`git pull`), `magehand verify`, then `magehand pr ready {number}` again '
+                   '(--force readies it without, and says so on the PR)')
+        code, _, err = gh_cli('pr', 'comment', str(number), '-R', repo, '--body',
+                              f'Readied with `magehand pr ready --force`: `{head[:7]}` has not passed `magehand verify` '
+                              'locally (the platform\'s checks still run in CI).')
+        changed.append('readied without a local `magehand verify` (--force; said so on the PR)' if code == 0 else
+                       f'readied without a local `magehand verify` (--force; the PR comment failed: {err or "gh failed"})')
     own = (pr.get('author') or {}).get('login', '').lower() == BOT.lower()  # OpenClaw's own PR: the owner reviews it
     # The request first, on the draft (OpenClaw ignores drafts), confirmed; only then mark it ready, so a request
     # that didn't stick never leaves a ready PR without its reviewer.
@@ -8293,10 +8681,10 @@ def cmd_job(a):
 # The root help groups commands by task, most used first (each line from the
 # command's short help).
 GROUPS = (('start an app', ('new', 'icon')),
-          ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'api')),
+          ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'verify', 'api')),
           ('ship an app', ('pr', 'release', 'job', 'fetch')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
-          ('this machine', ('setup', 'doctor', 'upgrade')))
+          ('this machine', ('setup', 'doctor', 'hooks', 'upgrade')))
 # Working, but not what a person needs to learn: -V and -h do version's and help's jobs, setup and upgrade
 # install the skill (OpenClaw's provisioning runs `skill --install`), and check says when to update-agents.
 PLUMBING = ('update-agents', 'skill', 'version', 'help')
@@ -8462,6 +8850,8 @@ def build_parser():
     psub = p.add_subparsers(dest='pr_action', metavar='ACTION', required=True, parser_class=Parser)
     q = psub.add_parser('ready', help='ready a green PR and request the review, confirmed')
     q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
+    q.add_argument('--force', action='store_true',
+                   help="ready it though its head hasn't passed `magehand verify` here (says so on the PR)")
     q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     q = psub.add_parser('watch', help='follow the PR until its review, a failure or the merge, then say what to do')
     q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
@@ -8568,6 +8958,33 @@ def build_parser():
     p.add_argument('--ui', action='store_true',
                    help="run CI's browser check here instead (builds the image; needs a container runtime)")
     json_option(p)
+    p = command('verify', cmd_verify, "run the platform's checks on what you'll push, as CI does",
+                "run the platform's static checks on this branch, as the PR's CI will",
+                "The same checks as homelab-apps' checks.yaml (ruff's bug rules, ESLint's, shellcheck and the lab's\n"
+                "own rules), at the commit CI uses, on the files changed since origin's default branch; then the\n"
+                "repo's own .pre-commit-config.yaml, and in an app repo `magehand check`. A pass of a clean checkout\n"
+                'is recorded for its commit: `magehand pr ready` asks for it. The first run installs pre-commit (and\n'
+                'ESLint where there is JS/TS), hash-locked, into the cache; later runs take seconds. Exit 1 when a\n'
+                "check fails. `magehand hooks install` runs it before every push.\n\n"
+                'examples:\n  magehand verify\n  magehand verify --all          every file (the backlog, not only your change)\n'
+                '  magehand verify --only eslint\n  magehand verify --json')
+    p.add_argument('--all', action='store_true', help='check every file, not only the ones this branch changes')
+    p.add_argument('--only', choices=HOOKS, metavar='CHECK', help=f'run one check: {", ".join(HOOKS)}')
+    p.add_argument('--apps-dir', metavar='DIR', help="read this homelab-apps checkout's checks instead of GitHub's")
+    p.add_argument('--pre-push', action='store_true', help=argparse.SUPPRESS)
+    p.add_argument('push_args', nargs='*', help=argparse.SUPPRESS)  # git gives the hook the remote's name and URL
+    json_option(p)
+    p = command('hooks', cmd_hooks, 'install the pre-push hook that runs verify', "install, check or remove the git pre-push hook that runs `magehand verify`",
+                'The hook runs `magehand verify --pre-push` on the commits being pushed and stops the push when\n'
+                'a check fails. It never replaces another tool\'s hook (it says what to add to it instead); without\n'
+                'magehand on PATH it lets the push through with a warning (CI still checks the PR). `git push\n'
+                '--no-verify` skips it in an emergency. `magehand new` installs it; `magehand doctor` reports it.\n\n'
+                'examples:\n  magehand hooks install\n  magehand hooks status --json\n  magehand hooks remove')
+    hsub = p.add_subparsers(dest='hooks_action', metavar='ACTION', required=True, parser_class=Parser)
+    for name, short in (('install', 'write the pre-push hook (safe to re-run)'), ('status', 'say whether it is installed'),
+                        ('remove', "remove magehand's hook (never another tool's)")):
+        q = hsub.add_parser(name, help=short)
+        q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     p = command('update-agents', cmd_agents, "update this repo's AGENTS.md from the template", "update the platform rules in this repo's AGENTS.md from homelab-app-template",
                 'Replaces everything above the "## This app" heading with the template\'s current text and keeps\n'
                 "the heading and everything below it (the app's own notes). Writes only AGENTS.md; commit it yourself.\n\n"
