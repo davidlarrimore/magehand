@@ -321,6 +321,28 @@ def registration(name):
     return None if text is None else (yaml.safe_load(text) or {})
 
 
+def registered_apps():
+    """{app: its source repo (None: code kept in homelab-apps)} for every app in homelab-apps apps/: the checkout's
+    with --apps-dir, else GitHub's main. None when GitHub's list couldn't be read."""
+    if APPS_DIR:
+        names = sorted(f.parent.name for f in pathlib.Path(APPS_DIR, 'apps').glob('*/app.yaml'))
+    else:
+        names, why = github_listing(APPS_REPO, 'apps')
+        if names is None:
+            return None
+    found = {}
+    for app in names:
+        spec = registration(app)
+        if spec is None:
+            continue
+        source = spec.get('source') if isinstance(spec, dict) else None
+        found[app] = source.get('repo') if isinstance(source, dict) else None
+    return found
+
+
+CHECK_STRICT = False  # cmd_check's --strict, for a rule that couldn't run
+
+
 def llm_key_state(name, block, deployed):
     """Where block's dev key stands, from the deployed spec (None: not registered): 'unregistered',
     'undeployed' (the block isn't on main yet) or 'deployed' (the key exists or is being created)."""
@@ -4138,16 +4160,22 @@ def check_app_name(app):
             found.append(finding('error', at, f'the app name {name} is registered in homelab-apps to '
                                  f'{"davidlarrimore/" + owner if owner else "code kept there"}, not to this repo '
                                  f'({repo}): set another `app:`', guide))
-    if APPS_DIR:  # CI: homelab-apps' apps/ is on disk, so a repo registered under another name is found
-        for f in sorted(pathlib.Path(APPS_DIR, 'apps').glob('*/app.yaml')):
-            try:
-                other = (yaml.safe_load(f.read_text()) or {}).get('source') or {}
-            except (OSError, yaml.YAMLError, AttributeError):
-                continue
-            if f.parent.name != name and isinstance(other, dict) and other.get('repo') == repo:
-                found.append(finding('error', at, f'this repo is registered as the app {f.parent.name}, but '
-                                     f'{at} names {name}: restore `app: {f.parent.name}` (the image is named '
-                                     'after the app)', guide))
+    # A repo registered under another name (a rename CI would reject): homelab-apps' apps/ from its checkout in CI,
+    # from GitHub here, so a local check (and `magehand verify`'s record) catches it too (magehand#110's review).
+    try:
+        regs = registered_apps()
+    except (OSError, yaml.YAMLError, AttributeError):
+        regs = None
+    if regs is None:
+        if CHECK_STRICT:
+            found.append(finding('error', at, "couldn't read homelab-apps' app registrations to check this repo's app "
+                                 'name (--strict: every rule must run); `gh auth status`, then check again', guide))
+        return found
+    for other, owner in sorted(regs.items()):
+        if other != name and owner == repo:
+            found.append(finding('error', at, f'this repo is registered as the app {other}, but '
+                                 f'{at} names {name}: restore `app: {other}` (the image is named '
+                                 'after the app)', guide))
     return found
 
 
@@ -5578,7 +5606,8 @@ def cmd_check_ui(a):
 
 
 def cmd_check(a):
-    global APPS_DIR
+    global APPS_DIR, CHECK_STRICT
+    CHECK_STRICT = bool(a.strict)
     if a.ui:
         if a.manifests_only or a.apps_dir or a.strict:
             usage('check', '--ui runs the browser check only: leave out --manifests-only, --apps-dir and --strict')
@@ -7926,12 +7955,13 @@ def cmd_pr(a):
                    f'in the PR\'s checkout, at {head[:7] if head else "its head"} (`git pull`): `magehand verify`, then '
                    f'`magehand pr ready {number}` again (--force readies it without, and says so on the PR)')
         code, _, err = gh_cli('pr', 'comment', str(number), '-R', repo, '--body',
-                              f'Readied with `magehand pr ready --force`: `{(head or "its head")[:7]}` has not passed '
-                              '`magehand verify` locally (the platform\'s checks still run in CI).')
+                              f'`magehand pr ready --force`: `{(head or "its head")[:7]}` has not passed `magehand verify` '
+                              'locally; it is being readied without it (the platform\'s checks still run in CI).')
         if code != 0:  # the disclosure is the condition of --force: without it, nothing is readied
             finish(False, f'not readied: the --force comment could not be posted ({err or "gh failed"})',
                    f'`magehand pr ready {number} --force` again, or `magehand verify` first')
-        changed.append('readied without a local `magehand verify` (--force; said so on the PR)')
+        # Only the disclosure so far: whether it gets readied is the steps below (magehand#110's review).
+        changed.append('said on the PR that `magehand verify` was skipped (--force)')
     own = (pr.get('author') or {}).get('login', '').lower() == BOT.lower()  # OpenClaw's own PR: the owner reviews it
     # The request first, on the draft (OpenClaw ignores drafts), confirmed; only then mark it ready, so a request
     # that didn't stick never leaves a ready PR without its reviewer.

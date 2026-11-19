@@ -2578,6 +2578,27 @@ class AppNameOverride(unittest.TestCase):
             errors = texts(magehand.check_app_name(self.load(tmp, 'services: {}\n', name='lab-website')), 'error')
         self.assertTrue(any('registered as the app lab' in e and 'restore `app: lab`' in e for e in errors), errors)
 
+    def test_a_rename_is_caught_without_a_homelab_apps_checkout(self):
+        # magehand#110's review: the reverse lookup ran only with --apps-dir (CI), so a local `check --strict` (and
+        # verify's record) passed a rename CI rejects. Here the registrations come from GitHub.
+        regs = {'apps/old-name/app.yaml': 'source: {repo: lab-website}\nservices: {}\n'}
+        with mock.patch.object(magehand, 'APPS_DIR', None), \
+                mock.patch.object(magehand, 'github_listing', lambda repo, path: (['old-name'], None)), \
+                mock.patch.object(magehand, 'github_file', lambda repo, path, required=True, ref='main': regs.get(path)), \
+                tempfile.TemporaryDirectory() as tmp:
+            errors = texts(magehand.check_app_name(self.load(tmp, 'app: new-name\nservices: {}\n', name='new-name')),
+                           'error')
+        self.assertTrue(any('registered as the app old-name' in e for e in errors), errors)
+
+    def test_unreadable_registrations_fail_only_strict(self):
+        for strict, expected in ((True, 1), (False, 0)):
+            with mock.patch.object(magehand, 'APPS_DIR', None), mock.patch.object(magehand, 'CHECK_STRICT', strict), \
+                    mock.patch.object(magehand, 'github_listing', lambda repo, path: (None, 'HTTP 502')), \
+                    mock.patch.object(magehand, 'github_file', lambda *a, **k: None), \
+                    tempfile.TemporaryDirectory() as tmp:
+                errors = texts(magehand.check_app_name(self.load(tmp, 'app: lab\nservices: {}\n')), 'error')
+            self.assertEqual(len([e for e in errors if "couldn't read homelab-apps' app registrations" in e]), expected)
+
 
 class BucketAccess(unittest.TestCase):
     """A bucket's access can't change in place: deploy/app.yaml against homelab-apps' dev and release copies."""
@@ -8268,7 +8289,7 @@ class PrReadyNeedsVerify(unittest.TestCase):
         self.assertEqual(code, 0)
         comment = next(w for w in writes if w[:2] == ('pr', 'comment'))
         self.assertIn('has not passed `magehand verify`', comment[-1])
-        self.assertIn('readied without a local `magehand verify` (--force; said so on the PR)', out)
+        self.assertIn('said on the PR that `magehand verify` was skipped (--force)', out)
         self.assertTrue(any(w[:2] == ('pr', 'ready') for w in writes))
 
     def test_outside_a_checkout_it_is_unverified(self):
@@ -8284,6 +8305,13 @@ class PrReadyNeedsVerify(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(any(w[:2] == ('pr', 'ready') for w in writes))  # nothing readied
         self.assertIn('the --force comment could not be posted (HTTP 403)', out)
+
+    def test_force_reports_readiness_only_once_it_happens(self):
+        # magehand#110's review: with the disclosure posted and the review request refused, it said "readied".
+        code, out, writes = self.run_pr(extra=('--force',), refused='HTTP 422: not a collaborator', access='missing')
+        self.assertEqual(code, 1)
+        self.assertNotIn('readied', out.replace('not readied', ''))
+        self.assertFalse(any(w[:2] == ('pr', 'ready') for w in writes))
 
     def test_a_verified_head_is_readied(self):
         with mock.patch.object(magehand, 'verified_commits', lambda top: ['a' * 40]):
