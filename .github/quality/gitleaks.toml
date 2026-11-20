@@ -5,7 +5,8 @@ useDefault = true
 
 # Test fixtures: hashes, golden outputs and fake tokens match the generic rule. Only that rule is allowed there:
 # the provider rules (AWS, GitHub, Slack, ...) still apply, so a real key pasted into a test is still caught.
-# A false positive elsewhere: `gitleaks:allow` on its line, or its fingerprint in the repo's .gitleaksignore.
+# A false positive elsewhere: `gitleaks:allow` on its line, or `path:rule:line` in the repo's .gitleaksignore (the
+# printed fingerprint without its leading `<commit>:`).
 [[allowlists]]
 description = "test fixtures"
 targetRules = ["generic-api-key"]
