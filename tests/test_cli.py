@@ -2945,7 +2945,7 @@ class New(unittest.TestCase):
         self.assertEqual(magehand.CHECKS_RULESET['bypass_actors'], [])
         rule = next(r for r in magehand.CHECKS_RULESET['rules'] if r['type'] == 'required_status_checks')
         self.assertEqual([c['context'] for c in rule['parameters']['required_status_checks']],
-                         ['security / scan', 'image / result'])
+                         ['security / scan', 'image / result', 'checks / pre-commit'])
 
     def test_checks_a_merge_could_skip_are_reported_not_changed(self):
         import contextlib
@@ -2953,7 +2953,7 @@ class New(unittest.TestCase):
         bypass = dict(magehand.CHECKS_RULESET, id=8, bypass_actors=magehand.RULESET['bypass_actors'])
         one = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
             'required_status_checks': [{'context': 'security / scan'}]}}])
-        for weak, why in ((bypass, 'bypass'), (one, 'image / result not required')):
+        for weak, why in ((bypass, 'bypass'), (one, 'image / result, checks / pre-commit not required')):
             self.calls.clear()
             self.fake(exists='true', collaborator=True, ruleset=True, checks=weak)
             err = io.StringIO()
@@ -3586,12 +3586,14 @@ class RepoConformance(unittest.TestCase):
         def required(*contexts, ruleset_id=8):
             return {'type': 'required_status_checks', 'ruleset_id': ruleset_id,
                     'parameters': {'required_status_checks': [{'context': c} for c in contexts]}}
-        both = [{'type': 'pull_request', 'ruleset_id': 7}, required('security / scan', 'image / result')]
+        both = [{'type': 'pull_request', 'ruleset_id': 7},
+                required('security / scan', 'image / result', 'checks / pre-commit')]
         theirs = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8)), '')
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': theirs}))
         self.assertEqual((state['checks'], state['checks_detail']), ('ok', ''))
         # Any ruleset's rule counts, split over two rulesets too.
-        split = [required('security / scan', ruleset_id=8), required('image / result', ruleset_id=9)]
+        split = [required('security / scan', ruleset_id=8),
+                 required('image / result', 'checks / pre-commit', ruleset_id=9)]
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(split), '')),
                                   **{'/rulesets/8': theirs, '/rulesets/9': theirs}))
         self.assertEqual(state['checks'], 'ok')
@@ -3599,7 +3601,12 @@ class RepoConformance(unittest.TestCase):
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps([required('security / scan')]), '')),
                                   **{'/rulesets/8': theirs}))
         self.assertEqual(state['checks'], 'weak')
-        self.assertIn('image / result not required on main', state['checks_detail'])
+        self.assertIn('image / result, checks / pre-commit not required on main', state['checks_detail'])
+        # An app set up before the static checks (homelab#611): weak until the owner adds checks / pre-commit.
+        older = [required('security / scan', 'image / result')]
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(older), '')), **{'/rulesets/8': theirs}))
+        self.assertEqual(state['checks'], 'weak')
+        self.assertIn('checks / pre-commit not required on main', state['checks_detail'])
         # A bypass list lets the owner merge red: weak.
         bypass = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8, bypass_actors=[{'actor_id': 5}])), '')
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': bypass}))

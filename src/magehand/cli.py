@@ -2500,9 +2500,11 @@ RULESET = {
 
 # The checks every app PR must pass before it merges, from the template's .github/workflows/build.yaml: its
 # `security` and `image` jobs call homelab-apps' shared workflows, and `image / result` passes only when every
-# job of the image build did. The ruleset requiring them has no bypass (as homelab's own "main: checks must
-# pass"): the owner's bypass of the approval never skips CI.
-REQUIRED_CHECKS = ('security / scan', 'image / result')
+# job of the image build did; `checks / pre-commit` is the platform's static checks (homelab#611). The ruleset
+# requiring them has no bypass (as homelab's own "main: checks must pass"): the owner's bypass of the approval
+# never skips CI.
+REQUIRED_CHECKS = ('security / scan', 'image / result', 'checks / pre-commit')
+REQUIRED_NAMES = ', '.join(REQUIRED_CHECKS[:-1]) + ' and ' + REQUIRED_CHECKS[-1]
 CHECKS_RULESET = {
     'name': 'main: checks must pass', 'target': 'branch', 'enforcement': 'active',
     'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH'], 'exclude': []}},
@@ -2697,7 +2699,7 @@ def ensure_checks(repo):
     state, detail = checks_status(repo)
     name = CHECKS_RULESET['name']
     if state == 'ok':
-        print(f"{repo}: the checks {' and '.join(REQUIRED_CHECKS)} are already required", file=sys.stderr)
+        print(f"{repo}: the checks {REQUIRED_NAMES} are already required", file=sys.stderr)
         return 'exists'
     if state == 'weak':
         print(f"{repo}: required checks are incomplete ({detail}); fix it in the repo's Settings > Rules "
@@ -2707,7 +2709,7 @@ def ensure_checks(repo):
         code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-',
                                  stdin=json.dumps(CHECKS_RULESET))
         if code == 0:
-            print(f"{repo}: ruleset '{name}' added (a PR merges only when {' and '.join(REQUIRED_CHECKS)} pass; "
+            print(f"{repo}: ruleset '{name}' added (a PR merges only when {REQUIRED_NAMES} pass; "
                   'nobody can bypass it)', file=sys.stderr)
             return 'created'
     print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
@@ -3289,7 +3291,7 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
         steps.append(f"do:    add the ruleset '{RULESET['name']}' (only an admin can): run `magehand new "
                      f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
     if checks == 'weak':
-        steps.append(f"do:    require the checks {' and '.join(REQUIRED_CHECKS)} on main with no bypass in the repo's "
+        steps.append(f"do:    require the checks {REQUIRED_NAMES} on main with no bypass in the repo's "
                      'Settings > Rules (magehand leaves an existing ruleset alone)')
     elif checks == 'failed':
         steps.append(f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
@@ -4042,7 +4044,7 @@ def cmd_doctor(a):
                  if bot == 'invited' else unread),
                 (f"{repo}: ruleset '{RULESET['name']}'", None if state['ruleset'] is None else state['ruleset'] == 'ok',
                  weak if state['ruleset'] == 'weak' else fix, unread),
-                (f"{repo}: merges wait for {' and '.join(REQUIRED_CHECKS)}",
+                (f"{repo}: merges wait for {REQUIRED_NAMES}",
                  None if state['checks'] is None else state['checks'] == 'ok',
                  f'{state["checks_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
                  if state['checks'] == 'weak' else fix, unread),
@@ -8926,7 +8928,7 @@ def build_parser():
     p = command('new', cmd_new, "create an app's repo for the platform, or repair one",
                 "create an app's private repo from homelab-app-template, invite OpenClaw's bot (write) and add\n"
                 "the rulesets 'main: owner approves' (an approval) and 'main: checks must pass' (green\n"
-                "security / scan and image / result, no bypass); on an existing repo, add whichever is missing",
+                "security / scan, image / result and checks / pre-commit, no bypass); on an existing repo, add whichever is missing",
                 'Uses gh as you (only the owner can create the repo).\n\n'
                 'Repair: run it again on a repo made without it (`magehand doctor` says when one is). It\n'
                 'invites a missing bot, gives a read-only one write, renews a pending invitation and adds a\n'
@@ -9304,7 +9306,7 @@ def build_parser():
                 "check GitHub access, homelab reach, sign-in, the app repo's setup and the container runtime",
                 'In an app repo it also checks that OpenClaw\'s bot can write to it (a pending invitation is\n'
                 "a note), that it is private, that the ruleset 'main: owner approves' is active on the\n"
-                'default branch, and that merges wait for security / scan and image / result with no bypass.\n'
+                'default branch, and that merges wait for security / scan, image / result and checks / pre-commit with no bypass.\n'
                 'Each failure names its fix (`magehand new REPO` repairs the repo). What\n'
                 'needs admin to read (the ruleset, invitations) is a note when unreadable, not a failure;\n'
                 'an archived repo is not checked. Run it at the start of a session. Exit 1 on a failure.\n\n'
