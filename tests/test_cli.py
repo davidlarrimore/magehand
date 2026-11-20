@@ -8323,15 +8323,15 @@ class Verify(unittest.TestCase):
             f'refs/heads/main {a} refs/heads/main {z}',     # a new default branch: every file, no record
             f'refs/heads/same {a} refs/heads/same {a}',   # nothing new
             'garbage'])
-        self.assertEqual(targets, [(a, base, a, True), (a, base, a, False), (a, None, None, False)])
-        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True)])
+        r = f'{base}..{a}'
+        self.assertEqual(targets, [(a, base, a, True, r), (a, base, a, False, r), (a, None, None, False, None)])
         # --all still scans the branch's commits for secrets, from the merge base (magehand#114's review)...
-        self.assertEqual(magehand.commit_range(top, a, None, None), f'{base}..{a}')
-        self.assertEqual(magehand.commit_range(top, a, base, a), f'{base}..{a}')
-        # ...and with no shared history there is no range to scan, so no record either.
+        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True, r)])
+        # ...and with no shared history there is no range to scan, so no record either, push or --all.
         self.git(top, 'update-ref', '-d', 'refs/remotes/origin/main')
-        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, False)])
-        self.assertIsNone(magehand.commit_range(top, a, None, None))
+        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, False, None)])
+        self.assertEqual(magehand.verify_targets(top, [f'refs/heads/x {a} refs/heads/x {base}']),
+                         [(a, None, None, False, None)])
 
     def test_verify_all_passes_the_commit_range_and_only_takes_gitleaks(self):
         top = self.repo()
@@ -8344,6 +8344,13 @@ class Verify(unittest.TestCase):
         self.assertIn('; recorded', out)
         code, out, _ = self.main('verify', '--only', 'gitleaks')  # magehand#114's review: a valid choice
         self.assertEqual(code, 0)
+        # No merge base: a pass, not recorded, and the reason and the fix are about the base, not --apps-dir.
+        self.git(top, 'update-ref', '-d', 'refs/remotes/origin/main')
+        code, out, _ = self.main('verify', '--all')
+        self.assertEqual(code, 0)
+        self.assertIn('not recorded: no merge base', out)
+        self.assertIn('git fetch origin', out)
+        self.assertNotIn('--apps-dir', out)
 
     def test_verify_json_is_only_json(self):
         # magehand#110's review: pre-commit's own output went to stdout before the JSON object.
