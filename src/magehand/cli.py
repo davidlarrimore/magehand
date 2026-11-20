@@ -2715,6 +2715,11 @@ def platform_checks_call(text, on_pull_requests=False):
         filters = on.get('pull_request') if isinstance(on, dict) else None
         if isinstance(filters, dict) and set(filters) & {'paths', 'paths-ignore', 'branches', 'branches-ignore'}:
             return None
+        # A `types` list must keep the default activities, or a later push to the PR doesn't run it.
+        types = filters.get('types') if isinstance(filters, dict) else None
+        if types is not None and not {'opened', 'synchronize', 'reopened'} <= set(
+                [types] if isinstance(types, str) else types if isinstance(types, list) else []):
+            return None
     prefix = f'{APPS_REPO}/{CHECKS_WORKFLOW}@'
     jobs = flow.get('jobs') if isinstance(flow.get('jobs'), dict) else {}
     for job_id, job in jobs.items():
@@ -3357,7 +3362,8 @@ def checks_steps(repo, checks):
     # The third check only once it reports on every PR: required and never reported, it blocks them all.
     third = (f"require {PLATFORM_CHECK} only once a recent PR's checks list it: {BUILD_WORKFLOW} must run "
              "homelab-app-template's `checks` job, under that name, on every pull request (no `paths` or `branches` "
-             "filter; `magehand check` warns otherwise)")
+             "filter, and a `types` list, if any, keeping opened, synchronize and reopened, so every push to a PR runs it; "
+             "`magehand check` warns otherwise)")
     if checks == 'weak':
         others = ' and '.join(c for c in REQUIRED_CHECKS if c != PLATFORM_CHECK)
         return [f"do:    require {others} on main with no bypass in the repo's Settings > Rules (magehand leaves "

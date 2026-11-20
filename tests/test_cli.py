@@ -2995,6 +2995,7 @@ class New(unittest.TestCase):
                      f'on:\n  pull_request:\n    paths: [src/**]\njobs:\n  checks:\n    uses: {call}\n',
                      f'on:\n  pull_request:\n    branches: [main]\njobs:\n  checks:\n    uses: {call}\n',
                      f'on: [pull_request]\njobs:\n  lint:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: [opened]\njobs:\n  checks:\n    uses: {call}\n',
                      f'on: [pull_request]\njobs:\n  checks:\n    name: Lint\n    uses: {call}\n'):
             self.assertIsNone(magehand.platform_checks_call(text, on_pull_requests=True), text)
         self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
@@ -3002,6 +3003,9 @@ class New(unittest.TestCase):
         template = (f"on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\njobs:\n  checks:\n"
                     f"    if: github.event_name != 'workflow_dispatch'\n    uses: {call}\n")
         self.assertEqual(magehand.platform_checks_call(template, on_pull_requests=True), 'main')
+        every = (f'on:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\njobs:\n  checks:\n'
+                 f'    uses: {call}\n')
+        self.assertEqual(magehand.platform_checks_call(every, on_pull_requests=True), 'main')
 
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
