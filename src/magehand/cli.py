@@ -5845,7 +5845,7 @@ TOOLS_PIN = re.compile(r'\b' + re.escape(APPS_REPO) + r'/\.github/actions/tools@
 PLATFORM_LINK = '.platform-quality'
 PRE_COMMIT_CONFIG = f'{PLATFORM_LINK}/pre-commit-config.yaml'
 JS_TS = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts')
-HOOKS = ('ruff-check', 'eslint', 'shellcheck', 'platform-rules')
+HOOKS = ('ruff-check', 'eslint', 'shellcheck', 'gitleaks', 'platform-rules')
 ZERO_SHA = '0' * 40
 VERIFIED_KEEP = 20  # commits kept in .git/magehand/verified
 # Git's own variables point a child git at this checkout; the worktree's checks must see their own.
@@ -6030,14 +6030,16 @@ def default_base(top):
 
 def verify_targets(top, pre_push_lines=None, everything=False):
     """[(commit, from, to, ci_range)] to check. A commit is checked over the range CI checks (its merge base on
-    origin's default branch to it; with `everything`, every file: from and to None), which is what a record may
-    stand for. For a pre-push hook's stdin lines (`local_ref local_sha remote_ref remote_sha`): a deleted ref and a
-    tag have nothing to check; a push to the default branch itself checks the commits it adds (not a CI range)."""
+    origin's default branch to it; with `everything`, every file: from and to None, and a record only when the merge
+    base is known, since the secrets hook scans that range (commit_range); magehand#114's review), which is what a
+    record may stand for. For a pre-push hook's stdin lines (`local_ref local_sha remote_ref remote_sha`): a deleted
+    ref and a tag have nothing to check; a push to the default branch itself checks the commits it adds (not a CI
+    range)."""
     base_ref = default_base(top)
     if pre_push_lines is None:
         head = git_out(['rev-parse', 'HEAD'], top)
         if everything:
-            return [(head, None, None, True)]
+            return [(head, None, None, git_out(['merge-base', 'HEAD', base_ref], top) is not None)]
         base = git_out(['merge-base', 'HEAD', base_ref], top)
         if not head or not base:
             die(f'cannot find where this branch starts on {base_ref}: `git fetch`, or `magehand verify --all`')
@@ -6061,6 +6063,15 @@ def verify_targets(top, pre_push_lines=None, everything=False):
         elif base != local_sha:
             targets.append((local_sha, base, local_sha, True))
     return targets
+
+
+def commit_range(top, sha, frm, to):
+    """FROM..TO for the secrets hook: the range being checked, or with every file (no range) the commit's merge
+    base on origin's default branch to it; None when there is none (no shared history)."""
+    if frm:
+        return f'{frm}..{to}'
+    base = git_out(['merge-base', sha, default_base(top)], top)
+    return f'{base}..{sha}' if base and base != sha else None
 
 
 def verified_path(top):
@@ -6182,7 +6193,7 @@ def cmd_verify(a):
             everything = frm is None or (own is not None and git_out(
                 ['diff', '--name-only', f'{frm}...{to}', '--', QUALITY_DIR, '.github/workflows'], work) != '')
             rng = ['--all-files'] if everything else ['--from-ref', frm, '--to-ref', to]
-            ok = run_pre_commit(pc, work, rng, a.only, out, commits=f'{frm}..{to}' if frm else None)
+            ok = run_pre_commit(pc, work, rng, a.only, out, commits=commit_range(top, sha, frm, to))
             if ok and not a.only and is_app_checkout(work):
                 # An app repo: the platform's rules too, strict as CI runs them (a rule whose tool is missing here
                 # fails instead of being skipped, so a record means they all ran; magehand#110's review).

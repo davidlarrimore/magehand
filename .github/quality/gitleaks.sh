@@ -33,7 +33,8 @@ cache="${XDG_CACHE_HOME:-$HOME/.cache}/platform-checks/gitleaks-$version-$asset"
 gitleaks="$cache/gitleaks"
 if [ ! -x "$gitleaks" ]; then
   download=$(mktemp -d); scratch+=("$download")
-  curl -fsSL --retry 3 -o "$download/gitleaks.tar.gz" \
+  # Bounded: a stalled connection must not hold a push open (about 3 minutes at most, retries included).
+  curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 --retry-max-time 150 -o "$download/gitleaks.tar.gz" \
     "https://github.com/gitleaks/gitleaks/releases/download/v$version/gitleaks_${version}_$asset.tar.gz"
   got=$(sha256 "$download/gitleaks.tar.gz" | cut -d' ' -f1)
   if [ "$got" != "$sum" ]; then

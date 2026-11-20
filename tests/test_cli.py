@@ -8325,6 +8325,25 @@ class Verify(unittest.TestCase):
             'garbage'])
         self.assertEqual(targets, [(a, base, a, True), (a, base, a, False), (a, None, None, False)])
         self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True)])
+        # --all still scans the branch's commits for secrets, from the merge base (magehand#114's review)...
+        self.assertEqual(magehand.commit_range(top, a, None, None), f'{base}..{a}')
+        self.assertEqual(magehand.commit_range(top, a, base, a), f'{base}..{a}')
+        # ...and with no shared history there is no range to scan, so no record either.
+        self.git(top, 'update-ref', '-d', 'refs/remotes/origin/main')
+        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, False)])
+        self.assertIsNone(magehand.commit_range(top, a, None, None))
+
+    def test_verify_all_passes_the_commit_range_and_only_takes_gitleaks(self):
+        top = self.repo()
+        a = self.commit(top, 'b.py', 'fine\n', branch='feature')
+        base = self.git(top, 'merge-base', 'origin/main', 'HEAD')
+        self.setup_verify(top)
+        code, out, _ = self.main('verify', '--all')
+        self.assertEqual(code, 0)
+        self.assertIn(f'(commits: {base}..{a})', out)
+        self.assertIn('; recorded', out)
+        code, out, _ = self.main('verify', '--only', 'gitleaks')  # magehand#114's review: a valid choice
+        self.assertEqual(code, 0)
 
     def test_verify_json_is_only_json(self):
         # magehand#110's review: pre-commit's own output went to stdout before the JSON object.
