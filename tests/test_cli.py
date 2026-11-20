@@ -2997,6 +2997,9 @@ class New(unittest.TestCase):
                      f'on: [pull_request]\njobs:\n  lint:\n    uses: {call}\n',
                      f'on:\n  pull_request:\n    types: [opened]\njobs:\n  checks:\n    uses: {call}\n',
                      f'on:\n  pull_request:\n    types: [opened, {{x: 1}}, [y]]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: [opened, synchronize, reopened, {{x: 1}}]\njobs:\n'
+                     f'  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: {{a: 1}}\njobs:\n  checks:\n    uses: {call}\n',
                      f'on: [pull_request]\njobs:\n  checks:\n    name: Lint\n    uses: {call}\n'):
             self.assertIsNone(magehand.platform_checks_call(text, on_pull_requests=True), text)
         self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
