@@ -2696,11 +2696,39 @@ def ensure_ruleset(repo):
 PLATFORM_CHECK = 'checks / pre-commit'
 
 
+def platform_checks_call(text, on_pull_requests=False):
+    """The ref of homelab-apps' checks.yaml that a workflow's job calls (`jobs.<id>.uses`, parsed: a comment
+    or a string elsewhere doesn't count), or None; with `on_pull_requests`, only when the workflow runs on pull
+    requests (where the check reports). None for a workflow that isn't valid YAML."""
+    try:
+        flow = yaml.safe_load(text or '')
+    except yaml.YAMLError:
+        return None
+    if not isinstance(flow, dict):
+        return None
+    if on_pull_requests:
+        on = flow.get('on', flow.get(True))  # YAML 1.1 reads a bare `on:` key as true
+        if not (on == 'pull_request' or (isinstance(on, (list, dict)) and 'pull_request' in on)):
+            return None
+    prefix = f'{APPS_REPO}/{CHECKS_WORKFLOW}@'
+    for job in (flow.get('jobs') or {}).values() if isinstance(flow.get('jobs'), dict) else []:
+        uses = job.get('uses') if isinstance(job, dict) else None
+        if isinstance(uses, str) and uses.startswith(prefix) and len(uses) > len(prefix):
+            return uses[len(prefix):]
+    return None
+
+
 def runs_platform_checks(repo):
-    """Whether the repo's build.yaml (on its default branch) calls the platform's checks.yaml, the job that
-    reports `checks / pre-commit`. False when it can't be read: requiring a check nothing reports blocks every PR."""
-    code, out, _ = gh_cli('api', f'repos/{repo}/contents/{BUILD_WORKFLOW}', '-H', 'Accept: application/vnd.github.raw')
-    return code == 0 and bool(CHECKS_CALL.search(out or ''))
+    """Whether the repo's build.yaml (on its default branch) runs the platform's checks.yaml on pull requests,
+    the job that reports `checks / pre-commit`: True, False (no such job, or no build.yaml), or None when it
+    can't be read (a rate limit, the network, a timeout: then nothing is decided from it)."""
+    code, out, err = gh_probe('api', f'repos/{repo}/contents/{BUILD_WORKFLOW}', '-H',
+                              'Accept: application/vnd.github.raw')
+    if code == 0:
+        return platform_checks_call(out, on_pull_requests=True) is not None
+    if code is not None and re.search(r'HTTP 404|Not Found', err or ''):
+        return False
+    return None
 
 
 def ensure_checks(repo):
@@ -2714,12 +2742,23 @@ def ensure_checks(repo):
         print(f"{repo}: the checks {REQUIRED_NAMES} are already required", file=sys.stderr)
         return 'exists'
     if state == 'weak':
+        if detail.startswith(f'{PLATFORM_CHECK} not required on ') and ';' not in detail \
+                and runs_platform_checks(repo) is False:
+            print(f"{repo}: {PLATFORM_CHECK} is not required, and {BUILD_WORKFLOW} doesn't run it yet: add "
+                  "homelab-app-template's `checks` job first, then require it in Settings > Rules", file=sys.stderr)
+            return 'partial'
         print(f"{repo}: required checks are incomplete ({detail}); fix it in the repo's Settings > Rules "
               "(magehand leaves an existing ruleset alone)", file=sys.stderr)
         return 'weak'
     if state == 'missing':
         ruleset, names = CHECKS_RULESET, REQUIRED_NAMES
-        if not runs_platform_checks(repo):
+        runs = runs_platform_checks(repo)
+        if runs is None:
+            # Unknown: a two-check ruleset would stay weak for good, a three-check one could block every PR.
+            print(f"{repo}: could not read {BUILD_WORKFLOW}, so the ruleset '{name}' was not added yet: run "
+                  f"`magehand new {repo.split('/', 1)[1]} --no-clone` again", file=sys.stderr)
+            return 'unknown'
+        if not runs:
             contexts = [check for check in REQUIRED_CHECKS if check != PLATFORM_CHECK]
             names = ' and '.join(contexts)
             ruleset = dict(CHECKS_RULESET, rules=[
@@ -2734,7 +2773,7 @@ def ensure_checks(repo):
         if code == 0:
             print(f"{repo}: ruleset '{name}' added (a PR merges only when {names} pass; "
                   'nobody can bypass it)', file=sys.stderr)
-            return 'created'
+            return 'created' if runs else 'partial'
     print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
           'checks until it exists', file=sys.stderr)
     return 'failed'
@@ -3232,7 +3271,7 @@ def cmd_new(a):
         print(f'{dest}: not touched (it is not a checkout of {repo})', file=sys.stderr)
     if named == 'differs' and work:
         print(f'{work}: no scaffold written: deploy/app.yaml on main names another app', file=sys.stderr)
-    steps = (new_steps(repo, name, app, dest, named, cloned, wrote) if created else
+    steps = (new_steps(repo, name, app, dest, named, cloned, wrote) + checks_steps(repo, checks) if created else
              repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote, checks))
     if pull:
         steps.insert(0, f'run:   git -C {shell_path(work)} pull   # new committed deploy/app.yaml (`app: {app}`) to main')
@@ -3313,17 +3352,27 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     elif ruleset == 'failed':
         steps.append(f"do:    add the ruleset '{RULESET['name']}' (only an admin can): run `magehand new "
                      f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
-    if checks == 'weak':
-        steps.append(f"do:    require the checks {REQUIRED_NAMES} on main with no bypass in the repo's "
-                     'Settings > Rules (magehand leaves an existing ruleset alone)')
-    elif checks == 'failed':
-        steps.append(f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
-                     f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
+    steps += checks_steps(repo, checks)
     if cloned == 'failed':
         steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
     if wrote:
         steps.append(commit_step(list(wrote)))
     return steps
+
+
+def checks_steps(repo, checks):
+    """What the required-checks ruleset leaves you, from ensure_checks' result."""
+    if checks == 'weak':
+        return [f"do:    require the checks {REQUIRED_NAMES} on main with no bypass in the repo's "
+                'Settings > Rules (magehand leaves an existing ruleset alone)']
+    if checks == 'partial':
+        return [f"do:    add homelab-app-template's `checks` job to {BUILD_WORKFLOW} (a PR; workflows are yours), "
+                f'and once it has run, require {PLATFORM_CHECK} in Settings > Rules']
+    if checks in ('failed', 'unknown'):
+        return [f"do:    add the ruleset '{CHECKS_RULESET['name']}': run `magehand new {repo.split('/', 1)[1]} "
+                '--no-clone` again' + (', or add it in Settings > Rules (only an admin can)' if checks == 'failed'
+                                       else ' (the build workflow could not be read)')]
+    return []
 
 
 def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=(), steps=None,
@@ -5087,7 +5136,7 @@ def check_checks_job(root):
     """The Build workflow calls the platform's static checks (homelab-app-template's `checks` job, homelab#611).
     A warning naming who fixes it, as for the quality job."""
     path = root / BUILD_WORKFLOW
-    if not path.is_file() or CHECKS_CALL.search(path.read_text(errors='replace')):
+    if not path.is_file() or platform_checks_call(path.read_text(errors='replace'), on_pull_requests=True):
         return []
     return [finding('warning', BUILD_WORKFLOW, "doesn't run the platform's static checks: ask the owner to add "
                     "homelab-app-template's `checks` job (agents can't change workflows)",
@@ -5791,7 +5840,6 @@ def agents_text(path):
 QUALITY_DIR = '.github/quality'
 CHECKS_WORKFLOW = '.github/workflows/checks.yaml'
 TOOLS_PIN = re.compile(r'\b' + re.escape(APPS_REPO) + r'/\.github/actions/tools@([0-9a-f]{40})\b')
-CHECKS_CALL = re.compile(r'\buses:\s*' + re.escape(APPS_REPO) + r'/\.github/workflows/checks\.yaml@([\w./-]+)')
 PLATFORM_LINK = '.platform-quality'
 PRE_COMMIT_CONFIG = f'{PLATFORM_LINK}/pre-commit-config.yaml'
 JS_TS = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts')
@@ -5830,9 +5878,9 @@ def checks_ref(top):
     """The ref of homelab-apps' checks.yaml this checkout's own workflows call (what its CI runs), or None."""
     workflows = top / '.github' / 'workflows'
     for path in sorted(workflows.glob('*.y*ml')) if workflows.is_dir() else []:
-        m = CHECKS_CALL.search(path.read_text(errors='replace'))
-        if m:
-            return m.group(1)
+        ref = platform_checks_call(path.read_text(errors='replace'))
+        if ref:
+            return ref
     return None
 
 

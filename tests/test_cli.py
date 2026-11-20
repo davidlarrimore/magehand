@@ -30,7 +30,8 @@ from unittest import mock
 from magehand import cli as magehand
 
 APP_BUILD = '.github/workflows/build.yaml'  # the template's Build workflow, as GitHub reports its runs
-TEMPLATE_BUILD = ('jobs:\n  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n')
+TEMPLATE_BUILD = ('on:\n  pull_request:\njobs:\n  checks:\n'
+                  '    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n')
 
 os.environ['MAGEHAND_NO_UPDATE_CHECK'] = '1'  # tests never ask GitHub for the latest version
 
@@ -1883,7 +1884,8 @@ class CheckCode(unittest.TestCase):
             self.assertIn('coverage stage must come before the final', last[0][1])
 
     def test_build_workflow_calls_the_quality_check(self):
-        flow = 'jobs:\n  image:\n    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n'
+        flow = ('on:\n  pull_request:\njobs:\n  image:\n'
+                '    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n')
         quality = '  quality:\n    uses: davidlarrimore/homelab-apps/.github/workflows/quality.yaml@main\n'
         checks = '  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n'
         texts = [f['text'] for f in self.run_check({'.github/workflows/build.yaml': flow}) if f['where'] ==
@@ -2875,6 +2877,8 @@ class New(unittest.TestCase):
             if args[:3] == ('api', '-X', 'POST'):
                 self.posted.append(kw.get('stdin'))
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/contents/.github/workflows/build.yaml') and '-H' in args:
+                if isinstance(build, tuple):
+                    return build
                 return (0, build, '') if build is not None else (1, '', 'gh: Not Found (HTTP 404)')
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets'):
                 listed = [{'id': 7, 'name': existing['name']}] if existing else []
@@ -2963,6 +2967,49 @@ class New(unittest.TestCase):
                 self.run_new('elvis')
             self.assertEqual(self.required_posted(), [['security / scan', 'image / result']])
             self.assertIn("add homelab-app-template's `checks` job", err.getvalue())
+        # The result carries the job as your next step, not "nothing left" (magehand#112's review).
+        self.posted = []
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={},
+                  build='jobs:\n  image:\n    uses: x\n')
+        out = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
+            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone', '--json']))
+        self.assertEqual(json.loads(out.getvalue())['checks'], 'partial')
+        self.assertIn("`checks` job", json.loads(out.getvalue())['next'])
+
+    def test_a_build_workflow_that_cant_be_read_defers_the_checks_ruleset(self):
+        # magehand#112's review: a failed read is not "no checks job"; nothing is posted, and the step is a rerun.
+        import contextlib
+        import io
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={},
+                  build=(1, '', 'gh: Server Error (HTTP 502)'))
+        out = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
+            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone', '--json']))
+        self.assertEqual(self.posted, [])
+        result = json.loads(out.getvalue())
+        self.assertEqual(result['checks'], 'unknown')
+        self.assertIn('magehand new elvis --no-clone', result['next'])
+
+    def test_an_older_app_with_the_two_checks_waits_for_its_job_before_the_third(self):
+        import contextlib
+        import io
+        two = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
+            'required_status_checks': [{'context': 'security / scan'}, {'context': 'image / result'}]}}])
+        for build, expected in (('jobs:\n  image:\n    uses: x\n', 'partial'), (TEMPLATE_BUILD, 'weak')):
+            self.fake(exists='true', collaborator=True, ruleset=True, checks=two, build=build)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), expected)
+
+    def test_only_a_jobs_real_call_counts(self):
+        call = 'davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main'
+        self.assertEqual(magehand.platform_checks_call(f'on: [pull_request]\njobs:\n  c:\n    uses: "{call}"\n',
+                                                       on_pull_requests=True), 'main')  # quoted: still a call
+        for text in (f'on: [pull_request]\njobs:\n  c:\n    runs-on: x\n    # uses: {call}\n',  # a comment
+                     f'on: [push]\njobs:\n  c:\n    uses: {call}\n',  # never on a PR: never reports there
+                     f'on: [pull_request]\nenv:\n  X: "uses: {call}"\n', 'not: [valid', ''):
+            self.assertIsNone(magehand.platform_checks_call(text, on_pull_requests=True), text)
+        self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
 
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
         self.posted = []
