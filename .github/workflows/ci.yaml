@@ -35,9 +35,9 @@ jobs:
           bandit -r src --severity-level medium
   # The platform's static checks (ruff's bug rules, shellcheck, the lab's ast-grep rules): pre-commit with the config
   # in .github/quality, a copy of the platform's (this repo is public, so it can't call the platform's private
-  # checks workflow; the platform's CI fails when the copies differ). `magehand verify` runs the same rules
-  # locally. Findings that predate these checks carry `# noqa` or `# ast-grep-ignore` markers (#109): new code
-  # gets none without a reason.
+  # checks workflow; the platform's CI fails when the copies differ, and tests the rules there; rule-tests/ is
+  # left out here). `magehand verify` runs the same rules locally. Findings that predate these checks carry
+  # `# noqa` or `# ast-grep-ignore` markers (#109): new code gets none without a reason.
   checks:
     runs-on: ubuntu-latest
     steps:
@@ -60,10 +60,6 @@ jobs:
           # The files the PR changes, read from the merge commit checked out here (the PR's head alone can name a path
           # the merge moved; #112's review). A change to the rules or this workflow checks every file (a new rule must
           # hold for code it didn't touch), as `magehand verify` does.
-          # Each platform rule still catches what its tests say (the same ast-grep the hook installs).
-          version=$(grep -oE 'ast-grep-cli==[0-9.]+' .platform-quality/pre-commit-config.yaml)
-          /tmp/pre-commit/bin/pip install --quiet "$version"
-          /tmp/pre-commit/bin/ast-grep test -c .platform-quality/ast-grep/sgconfig.yml --skip-snapshot-tests
           if [ "$EVENT" = pull_request ] && git diff --quiet "$BASE" HEAD -- .github/quality .github/workflows; then
             range=(--from-ref "$BASE" --to-ref "$(git rev-parse HEAD)")
           else

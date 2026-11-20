@@ -1,8 +1,0 @@
-id: fixed-temp-name
-valid:
-  - 'fd, tmp = tempfile.mkstemp(dir=path.parent)'
-  - 'name = path.name + ''.json'''
-invalid:
-  - 'tmp = path.with_name(path.name + ''.new'')'
-  - 'temporary = marker.with_suffix(''.tmp'')'
-  - 'new = TOKEN_FILE + ".part"'

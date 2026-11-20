@@ -1,8 +1,0 @@
-id: subprocess-result-discarded
-valid:
-  - 'out = subprocess.run([''curl'', url], capture_output=True)'
-  - 'subprocess.run([''true''], check=True)'
-  - 'return subprocess.run([''git'', ''status'']).returncode'
-invalid:
-  - 'subprocess.run([''curl'', ''-sS'', url], capture_output=True)'
-  - 'subprocess.run([''launchctl'', ''bootout'', label], check=False)'

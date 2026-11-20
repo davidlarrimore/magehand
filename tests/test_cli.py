@@ -8103,13 +8103,23 @@ class Verify(unittest.TestCase):
             self.assertNotEqual(used[-1], top / magehand.QUALITY_DIR)  # the commit's copy, in its worktree
             # A change to the copy checks every file, as CI does: old.py's finding now counts.
             self.commit(top, '.github/quality/pre-commit-config.yaml', 'repos: []  # new rule\n')
-            code, _, _ = self.main('verify')
+            code, out, _ = self.main('verify')
             self.assertEqual(code, 1)
+            self.assertIn('(every file', out)  # the scope it really checked (magehand#112's review)
         # A repo that calls the platform's checks.yaml uses its pin, own copy or not; --apps-dir names the config.
         self.assertIsNone(magehand.own_quality(top, 'main'))
         with mock.patch.object(magehand, 'APPS_DIR', '/elsewhere'):
             self.assertIsNone(magehand.own_quality(top, None))
         self.assertEqual(magehand.own_quality(top, None), top / magehand.QUALITY_DIR)
+
+    def test_apps_dir_needs_no_pin_lookup(self):
+        # magehand#112's review: --apps-dir names the config, so GitHub being unreachable mustn't stop it.
+        top = self.repo()
+        refs = self.setup_verify(top)
+        self.commit(top, 'a.py', 'x = 2\n', branch='feature')
+        code, out, _ = self.main('verify', '--apps-dir', str(top.parent))
+        self.assertEqual((code, refs), (0, []))
+        self.assertIn('not recorded: --apps-dir', out)
 
     def test_the_commit_is_checked_not_the_working_tree(self):
         # magehand#110's review: pre-commit reads the checkout's files, so a bad commit on another branch passed

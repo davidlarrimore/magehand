@@ -6080,7 +6080,8 @@ def cmd_verify(a):
             ref = checks_ref(work)
             own = own_quality(work, ref)
             with setup_lock():
-                quality = own or quality_tree(quality_pin(ref or 'main'))
+                # --apps-dir names the config: no pin to look up (magehand#112's review).
+                quality = own or quality_tree(None if APPS_DIR else quality_pin(ref or 'main'))
                 ensure_eslint(quality, work)
                 pc = pre_commit_bin(quality)
             (work / PLATFORM_LINK).symlink_to(quality, target_is_directory=True)
@@ -6097,7 +6098,7 @@ def cmd_verify(a):
                             env=child_env()) == 0
         # A record stands for "CI's checks pass on this commit": the CI range, every check, the config CI uses.
         recorded = bool(ok and ci_range and not a.only and not APPS_DIR and record_verified(top, sha))
-        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref})
+        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref, 'everything': everything})
     ok = all(r['ok'] for r in results)
     if a.pre_push:
         if not ok:
@@ -6105,7 +6106,7 @@ def cmd_verify(a):
                   'shows the same; in an emergency `git push --no-verify`, and CI still checks the PR)', file=sys.stderr)
         sys.exit(0 if ok else 1)
     head = results[0]
-    scope = 'every file' if a.all else f'the files changed since {default_base(top)}'
+    scope = 'every file' if head['everything'] else f'the files changed since {default_base(top)}'
     dirty = not clean_checkout(top)
     why_not = ('--only runs one check' if a.only else '--apps-dir is not what CI runs' if APPS_DIR else None)
     step = ('`magehand pr ready` once the PR\'s checks are green' if ok and head['recorded'] and not dirty else
