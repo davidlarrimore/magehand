@@ -8369,6 +8369,12 @@ class Verify(unittest.TestCase):
             subprocess.run(['git', '-C', str(clone), 'fetch', '-q', '--unshallow', 'origin',
                             'refs/heads/main:refs/remotes/origin/main'], check=True, capture_output=True)
             self.assertIsNotNone(magehand.git_out(['merge-base', 'HEAD', 'origin/main'], clone))  # the step works
+        # A default branch whose name holds shell syntax stays one quoted argument.
+        with mock.patch.object(magehand, 'default_base', lambda top: 'origin/a;touch x'), \
+                mock.patch.object(magehand, 'git_out', lambda args, root=None: None):
+            step = magehand.fetch_step(top)
+        command = step.split('`')[1]
+        self.assertEqual(shlex.split(command), ['git', 'fetch', 'origin', 'refs/heads/a;touch x:refs/remotes/origin/a;touch x'])
 
     def test_verify_json_is_only_json(self):
         # magehand#110's review: pre-commit's own output went to stdout before the JSON object.
