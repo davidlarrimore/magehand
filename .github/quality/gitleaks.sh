@@ -11,8 +11,9 @@
 # gitleaks itself: its release binary from GitHub, checked against the sha256 pinned below, kept in
 # ~/.cache/platform-checks (no Go toolchain, no module proxy). To bump: the version and the four sums from the
 # release's gitleaks_<version>_checksums.txt.
-# A false positive: `gitleaks:allow` in a comment on its line, or its fingerprint (gitleaks prints it) in the repo's
-# .gitleaksignore.
+# A false positive: `gitleaks:allow` in a comment on its line, or a `path:rule:line` line in the repo's .gitleaksignore:
+# the fingerprint gitleaks prints without its leading `<commit>:` (that form silences only the commit scan, and a
+# squash merge drops the commit; homelab-apps#561's review).
 set -euo pipefail
 version=8.30.1
 case "$(uname -s)_$(uname -m)" in
