@@ -2718,62 +2718,44 @@ def platform_checks_call(text, on_pull_requests=False):
     return None
 
 
-def runs_platform_checks(repo):
-    """Whether the repo's build.yaml (on its default branch) runs the platform's checks.yaml on pull requests,
-    the job that reports `checks / pre-commit`: True, False (no such job, or no build.yaml), or None when it
-    can't be read (a rate limit, the network, a timeout: then nothing is decided from it)."""
-    code, out, err = gh_probe('api', f'repos/{repo}/contents/{BUILD_WORKFLOW}', '-H',
-                              'Accept: application/vnd.github.raw')
-    if code == 0:
-        return platform_checks_call(out, on_pull_requests=True) is not None
-    if code is not None and re.search(r'HTTP 404|Not Found', err or ''):
-        return False
-    return None
-
-
-def ensure_checks(repo):
-    """Make sure a merge waits for the required checks: 'exists', 'created', 'weak' or 'failed' (a warning, as
-    for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes one. A repo
-    whose build.yaml doesn't run the platform's checks yet (an app made before them) gets the others only:
-    requiring a check nothing reports would leave every PR waiting (magehand#112's review)."""
+def ensure_checks(repo, created=False):
+    """Make sure a merge waits for the required checks: 'exists', 'created', 'partial', 'weak' or 'failed' (a
+    warning, as for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes
+    one. A repo made now, from the template, runs every required check. Repairing an existing repo requires
+    PLATFORM_CHECK only once you say its build.yaml runs it: an app made before the static checks doesn't report
+    it, and a required check that never reports leaves every PR waiting (magehand#112's review). So a repair adds
+    the others, and the step says when to add it ('partial')."""
     state, detail = checks_status(repo)
     name = CHECKS_RULESET['name']
     if state == 'ok':
         print(f"{repo}: the checks {REQUIRED_NAMES} are already required", file=sys.stderr)
         return 'exists'
     if state == 'weak':
-        if detail.startswith(f'{PLATFORM_CHECK} not required on ') and ';' not in detail \
-                and runs_platform_checks(repo) is False:
-            print(f"{repo}: {PLATFORM_CHECK} is not required, and {BUILD_WORKFLOW} doesn't run it yet: add "
-                  "homelab-app-template's `checks` job first, then require it in Settings > Rules", file=sys.stderr)
+        if detail.startswith(f'{PLATFORM_CHECK} not required on ') and ';' not in detail:
+            print(f"{repo}: {PLATFORM_CHECK} is not required yet: once {BUILD_WORKFLOW} runs the platform's "
+                  "`checks` job on pull requests, require it in Settings > Rules", file=sys.stderr)
             return 'partial'
         print(f"{repo}: required checks are incomplete ({detail}); fix it in the repo's Settings > Rules "
               "(magehand leaves an existing ruleset alone)", file=sys.stderr)
         return 'weak'
     if state == 'missing':
         ruleset, names = CHECKS_RULESET, REQUIRED_NAMES
-        runs = runs_platform_checks(repo)
-        if runs is None:
-            # Unknown: a two-check ruleset would stay weak for good, a three-check one could block every PR.
-            print(f"{repo}: could not read {BUILD_WORKFLOW}, so the ruleset '{name}' was not added yet: run "
-                  f"`magehand new {repo.split('/', 1)[1]} --no-clone` again", file=sys.stderr)
-            return 'unknown'
-        if not runs:
+        if not created:
             contexts = [check for check in REQUIRED_CHECKS if check != PLATFORM_CHECK]
             names = ' and '.join(contexts)
             ruleset = dict(CHECKS_RULESET, rules=[
                 rule if rule['type'] != 'required_status_checks' else dict(rule, parameters=dict(
                     rule['parameters'], required_status_checks=[{'context': c} for c in contexts]))
                 for rule in CHECKS_RULESET['rules']])
-            print(f"{repo}: {BUILD_WORKFLOW} doesn't run the platform's checks yet, so {PLATFORM_CHECK} is not "
-                  "required: add homelab-app-template's `checks` job, then add the check in Settings > Rules",
-                  file=sys.stderr)
         code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-',
                                  stdin=json.dumps(ruleset))
         if code == 0:
             print(f"{repo}: ruleset '{name}' added (a PR merges only when {names} pass; "
                   'nobody can bypass it)', file=sys.stderr)
-            return 'created' if runs else 'partial'
+            if not created:
+                print(f"{repo}: {PLATFORM_CHECK} is not required yet: once {BUILD_WORKFLOW} runs the platform's "
+                      "`checks` job on pull requests, require it in Settings > Rules", file=sys.stderr)
+            return 'created' if created else 'partial'
     print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
           'checks until it exists', file=sys.stderr)
     return 'failed'
@@ -3223,7 +3205,7 @@ def cmd_new(a):
         print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
-    checks = ensure_checks(repo)
+    checks = ensure_checks(repo, created)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
     here = not a.dir and current_repo() == repo  # repairing the checkout you are in: no second copy inside it
     cloned = None if a.no_clone or here else clone_repo(repo, dest)
@@ -3366,12 +3348,11 @@ def checks_steps(repo, checks):
         return [f"do:    require the checks {REQUIRED_NAMES} on main with no bypass in the repo's "
                 'Settings > Rules (magehand leaves an existing ruleset alone)']
     if checks == 'partial':
-        return [f"do:    add homelab-app-template's `checks` job to {BUILD_WORKFLOW} (a PR; workflows are yours), "
-                f'and once it has run, require {PLATFORM_CHECK} in Settings > Rules']
-    if checks in ('failed', 'unknown'):
-        return [f"do:    add the ruleset '{CHECKS_RULESET['name']}': run `magehand new {repo.split('/', 1)[1]} "
-                '--no-clone` again' + (', or add it in Settings > Rules (only an admin can)' if checks == 'failed'
-                                       else ' (the build workflow could not be read)')]
+        return [f"do:    once {BUILD_WORKFLOW} runs homelab-app-template's `checks` job on pull requests (a PR; "
+                f"`magehand check` warns while it doesn't), require {PLATFORM_CHECK} in Settings > Rules"]
+    if checks == 'failed':
+        return [f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
+                f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules"]
     return []
 
 

@@ -30,8 +30,6 @@ from unittest import mock
 from magehand import cli as magehand
 
 APP_BUILD = '.github/workflows/build.yaml'  # the template's Build workflow, as GitHub reports its runs
-TEMPLATE_BUILD = ('on:\n  pull_request:\njobs:\n  checks:\n'
-                  '    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n')
 
 os.environ['MAGEHAND_NO_UPDATE_CHECK'] = '1'  # tests never ask GitHub for the latest version
 
@@ -2865,7 +2863,7 @@ class New(unittest.TestCase):
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
     def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None, invited=False,
-             checks=None, build=TEMPLATE_BUILD):
+             checks=None):
         """`existing` is the ruleset already on the repo (default: ours when `ruleset`); `checks` is the
         required-checks ruleset on it (default: ours when `ruleset`); `collaborator` is True (write), 'read' or
         False, and `invited` says an invitation for the bot is pending."""
@@ -2876,10 +2874,6 @@ class New(unittest.TestCase):
             self.calls.append(args)
             if args[:3] == ('api', '-X', 'POST'):
                 self.posted.append(kw.get('stdin'))
-            if args[:2] == ('api', 'repos/davidlarrimore/elvis/contents/.github/workflows/build.yaml') and '-H' in args:
-                if isinstance(build, tuple):
-                    return build
-                return (0, build, '') if build is not None else (1, '', 'gh: Not Found (HTTP 404)')
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets'):
                 listed = [{'id': 7, 'name': existing['name']}] if existing else []
                 return ruleset_status, json.dumps(listed), 'HTTP 403' if ruleset_status else ''
@@ -2956,50 +2950,35 @@ class New(unittest.TestCase):
 
     def test_an_older_app_is_not_made_to_wait_for_a_check_it_doesnt_run(self):
         # magehand#112's review: repairing an app made before homelab#611 must not require checks / pre-commit,
-        # which its build.yaml doesn't report: every PR would wait for it.
+        # which its build.yaml may not report: every PR would wait for it. The owner adds it once the job runs.
         import contextlib
         import io
-        for build in ('jobs:\n  image:\n    uses: x\n', None):  # no checks job; build.yaml unreadable
-            self.posted = []
-            self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={}, build=build)
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self.run_new('elvis')
-            self.assertEqual(self.required_posted(), [['security / scan', 'image / result']])
-            self.assertIn("add homelab-app-template's `checks` job", err.getvalue())
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_new('elvis')
+        self.assertEqual(self.required_posted(), [['security / scan', 'image / result']])
+        self.assertIn('checks / pre-commit is not required yet', err.getvalue())
         # The result carries the job as your next step, not "nothing left" (magehand#112's review).
         self.posted = []
-        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={},
-                  build='jobs:\n  image:\n    uses: x\n')
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
         out = io.StringIO()
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
             magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone', '--json']))
         self.assertEqual(json.loads(out.getvalue())['checks'], 'partial')
         self.assertIn("`checks` job", json.loads(out.getvalue())['next'])
 
-    def test_a_build_workflow_that_cant_be_read_defers_the_checks_ruleset(self):
-        # magehand#112's review: a failed read is not "no checks job"; nothing is posted, and the step is a rerun.
-        import contextlib
-        import io
-        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={},
-                  build=(1, '', 'gh: Server Error (HTTP 502)'))
-        out = io.StringIO()
-        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
-            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone', '--json']))
-        self.assertEqual(self.posted, [])
-        result = json.loads(out.getvalue())
-        self.assertEqual(result['checks'], 'unknown')
-        self.assertIn('magehand new elvis --no-clone', result['next'])
-
-    def test_an_older_app_with_the_two_checks_waits_for_its_job_before_the_third(self):
+    def test_an_older_app_with_the_two_checks_is_told_when_to_add_the_third(self):
         import contextlib
         import io
         two = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
             'required_status_checks': [{'context': 'security / scan'}, {'context': 'image / result'}]}}])
-        for build, expected in (('jobs:\n  image:\n    uses: x\n', 'partial'), (TEMPLATE_BUILD, 'weak')):
-            self.fake(exists='true', collaborator=True, ruleset=True, checks=two, build=build)
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), expected)
+        self.fake(exists='true', collaborator=True, ruleset=True, checks=two)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), 'partial')
+        self.assertFalse([c for c in self.calls if '-X' in c])  # never changed
+        step = magehand.checks_steps('davidlarrimore/elvis', 'partial')[0]
+        self.assertIn("once .github/workflows/build.yaml runs homelab-app-template's `checks` job", step)
 
     def test_only_a_jobs_real_call_counts(self):
         call = 'davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main'
@@ -3012,11 +2991,17 @@ class New(unittest.TestCase):
         self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
 
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
-        self.posted = []
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
         self.run_new('elvis')
         posted = [c for c in self.calls if c[:3] == ('api', '-X', 'POST')]
         self.assertEqual(posted, [('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-')])
+        # A repo made now, from the template (which runs the checks job), requires all three.
+        with mock.patch.object(magehand, 'checks_status', lambda repo: ('missing', '')):
+            self.posted = []
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis', created=True), 'created')
         self.assertEqual(self.required_posted(), [['security / scan', 'image / result', 'checks / pre-commit']])
         self.assertEqual(magehand.CHECKS_RULESET['bypass_actors'], [])
         rule = next(r for r in magehand.CHECKS_RULESET['rules'] if r['type'] == 'required_status_checks')
