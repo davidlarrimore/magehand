@@ -1,0 +1,19 @@
+# The platform's enforced Python checks (ruff, MIT; homelab#611). Bugs, not style: each rule here catches a mistake
+# that changes behaviour, and new code must pass all of them. Style and complexity stay in homelab-ruff.toml,
+# which MegaLinter only measures. Security is Bandit's (security.yaml): ruff doesn't read `# nosec`, so its S rules
+# would re-raise every finding Bandit already has a reviewed reason for.
+#   F       pyflakes: undefined or unused names, imports, shadowing
+#   E9      syntax and indentation errors
+#   B       bugbear: loop variables captured by closures, mutable defaults, `raise` without `from`, zip without strict
+#   PLE     pylint errors
+#   PLW1510 subprocess.run without check=: decide whether a failure raises (host-check lost an alert this way)
+#   PLW2901 a for-loop variable overwritten inside the loop
+#   BLE001  a blind `except Exception`: catch what can happen
+#   SIM115  open() outside a `with`
+#   RUF006  an asyncio task nobody keeps a reference to
+# A finding that is right where it is gets `# noqa: CODE  # why`. A repo's baseline marks the findings it had
+# when it started (ruff check --add-noqa); those are its backlog.
+line-length = 120
+
+[lint]
+select = ["F", "E9", "B", "PLE", "PLW1510", "PLW2901", "BLE001", "SIM115", "RUF006"]

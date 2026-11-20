@@ -263,7 +263,7 @@ class LocalBucket(unittest.TestCase):
         return state
 
     def runs(self):
-        return [(a, e) for a, e in zip(self.engine_calls, self.engine_env) if a[0] == 'run']
+        return [(a, e) for a, e in zip(self.engine_calls, self.engine_env) if a[0] == 'run']  # noqa: B905  # zip(strict=) needs Python 3.10; magehand supports 3.9
 
     def test_it_starts_the_pinned_garage_on_loopback_with_its_data_in_a_volume(self):
         self.up()
@@ -320,7 +320,7 @@ class LocalBucket(unittest.TestCase):
                 mock.patch.object(magehand, 'save_local_state', lambda *_a: None), \
                 mock.patch.object(magehand, 'block_image', lambda *_a: 'img'), contextlib.redirect_stdout(io.StringIO()):
             magehand.cmd_dev(mock.Mock(action='up', app_flag=None, app=None))
-        for argv, env in zip(calls, envs):
+        for argv, env in zip(calls, envs):  # noqa: B905  # zip(strict=) needs Python 3.10; magehand supports 3.9
             if argv[0] == 'run':
                 self.assertTrue(env, 'a run with a password passes it through the environment')
                 for value in env.values():
@@ -613,7 +613,7 @@ class BucketCommands(unittest.TestCase):
         self.assertIn('files', self.run_cmd('--env', 'local', 'usage'))
 
     def test_the_signer_reproduces_awss_published_s3_example(self):
-        import datetime, hashlib
+        import hashlib
         h = magehand.s3_sign('GET', 'examplebucket.s3.amazonaws.com', '/test.txt', '', hashlib.sha256(b'').hexdigest(),
                              'AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'us-east-1',
                              {'range': 'bytes=0-9'}, when=datetime.datetime(2013, 5, 24, tzinfo=datetime.timezone.utc))
@@ -1882,12 +1882,16 @@ class CheckCode(unittest.TestCase):
             self.assertIn('coverage stage must come before the final', last[0][1])
 
     def test_build_workflow_calls_the_quality_check(self):
-        flow = 'jobs:\n  image:\n    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n'
+        flow = ('on:\n  pull_request:\njobs:\n  image:\n'
+                '    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n')
         quality = '  quality:\n    uses: davidlarrimore/homelab-apps/.github/workflows/quality.yaml@main\n'
+        checks = '  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n'
         texts = [f['text'] for f in self.run_check({'.github/workflows/build.yaml': flow}) if f['where'] ==
                  '.github/workflows/build.yaml']
-        self.assertTrue(texts and "doesn't call the platform's quality check" in texts[0])
-        self.assertFalse([f for f in self.run_check({'.github/workflows/build.yaml': flow + quality})
+        self.assertEqual(len(texts), 2, texts)
+        self.assertIn("doesn't call the platform's quality check", texts[0])
+        self.assertIn("doesn't run the platform's static checks", texts[1])  # homelab#611
+        self.assertFalse([f for f in self.run_check({'.github/workflows/build.yaml': flow + quality + checks})
                           if f['where'] == '.github/workflows/build.yaml'])
         self.assertFalse([f for f in self.run_check({}) if f['where'] == '.github/workflows/build.yaml'])
 
@@ -2855,6 +2859,7 @@ class New(unittest.TestCase):
     def setUp(self):
         self.saved = magehand.gh_cli
         self.calls = []
+        self.posted = []
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
     def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None, invited=False,
@@ -2867,6 +2872,8 @@ class New(unittest.TestCase):
 
         def gh(*args, **kw):
             self.calls.append(args)
+            if args[:3] == ('api', '-X', 'POST'):
+                self.posted.append(kw.get('stdin'))
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets'):
                 listed = [{'id': 7, 'name': existing['name']}] if existing else []
                 return ruleset_status, json.dumps(listed), 'HTTP 403' if ruleset_status else ''
@@ -2937,15 +2944,90 @@ class New(unittest.TestCase):
             self.run_new('elvis')
         self.assertIn('without a review', err.getvalue())
 
+    def required_posted(self):
+        return [[c['context'] for r in json.loads(body)['rules'] if r['type'] == 'required_status_checks'
+                 for c in r['parameters']['required_status_checks']] for body in self.posted]
+
+    def test_an_older_app_is_not_made_to_wait_for_a_check_it_doesnt_run(self):
+        # magehand#112's review: repairing an app made before homelab#611 must not require checks / pre-commit,
+        # which its build.yaml may not report: every PR would wait for it. The owner adds it once the job runs.
+        import contextlib
+        import io
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_new('elvis')
+        self.assertEqual(self.required_posted(), [['security / scan', 'image / result']])
+        self.assertIn('checks / pre-commit is not required yet', err.getvalue())
+        # The result carries the job as your next step, not "nothing left" (magehand#112's review).
+        self.posted = []
+        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
+        out = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
+            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone', '--json']))
+        self.assertEqual(json.loads(out.getvalue())['checks'], 'partial')
+        self.assertIn("`checks` job", json.loads(out.getvalue())['next'])
+
+    def test_an_older_app_with_the_two_checks_is_told_when_to_add_the_third(self):
+        import contextlib
+        import io
+        two = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
+            'required_status_checks': [{'context': 'security / scan'}, {'context': 'image / result'}]}}])
+        self.fake(exists='true', collaborator=True, ruleset=True, checks=two)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), 'partial')
+        self.assertFalse([c for c in self.calls if '-X' in c])  # never changed
+        step = magehand.checks_steps('davidlarrimore/elvis', 'partial')[0]
+        self.assertIn("only once a recent PR's checks list it", step)
+        # Mixed defects (a bypass, or image / result missing too): the first two now, the third still conditional.
+        step = magehand.checks_steps('davidlarrimore/elvis', 'weak')[0]
+        self.assertIn('require security / scan and image / result on main', step)
+        self.assertIn("checks / pre-commit only once a recent PR's checks list it", step)
+
+    def test_only_a_jobs_real_call_counts(self):
+        call = 'davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main'
+        self.assertEqual(magehand.platform_checks_call(f'on: [pull_request]\njobs:\n  checks:\n    uses: "{call}"\n',
+                                                       on_pull_requests=True), 'main')  # quoted: still a call
+        for text in (f'on: [pull_request]\njobs:\n  checks:\n    runs-on: x\n    # uses: {call}\n',  # a comment
+                     f'on: [push]\njobs:\n  c:\n    uses: {call}\n',  # never on a PR: never reports there
+                     f'on: [pull_request]\nenv:\n  X: "uses: {call}"\n', 'not: [valid', '',
+                     # magehand#112's review: not every PR, or another check name
+                     f'on:\n  pull_request:\n    paths: [src/**]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    branches: [main]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on: [pull_request]\njobs:\n  lint:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: [opened]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: [opened, {{x: 1}}, [y]]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: [opened, synchronize, reopened, {{x: 1}}]\njobs:\n'
+                     f'  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    types: {{a: 1}}\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on: [pull_request]\njobs:\n  checks:\n    name: Lint\n    uses: {call}\n'):
+            self.assertIsNone(magehand.platform_checks_call(text, on_pull_requests=True), text)
+        self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
+        # The template's own job: skipped only on workflow_dispatch, so every PR reports it.
+        template = (f"on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\njobs:\n  checks:\n"
+                    f"    if: github.event_name != 'workflow_dispatch'\n    uses: {call}\n")
+        self.assertEqual(magehand.platform_checks_call(template, on_pull_requests=True), 'main')
+        every = (f'on:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\njobs:\n  checks:\n'
+                 f'    uses: {call}\n')
+        self.assertEqual(magehand.platform_checks_call(every, on_pull_requests=True), 'main')
+
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
         self.run_new('elvis')
         posted = [c for c in self.calls if c[:3] == ('api', '-X', 'POST')]
         self.assertEqual(posted, [('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-')])
+        # A repo made now, from the template (which runs the checks job), requires all three.
+        with mock.patch.object(magehand, 'checks_status', lambda repo: ('missing', '')):
+            self.posted = []
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis', created=True), 'created')
+        self.assertEqual(self.required_posted(), [['security / scan', 'image / result', 'checks / pre-commit']])
         self.assertEqual(magehand.CHECKS_RULESET['bypass_actors'], [])
         rule = next(r for r in magehand.CHECKS_RULESET['rules'] if r['type'] == 'required_status_checks')
         self.assertEqual([c['context'] for c in rule['parameters']['required_status_checks']],
-                         ['security / scan', 'image / result'])
+                         ['security / scan', 'image / result', 'checks / pre-commit'])
 
     def test_checks_a_merge_could_skip_are_reported_not_changed(self):
         import contextlib
@@ -2953,7 +3035,7 @@ class New(unittest.TestCase):
         bypass = dict(magehand.CHECKS_RULESET, id=8, bypass_actors=magehand.RULESET['bypass_actors'])
         one = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
             'required_status_checks': [{'context': 'security / scan'}]}}])
-        for weak, why in ((bypass, 'bypass'), (one, 'image / result not required')):
+        for weak, why in ((bypass, 'bypass'), (one, 'image / result, checks / pre-commit not required')):
             self.calls.clear()
             self.fake(exists='true', collaborator=True, ruleset=True, checks=weak)
             err = io.StringIO()
@@ -3586,12 +3668,14 @@ class RepoConformance(unittest.TestCase):
         def required(*contexts, ruleset_id=8):
             return {'type': 'required_status_checks', 'ruleset_id': ruleset_id,
                     'parameters': {'required_status_checks': [{'context': c} for c in contexts]}}
-        both = [{'type': 'pull_request', 'ruleset_id': 7}, required('security / scan', 'image / result')]
+        both = [{'type': 'pull_request', 'ruleset_id': 7},
+                required('security / scan', 'image / result', 'checks / pre-commit')]
         theirs = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8)), '')
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': theirs}))
         self.assertEqual((state['checks'], state['checks_detail']), ('ok', ''))
         # Any ruleset's rule counts, split over two rulesets too.
-        split = [required('security / scan', ruleset_id=8), required('image / result', ruleset_id=9)]
+        split = [required('security / scan', ruleset_id=8),
+                 required('image / result', 'checks / pre-commit', ruleset_id=9)]
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(split), '')),
                                   **{'/rulesets/8': theirs, '/rulesets/9': theirs}))
         self.assertEqual(state['checks'], 'ok')
@@ -3599,7 +3683,12 @@ class RepoConformance(unittest.TestCase):
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps([required('security / scan')]), '')),
                                   **{'/rulesets/8': theirs}))
         self.assertEqual(state['checks'], 'weak')
-        self.assertIn('image / result not required on main', state['checks_detail'])
+        self.assertIn('image / result, checks / pre-commit not required on main', state['checks_detail'])
+        # An app set up before the static checks (homelab#611): weak until the owner adds checks / pre-commit.
+        older = [required('security / scan', 'image / result')]
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(older), '')), **{'/rulesets/8': theirs}))
+        self.assertEqual(state['checks'], 'weak')
+        self.assertIn('checks / pre-commit not required on main', state['checks_detail'])
         # A bypass list lets the owner merge red: weak.
         bypass = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8, bypass_actors=[{'actor_id': 5}])), '')
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': bypass}))
@@ -3826,7 +3915,7 @@ class PrReady(unittest.TestCase):
         code, out, writes = self.run_pr()
         self.assertEqual(code, 0)
         self.assertEqual([w[:2] for w in writes], [('api', '-X'), ('pr', 'ready')])
-        self.assertEqual(writes[0][3:], (f'repos/davidlarrimore/demo/pulls/12/requested_reviewers',
+        self.assertEqual(writes[0][3:], ('repos/davidlarrimore/demo/pulls/12/requested_reviewers',
                                          '-f', f'reviewers[]={magehand.BOT}'))
         self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
         self.assertIn('`magehand pr watch 12`', out.splitlines()[-1])
@@ -4136,7 +4225,7 @@ class Scaffold(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             magehand.scaffold(tmp, 'demo', 'demo')
             # the Dockerfile's test stage runs exactly this, in /app
-            run = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'],
+            run = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'],  # noqa: PLW1510
                                  cwd=tmp, capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
 
@@ -4247,7 +4336,8 @@ class Scaffold(unittest.TestCase):
                                   ('https://example.com/github.com/davidlarrimore/elvis.git', None),
                                   ('/srv/git/github.com/davidlarrimore/elvis.git', None)):
                 subprocess.run(['git', 'init', '-q', tmp], check=True)
-                subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)
+                # ast-grep-ignore: subprocess-result-discarded  # a fresh repo may have no origin to remove
+                subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)  # noqa: PLW1510
                 subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', url], check=True)
                 self.assertEqual(magehand.origin_repo(tmp), expected, url)
 
@@ -4335,7 +4425,7 @@ class Approvals(unittest.TestCase):
     def hook(self, command, tool='Bash'):
         """The installed hook's decision for `command`: (decision, reason) or None, run as Claude Code runs it."""
         event = json.dumps({'tool_name': tool, 'tool_input': {'command': command}})
-        run = subprocess.run([sys.executable, '-I', str(self.plugin / 'hooks/approve.py')], input=event,
+        run = subprocess.run([sys.executable, '-I', str(self.plugin / 'hooks/approve.py')], input=event,  # noqa: PLW1510
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr)
         if not run.stdout.strip():
@@ -4401,7 +4491,7 @@ class Approvals(unittest.TestCase):
         (repo / 'src').mkdir(exist_ok=True)
         (repo / 'AGENTS.md').write_text(agents)
         script = magehand.SESSION_HOOK.format(generated='x', magehand=json.dumps([sys.executable, str(fake)]))
-        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,
+        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,  # noqa: PLW1510
                              input=json.dumps({'hook_event_name': 'SessionStart', 'cwd': str(repo / 'src')}))
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout
@@ -4568,12 +4658,13 @@ class Approvals(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(calls, [['version'], ['setup', '--refresh']])
 
-    def upgrade_with_refresh(self, refresh_code):
+    def upgrade_with_refresh(self, refresh_code, skill_code=0):
         calls = []
 
         def run(cmd, **kw):
             calls.append(cmd[1:])
-            return mock.Mock(returncode=refresh_code if cmd[1:] == ['setup', '--refresh'] else 0,
+            code = {('setup', '--refresh'): refresh_code, ('skill', '--install'): skill_code}.get(tuple(cmd[1:]), 0)
+            return mock.Mock(returncode=code,
                              stdout='0.38.0\n', stderr='')
         with tempfile.TemporaryDirectory() as tmp:
             (pathlib.Path(tmp) / 'magehand').write_text('')
@@ -4591,6 +4682,9 @@ class Approvals(unittest.TestCase):
         self.assertEqual((code, calls[-1], out.splitlines()[-1]), (0, ['skill', '--install'], 'next: nothing'))
         code, out, calls = self.upgrade_with_refresh(1)  # a refresh that failed: setup is the step
         self.assertEqual((code, out.splitlines()[-1]), (0, 'next: `magehand setup`'))
+        code, out, calls = self.upgrade_with_refresh(2, skill_code=1)  # magehand#112's review: not "nothing"
+        self.assertEqual(out.splitlines()[-2:], ['could not refresh the skill (see above)',
+                                                 'next: `magehand skill --install`'])
 
     def test_doctor_notes_missing_approvals(self):
         with mock.patch.object(magehand, 'github_token', lambda: 't'), \
@@ -5924,7 +6018,7 @@ class AppApi(unittest.TestCase):
         for exposure, host in (('external', 'demo.davidlarrimore.com'), ('internal', 'demo.lab.davidlarrimore.com')):
             self.calls, self.replies = [], [(200, {}, b'')]
             text = f'demo:\n  exposure: {exposure}\n'
-            with mock.patch.object(magehand, 'file_at', lambda repo, path, ref: (text, None)):
+            with mock.patch.object(magehand, 'file_at', lambda repo, path, ref: (text, None)):  # noqa: B023
                 code, _, err = self.run_main('api', '-a', 'demo', '/x', '--prod', '-X', 'delete')
             self.assertEqual((code, self.calls[0][0], self.calls[0][1]), (0, f'https://{host}/x', 'DELETE'))
             self.assertIn('production', err)
@@ -6391,7 +6485,7 @@ class Status(unittest.TestCase):
             with mock.patch.object(magehand, 'status_target', lambda name=None: ('demo', 'o/demo')), \
                     mock.patch.object(magehand, 'lifecycle_stages',
                                       lambda repo, name: calls.append(1) or answers[min(len(calls), len(answers)) - 1]), \
-                    mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):
+                    mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):  # noqa: B023
                 code, out, _ = CommandLine.run_main(self, 'status', *watch, '--json')
             report = json.loads(out)
             self.assertEqual(report['ok'], done, answers)
@@ -6553,14 +6647,14 @@ class Status(unittest.TestCase):
 
             def kubectl(*a):
                 if a[0] == 'pods':
-                    return {'items': [self.pod()] if woken['n'] else []}, None
+                    return {'items': [self.pod()] if woken['n'] else []}, None  # noqa: B023
                 if a[0] == 'deployments':
                     return {'items': [{'metadata': {'name': 'demo', 'labels': {magehand.SLEEP_LABEL: 'true'}},
                                        'spec': {'replicas': 0}}]}, None
-                return (apps.pop(0) if apps else later), None
+                return (apps.pop(0) if apps else later), None  # noqa: B023
 
             def wake(name):
-                woken['n'] += 1
+                woken['n'] += 1  # noqa: B023
                 return True
             with mock.patch.object(magehand, 'gh_query', self.recorded('x', statuses=False)), \
                     mock.patch.object(magehand, 'kubectl_json', kubectl), mock.patch.object(magehand, 'wake_dev', wake), \
@@ -7499,7 +7593,7 @@ class Jobs(unittest.TestCase):
             calls = []
 
             def gh(*args, as_of=as_of):
-                calls.append(args)
+                calls.append(args)  # noqa: B023
                 return 0, json.dumps(self.published(as_of)), ''
             with mock.patch.object(magehand, 'kubectl_json', lambda *a: (None, 'kubectl has no context')), \
                     mock.patch.object(magehand, 'origin_repo', lambda root: 'davidlarrimore/demo'), \
@@ -8081,6 +8175,41 @@ class Verify(unittest.TestCase):
             magehand.quality_tree('e' * 40)
         self.assertIn('predate homelab#611', str(exit_.exception.code))
 
+    def test_a_repo_with_its_own_copy_is_checked_with_it(self):
+        # magehand#112's review: magehand (public: it can't call the platform's private workflow) and homelab-apps
+        # check with their own .github/quality in CI, so a local pass must use that copy, not homelab-apps' main.
+        top = self.repo(files={'a.py': 'x = 1\n', 'old.py': 'BAD\n',
+                               '.github/quality/pre-commit-config.yaml': 'repos: []\n'})
+        refs = self.setup_verify(top)
+        used = []
+        pc = top.parent / 'pre-commit'
+        with mock.patch.object(magehand, 'pre_commit_bin', lambda q: used.append(q) or pc):
+            self.commit(top, 'a.py', 'x = 2\n', branch='feature')
+            code, _, _ = self.main('verify')
+            self.assertEqual(code, 0)  # old.py is outside the change
+            self.assertEqual(refs, [])  # no pin looked up
+            self.assertEqual(used[-1].relative_to(used[-1].parents[1]).as_posix(), magehand.QUALITY_DIR)
+            self.assertNotEqual(used[-1], top / magehand.QUALITY_DIR)  # the commit's copy, in its worktree
+            # A change to the copy checks every file, as CI does: old.py's finding now counts.
+            self.commit(top, '.github/quality/pre-commit-config.yaml', 'repos: []  # new rule\n')
+            code, out, _ = self.main('verify')
+            self.assertEqual(code, 1)
+            self.assertIn('(every file', out)  # the scope it really checked (magehand#112's review)
+        # A repo that calls the platform's checks.yaml uses its pin, own copy or not; --apps-dir names the config.
+        self.assertIsNone(magehand.own_quality(top, 'main'))
+        with mock.patch.object(magehand, 'APPS_DIR', '/elsewhere'):
+            self.assertIsNone(magehand.own_quality(top, None))
+        self.assertEqual(magehand.own_quality(top, None), top / magehand.QUALITY_DIR)
+
+    def test_apps_dir_needs_no_pin_lookup(self):
+        # magehand#112's review: --apps-dir names the config, so GitHub being unreachable mustn't stop it.
+        top = self.repo()
+        refs = self.setup_verify(top)
+        self.commit(top, 'a.py', 'x = 2\n', branch='feature')
+        code, out, _ = self.main('verify', '--apps-dir', str(top.parent))
+        self.assertEqual((code, refs), (0, []))
+        self.assertIn('not recorded: --apps-dir', out)
+
     def test_the_commit_is_checked_not_the_working_tree(self):
         # magehand#110's review: pre-commit reads the checkout's files, so a bad commit on another branch passed
         # while a good file was checked out. Checks run in a worktree of the exact commit.
@@ -8291,7 +8420,7 @@ class Verify(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         hook = pathlib.Path(tmp.name) / 'pre-push'
         hook.write_text(magehand.HOOK_SCRIPT)
-        out = subprocess.run(['/bin/sh', str(hook), 'origin', 'url'], capture_output=True, text=True,
+        out = subprocess.run(['/bin/sh', str(hook), 'origin', 'url'], capture_output=True, text=True,  # noqa: PLW1510
                              env={'PATH': '/usr/bin:/bin'}, input='')
         self.assertEqual(out.returncode, 0)
         self.assertIn('not checked', out.stderr)

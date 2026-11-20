@@ -1,6 +1,6 @@
 # Tests on the oldest supported Python (the Mac's system 3.9) and a current
-# one, and Bandit (fails on MEDIUM/HIGH). Required checks for main: tests,
-# bandit.
+# one, Bandit (fails on MEDIUM/HIGH), and the platform's static checks.
+# Required checks for main: tests, bandit, checks.
 name: CI
 on:
   pull_request:
@@ -33,3 +33,37 @@ jobs:
       - run: |
           python -m pip install --quiet bandit==1.9.4
           bandit -r src --severity-level medium
+  # The platform's static checks (ruff's bug rules, shellcheck, the lab's ast-grep rules): pre-commit with the config
+  # in .github/quality, a copy of the platform's (this repo is public, so it can't call the platform's private
+  # checks workflow; the platform's CI fails when the copies differ, and tests the rules there; rule-tests/ is
+  # left out here). `magehand verify` runs the same rules locally. Findings that predate these checks carry
+  # `# noqa` or `# ast-grep-ignore` markers (#109): new code gets none without a reason.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # pre-commit compares the PR's head with its base
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf .platform-quality
+          cp -R .github/quality .platform-quality
+          python -m venv /tmp/pre-commit
+          /tmp/pre-commit/bin/pip install --quiet --require-hashes --no-deps -r .platform-quality/pre-commit-requirements.txt
+          # The files the PR changes, read from the merge commit checked out here (the PR's head alone can name a path
+          # the merge moved; #112's review). A change to the rules or this workflow checks every file (a new rule must
+          # hold for code it didn't touch), as `magehand verify` does.
+          if [ "$EVENT" = pull_request ] && git diff --quiet "$BASE" HEAD -- .github/quality .github/workflows; then
+            range=(--from-ref "$BASE" --to-ref "$(git rev-parse HEAD)")
+          else
+            range=(--all-files)
+          fi
+          /tmp/pre-commit/bin/pre-commit run --config .platform-quality/pre-commit-config.yaml "${range[@]}" \
+            --show-diff-on-failure --color always

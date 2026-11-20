@@ -118,7 +118,7 @@ def github_token():
     if token:
         return token
     if shutil.which('gh'):
-        out = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True)  # nosec B603 B607
+        out = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True)  # nosec B603 B607  # noqa: PLW1510
         if out.returncode == 0 and out.stdout.strip():
             return out.stdout.strip()
     die('no GitHub access: run `gh auth login` (or set GITHUB_TOKEN)')
@@ -400,7 +400,7 @@ def no_llm_key(name, block, path, status):
 def git_out(args, root=None):
     """Stdout of `git [-C root] ARGS` (stripped), or None if git fails."""
     cmd = ['git', *(['-C', str(root)] if root else []), *args]
-    out = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 B607
+    out = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 B607  # noqa: PLW1510
     return out.stdout.strip() if out.returncode == 0 else None
 
 
@@ -569,7 +569,7 @@ def secret_put(account, token, what='OpenBao'):
 
 def secret_get(account):
     if sys.platform == 'darwin':
-        out = subprocess.run(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE,  # nosec B603 B607
+        out = subprocess.run(['security', 'find-generic-password', '-s', KEYCHAIN_SERVICE,  # nosec B603 B607  # noqa: PLW1510
                               '-a', account, '-w'], capture_output=True, text=True)
         return out.stdout.strip() if out.returncode == 0 else None
     path = STATE / account
@@ -1306,7 +1306,7 @@ def deploy_stage(prs, head):
     closed); otherwise the newest."""
     marks = [m for m in deploy_marks(prs) if m[1] == head]
     marks.sort(key=lambda m: m[0].get('state') != 'MERGED')  # stable: newest first within each group
-    for pr, sha, image in marks:
+    for pr, sha, image in marks:  # noqa: B007
         ref = f'homelab-apps#{pr["number"]}'
         digest = image.rsplit('@', 1)[-1][:19]
         if pr.get('state') == 'MERGED':
@@ -1385,7 +1385,7 @@ def kubectl_json(*args):
     if not shutil.which('kubectl'):
         return None, 'kubectl is not installed'
     try:
-        out = subprocess.run(['kubectl', 'get', *args, '-o', 'json', '--request-timeout=10s'],  # nosec B603 B607
+        out = subprocess.run(['kubectl', 'get', *args, '-o', 'json', '--request-timeout=10s'],  # nosec B603 B607  # noqa: PLW1510
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None, 'kubectl did not answer'
@@ -1419,7 +1419,7 @@ def pod_stage(pods, application, image, argo_error=None):
 
         def ident(c):
             """The image a container runs, or (not pulled yet: no imageID) is declared to run."""
-            return c.get('imageID') or c.get('image') or declared.get(c.get('name'), '')
+            return c.get('imageID') or c.get('image') or declared.get(c.get('name'), '')  # noqa: B023
         on_new = bool(statuses) and (block or all(digest in ident(c) for c in statuses))
         if on_new and all(c.get('ready') for c in statuses):
             ready += 1
@@ -1565,7 +1565,7 @@ def cluster_access():
     if not shutil.which('kubectl'):
         return 'kubectl is not installed'
     try:
-        out = subprocess.run(['kubectl', 'config', 'current-context'], capture_output=True, text=True,  # nosec B603 B607
+        out = subprocess.run(['kubectl', 'config', 'current-context'], capture_output=True, text=True,  # nosec B603 B607  # noqa: PLW1510
                              timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return 'kubectl did not answer'
@@ -1607,7 +1607,7 @@ def wake_dev(name):
     """Ask Sablier (through the API server's Service proxy) to start <name>-dev for 30 minutes. Like opening
     the app: it changes nothing but how long dev stays up. True when the request was accepted."""
     try:
-        out = subprocess.run(['kubectl', 'get', '--raw', SABLIER_POKE.format(name=name), '--request-timeout=10s'],  # nosec B603 B607
+        out = subprocess.run(['kubectl', 'get', '--raw', SABLIER_POKE.format(name=name), '--request-timeout=10s'],  # nosec B603 B607  # noqa: PLW1510
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1993,7 +1993,7 @@ def spec_changes(old, new):
     def items(spec):
         found = {}
         for block, svc in ((spec or {}).get('services') or {}).items():
-            svc = svc if isinstance(svc, dict) else {}
+            svc = svc if isinstance(svc, dict) else {}  # noqa: PLW2901
             found[f'block {block} ({svc.get("type")})'] = None
             for model in svc.get('models') or []:
                 found[f'model {model} of {block}'] = None
@@ -2165,7 +2165,7 @@ def read_spec(repo, ref, problems, required):
         return {}
     if text is None:
         if required:
-            problems.append(f'deploy/app.yaml is missing on main (production needs deploy/app.yaml, base/ and prod/)')
+            problems.append('deploy/app.yaml is missing on main (production needs deploy/app.yaml, base/ and prod/)')
         return {}
     try:
         return yaml.safe_load(text) or {}
@@ -2197,7 +2197,7 @@ def plan_release(repo, name, forced=None, cluster=True, wake=False):
                         f'(the owner approves that PR; see the guide, "Going to production")')
     prod_dir, err = file_at(repo, 'deploy/prod', head)
     if prod_dir is None:
-        problems.append(f'deploy/prod/ is missing on main (production needs deploy/app.yaml, base/ and prod/)'
+        problems.append('deploy/prod/ is missing on main (production needs deploy/app.yaml, base/ and prod/)'
                         if not err else f'could not read deploy/prod: {err}')
     releases, err = gh_query('api', f'repos/{repo}/releases?per_page=20')
     if err:
@@ -2479,7 +2479,7 @@ def gh_cli(*args, stdin=None):
         if found is not None:
             return found
         die('needs the GitHub CLI: `brew install gh`, then `gh auth login`' + (TOKEN_ONLY if github_env_token() else ''))
-    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607
+    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607  # noqa: PLW1510
     return out.returncode, out.stdout, out.stderr.strip()
 
 
@@ -2500,9 +2500,11 @@ RULESET = {
 
 # The checks every app PR must pass before it merges, from the template's .github/workflows/build.yaml: its
 # `security` and `image` jobs call homelab-apps' shared workflows, and `image / result` passes only when every
-# job of the image build did. The ruleset requiring them has no bypass (as homelab's own "main: checks must
-# pass"): the owner's bypass of the approval never skips CI.
-REQUIRED_CHECKS = ('security / scan', 'image / result')
+# job of the image build did; `checks / pre-commit` is the platform's static checks (homelab#611). The ruleset
+# requiring them has no bypass (as homelab's own "main: checks must pass"): the owner's bypass of the approval
+# never skips CI.
+REQUIRED_CHECKS = ('security / scan', 'image / result', 'checks / pre-commit')
+REQUIRED_NAMES = ', '.join(REQUIRED_CHECKS[:-1]) + ' and ' + REQUIRED_CHECKS[-1]
 CHECKS_RULESET = {
     'name': 'main: checks must pass', 'target': 'branch', 'enforcement': 'active',
     'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH'], 'exclude': []}},
@@ -2691,25 +2693,85 @@ def ensure_ruleset(repo):
     return 'failed'
 
 
-def ensure_checks(repo):
-    """Make sure a merge waits for the required checks: 'exists', 'created', 'weak' or 'failed' (a warning, as
-    for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes one."""
+PLATFORM_CHECK = 'checks / pre-commit'
+
+
+def platform_checks_call(text, on_pull_requests=False):
+    """The ref of homelab-apps' checks.yaml that a workflow's job calls (`jobs.<id>.uses`, parsed: a comment
+    or a string elsewhere doesn't count), or None; with `on_pull_requests`, only when the workflow runs on pull
+    requests (where the check reports). None for a workflow that isn't valid YAML."""
+    try:
+        flow = yaml.safe_load(text or '')
+    except yaml.YAMLError:
+        return None
+    if not isinstance(flow, dict):
+        return None
+    if on_pull_requests:
+        # Every pull request: a `paths`, `paths-ignore` or `branches` filter leaves some PRs without the check, and
+        # a required check that never reports blocks them (magehand#112's review).
+        on = flow.get('on', flow.get(True))  # YAML 1.1 reads a bare `on:` key as true
+        if not (on == 'pull_request' or (isinstance(on, (list, dict)) and 'pull_request' in on)):
+            return None
+        filters = on.get('pull_request') if isinstance(on, dict) else None
+        if isinstance(filters, dict) and set(filters) & {'paths', 'paths-ignore', 'branches', 'branches-ignore'}:
+            return None
+        # A `types` list must keep the default activities, or a later push to the PR doesn't run it.
+        types = filters.get('types') if isinstance(filters, dict) else None
+        listed = [types] if isinstance(types, str) else types if isinstance(types, list) else [None]
+        if types is not None and (not all(isinstance(t, str) for t in listed)
+                                  or not {'opened', 'synchronize', 'reopened'} <= set(listed)):
+            return None  # an invalid list (GitHub rejects the workflow) or one without the default activities
+    prefix = f'{APPS_REPO}/{CHECKS_WORKFLOW}@'
+    jobs = flow.get('jobs') if isinstance(flow.get('jobs'), dict) else {}
+    for job_id, job in jobs.items():
+        uses = job.get('uses') if isinstance(job, dict) else None
+        if not (isinstance(uses, str) and uses.startswith(prefix) and len(uses) > len(prefix)):
+            continue
+        # The check's name is `<job> / pre-commit`: with on_pull_requests, the job must be the template's `checks`.
+        if on_pull_requests and (job_id != 'checks' or job.get('name', 'checks') != 'checks'):
+            continue
+        return uses[len(prefix):]
+    return None
+
+
+def ensure_checks(repo, created=False):
+    """Make sure a merge waits for the required checks: 'exists', 'created', 'partial', 'weak' or 'failed' (a
+    warning, as for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes
+    one. A repo made now, from the template, runs every required check. Repairing an existing repo requires
+    PLATFORM_CHECK only once you say its build.yaml runs it: an app made before the static checks doesn't report
+    it, and a required check that never reports leaves every PR waiting (magehand#112's review). So a repair adds
+    the others, and the step says when to add it ('partial')."""
     state, detail = checks_status(repo)
     name = CHECKS_RULESET['name']
     if state == 'ok':
-        print(f"{repo}: the checks {' and '.join(REQUIRED_CHECKS)} are already required", file=sys.stderr)
+        print(f"{repo}: the checks {REQUIRED_NAMES} are already required", file=sys.stderr)
         return 'exists'
     if state == 'weak':
+        if detail.startswith(f'{PLATFORM_CHECK} not required on ') and ';' not in detail:
+            print(f"{repo}: {PLATFORM_CHECK} is not required yet: once {BUILD_WORKFLOW} runs the platform's "
+                  "`checks` job on pull requests, require it in Settings > Rules", file=sys.stderr)
+            return 'partial'
         print(f"{repo}: required checks are incomplete ({detail}); fix it in the repo's Settings > Rules "
               "(magehand leaves an existing ruleset alone)", file=sys.stderr)
         return 'weak'
     if state == 'missing':
+        ruleset, names = CHECKS_RULESET, REQUIRED_NAMES
+        if not created:
+            contexts = [check for check in REQUIRED_CHECKS if check != PLATFORM_CHECK]
+            names = ' and '.join(contexts)
+            ruleset = dict(CHECKS_RULESET, rules=[
+                rule if rule['type'] != 'required_status_checks' else dict(rule, parameters=dict(
+                    rule['parameters'], required_status_checks=[{'context': c} for c in contexts]))
+                for rule in CHECKS_RULESET['rules']])
         code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-',
-                                 stdin=json.dumps(CHECKS_RULESET))
+                                 stdin=json.dumps(ruleset))
         if code == 0:
-            print(f"{repo}: ruleset '{name}' added (a PR merges only when {' and '.join(REQUIRED_CHECKS)} pass; "
+            print(f"{repo}: ruleset '{name}' added (a PR merges only when {names} pass; "
                   'nobody can bypass it)', file=sys.stderr)
-            return 'created'
+            if not created:
+                print(f"{repo}: {PLATFORM_CHECK} is not required yet: once {BUILD_WORKFLOW} runs the platform's "
+                      "`checks` job on pull requests, require it in Settings > Rules", file=sys.stderr)
+            return 'created' if created else 'partial'
     print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
           'checks until it exists', file=sys.stderr)
     return 'failed'
@@ -3159,7 +3221,7 @@ def cmd_new(a):
         print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
-    checks = ensure_checks(repo)
+    checks = ensure_checks(repo, created)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
     here = not a.dir and current_repo() == repo  # repairing the checkout you are in: no second copy inside it
     cloned = None if a.no_clone or here else clone_repo(repo, dest)
@@ -3207,7 +3269,7 @@ def cmd_new(a):
         print(f'{dest}: not touched (it is not a checkout of {repo})', file=sys.stderr)
     if named == 'differs' and work:
         print(f'{work}: no scaffold written: deploy/app.yaml on main names another app', file=sys.stderr)
-    steps = (new_steps(repo, name, app, dest, named, cloned, wrote) if created else
+    steps = (new_steps(repo, name, app, dest, named, cloned, wrote) + checks_steps(repo, checks) if created else
              repair_steps(repo, private, bot, ruleset, cloned, dest, app, named, wrote, checks))
     if pull:
         steps.insert(0, f'run:   git -C {shell_path(work)} pull   # new committed deploy/app.yaml (`app: {app}`) to main')
@@ -3288,17 +3350,31 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
     elif ruleset == 'failed':
         steps.append(f"do:    add the ruleset '{RULESET['name']}' (only an admin can): run `magehand new "
                      f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
-    if checks == 'weak':
-        steps.append(f"do:    require the checks {' and '.join(REQUIRED_CHECKS)} on main with no bypass in the repo's "
-                     'Settings > Rules (magehand leaves an existing ruleset alone)')
-    elif checks == 'failed':
-        steps.append(f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
-                     f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules")
+    steps += checks_steps(repo, checks)
     if cloned == 'failed':
         steps.append(f'run:   gh repo clone {repo} {shell_path(dest)}')
     if wrote:
         steps.append(commit_step(list(wrote)))
     return steps
+
+
+def checks_steps(repo, checks):
+    """What the required-checks ruleset leaves you, from ensure_checks' result."""
+    # The third check only once it reports on every PR: required and never reported, it blocks them all.
+    third = (f"require {PLATFORM_CHECK} only once a recent PR's checks list it: {BUILD_WORKFLOW} must run "
+             "homelab-app-template's `checks` job, under that name, on every pull request (no `paths` or `branches` "
+             "filter, and a `types` list, if any, keeping opened, synchronize and reopened, so every push to a PR runs it; "
+             "`magehand check` warns otherwise)")
+    if checks == 'weak':
+        others = ' and '.join(c for c in REQUIRED_CHECKS if c != PLATFORM_CHECK)
+        return [f"do:    require {others} on main with no bypass in the repo's Settings > Rules (magehand leaves "
+                f"an existing ruleset alone); {third}"]
+    if checks == 'partial':
+        return [f'do:    {third}; then add it in Settings > Rules']
+    if checks == 'failed':
+        return [f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
+                f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules"]
+    return []
 
 
 def repair_summary(repo, private, bot, ruleset, cloned, dest, app=None, named=None, wrote=(), steps=None,
@@ -3332,7 +3408,7 @@ _runtime = []  # memo: [cli or None]
 def quiet(cmd, timeout=10):
     """A read-only probe; None if the command is missing or hangs."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603  # fixed probes
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603  # fixed probes  # noqa: PLW1510
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -3717,7 +3793,7 @@ def local_connection(kind, block, local, app_name=None, app=None):
                                              f'/v2/GetKeyInfo?id={urllib.parse.quote(conn["access_key_id"])}'
                                              '&showSecretKey=true')
             except OSError:
-                status, found = 0, None
+                status, found = 0, None  # noqa: F841
         if not found or not found.get('secretAccessKey'):
             die(f'block {block} (bucket): the local object store is not running: `magehand dev up`')
         data = {'endpoint': endpoint, 'bucket': conn['bucket'], 'access_key_id': conn['access_key_id'],
@@ -3749,7 +3825,7 @@ def dotenv(path):
     values = {}
     if path.is_file():
         for line in path.read_text().splitlines():
-            line = line.strip()
+            line = line.strip()  # noqa: PLW2901
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
                 values[key.strip()] = os.path.expandvars(value.strip().strip('"\''))
@@ -3911,7 +3987,7 @@ def cmd_run(a):
         image = f'magehand/{app["name"]}:local'
         if build:
             print(f'magehand: {cli} build -t {image} .', file=sys.stderr)
-            if subprocess.run([cli, 'build', '-t', image, '.']).returncode:  # nosec B603  # docker/podman
+            if subprocess.run([cli, 'build', '-t', image, '.']).returncode:  # nosec B603  # docker/podman  # noqa: PLW1510
                 die(f'{cli} build failed')
         engine('network', 'create', f'magehand-{app["name"]}', check=False)
         engine('rm', '-f', f'magehand-{app["name"]}-app', check=False)
@@ -4042,7 +4118,7 @@ def cmd_doctor(a):
                  if bot == 'invited' else unread),
                 (f"{repo}: ruleset '{RULESET['name']}'", None if state['ruleset'] is None else state['ruleset'] == 'ok',
                  weak if state['ruleset'] == 'weak' else fix, unread),
-                (f"{repo}: merges wait for {' and '.join(REQUIRED_CHECKS)}",
+                (f"{repo}: merges wait for {REQUIRED_NAMES}",
                  None if state['checks'] is None else state['checks'] == 'ok',
                  f'{state["checks_detail"]}; fix it in the repo\'s Settings > Rules (magehand new leaves it alone)'
                  if state['checks'] == 'weak' else fix, unread),
@@ -4236,7 +4312,7 @@ def check_manifests(app, catalog):
     blocks = (catalog or {}).get('blocks') or {}
     models = {m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict)}
     for name, svc in app['services'].items():
-        svc = svc or {}
+        svc = svc or {}  # noqa: PLW2901
         kind = svc.get('type')
         if blocks and kind not in blocks:
             found.append(finding('error', f'{where}/app.yaml', f'block {name}: unknown type {kind!r}; types: '
@@ -4402,7 +4478,7 @@ def render_overlay(local, overlay):
     if not shutil.which('kubectl'):
         return None, 'kubectl is not installed'
     try:
-        out = subprocess.run(['kubectl', 'kustomize', str(local / overlay)], capture_output=True, text=True,  # nosec B603 B607
+        out = subprocess.run(['kubectl', 'kustomize', str(local / overlay)], capture_output=True, text=True,  # nosec B603 B607  # noqa: PLW1510
                              timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None, 'kubectl kustomize did not answer'
@@ -4641,7 +4717,7 @@ def run_tool(argv, timeout, **kwargs):
     caller reports that as a skipped check (an error with --strict), never a crash that loses the other findings."""
     tool = pathlib.Path(argv[0]).name
     try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs), None  # nosec B603
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs), None  # nosec B603  # noqa: PLW1510
     except subprocess.TimeoutExpired:
         return None, f'{tool} did not finish within {timeout}s'
     except OSError as error:
@@ -4704,7 +4780,7 @@ def policy_refusals(text):
     "1 -  why" in 1.19, "1. rule: why" before), one string each; the output's own lines when it has none."""
     refusals, current = [], None
     for line in text.splitlines():
-        line = line.strip()
+        line = line.strip()  # noqa: PLW2901
         head = re.match(r'policy (\S+) -> resource (\S+) (?:failed|error)', line)
         if head:
             current = [f'{head.group(1)} on {head.group(2).strip("/").rsplit("/", 1)[-1]}']
@@ -5058,6 +5134,17 @@ def check_quality_job(root):
                     "homelab-app-template's `quality` job (agents can't change workflows)", QUALITY_SEE)]
 
 
+def check_checks_job(root):
+    """The Build workflow calls the platform's static checks (homelab-app-template's `checks` job, homelab#611).
+    A warning naming who fixes it, as for the quality job."""
+    path = root / BUILD_WORKFLOW
+    if not path.is_file() or platform_checks_call(path.read_text(errors='replace'), on_pull_requests=True):
+        return []
+    return [finding('warning', BUILD_WORKFLOW, "doesn't run the platform's static checks: ask the owner to add "
+                    "homelab-app-template's `checks` job (agents can't change workflows)",
+                    'homelab-apps docs/development/quality.md "Checks"')]
+
+
 # A Prometheus metric definition (Python prometheus_client, JS prom-client, Go client_golang) and the label names
 # that would put a person or a document into a series label (homelab-apps docs/platform/metrics.md "Labels").
 METRIC_DEFINITION = re.compile(r'\b(?:New)?(?:Counter|Gauge|Histogram|Summary)(?:Vec)?\s*\(|\blabel_?[nN]ames\b')
@@ -5156,7 +5243,7 @@ def check_code(root, app, catalog=None):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
                                  'homelab-apps AGENTS.md "Apps with their own repo"'))
-    found += check_dockerfile(root) + check_quality_job(root) + check_dotenv(root, app)
+    found += check_dockerfile(root) + check_quality_job(root) + check_checks_job(root) + check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
         try:
@@ -5231,7 +5318,7 @@ def check_dotenv(root, app):
     from_secrets = {e[0] for e in env_plan(app) if e[1] != 'value'} if app else set()
     found = []
     for number, line in enumerate(path.read_text(errors='replace').splitlines(), 1):
-        line = line.strip()
+        line = line.strip()  # noqa: PLW2901
         if not line or line.startswith('#') or '=' not in line:
             continue
         var, value = (part.strip() for part in line.split('=', 1))
@@ -5411,7 +5498,7 @@ def check_merged_branch(root):
             continue
         if old == tip:
             return []  # a merged PR already covers HEAD: nothing new to move
-        ancestor = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', old, tip],  # nosec B603 B607
+        ancestor = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', old, tip],  # nosec B603 B607  # noqa: PLW1510
                                   capture_output=True)
         if ancestor.returncode == 0:
             covered.append(pr)
@@ -5555,7 +5642,7 @@ def cmd_check_ui(a):
     # One run per app at a time, from any checkout: runs share this directory, the image tag, the network and
     # the container names. Held until magehand exits (the kernel drops it then, even on a crash).
     work.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(work.parent / f'{tag}.lock', 'w')  # held for the whole run
+    lock = open(work.parent / f'{tag}.lock', 'w')  # held for the whole run  # noqa: SIM115
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -5573,7 +5660,7 @@ def cmd_check_ui(a):
     image, net = f'magehand/{tag}:ui-check', f'magehand-ui-{tag}'
     app_box, db_box, check_box = f'{net}-app', f'{net}-postgres', f'{net}-browser'
     print(f'magehand: {cli} build -t {image} {shell_path(root)}', file=sys.stderr)
-    if subprocess.run([cli, 'build', '-t', image, str(root)], stdout=sys.stderr).returncode:  # nosec B603  # docker/podman
+    if subprocess.run([cli, 'build', '-t', image, str(root)], stdout=sys.stderr).returncode:  # nosec B603  # docker/podman  # noqa: PLW1510
         die(f'{cli} build failed (CI builds the same Dockerfile): fix it, then `{again}`')
 
     def clean():
@@ -5603,7 +5690,7 @@ def cmd_check_ui(a):
         print(f'magehand: {UI_SCRIPT} from {APPS_REPO}, Playwright {pins["PLAYWRIGHT_VERSION"]}, '
               f'axe-core {pins["AXE_VERSION"]}', file=sys.stderr)
         values = {**pins, 'PORT': str(port)}
-        code = subprocess.run([  # nosec B603  # docker/podman
+        code = subprocess.run([  # nosec B603  # docker/podman  # noqa: PLW1510
             cli, 'run', '--name', check_box, '--network', f'container:{app_box}', '-v', f'{work / "check"}:/check:ro',
             '-v', f'{root}:/app:ro', '-v', f'{UI_CACHE_VOLUME}:/cache',
             *[x for k, v in values.items() for x in ('-e', f'{k}={v}')],
@@ -5755,7 +5842,6 @@ def agents_text(path):
 QUALITY_DIR = '.github/quality'
 CHECKS_WORKFLOW = '.github/workflows/checks.yaml'
 TOOLS_PIN = re.compile(r'\b' + re.escape(APPS_REPO) + r'/\.github/actions/tools@([0-9a-f]{40})\b')
-CHECKS_CALL = re.compile(r'\buses:\s*' + re.escape(APPS_REPO) + r'/\.github/workflows/checks\.yaml@([\w./-]+)')
 PLATFORM_LINK = '.platform-quality'
 PRE_COMMIT_CONFIG = f'{PLATFORM_LINK}/pre-commit-config.yaml'
 JS_TS = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts')
@@ -5794,10 +5880,20 @@ def checks_ref(top):
     """The ref of homelab-apps' checks.yaml this checkout's own workflows call (what its CI runs), or None."""
     workflows = top / '.github' / 'workflows'
     for path in sorted(workflows.glob('*.y*ml')) if workflows.is_dir() else []:
-        m = CHECKS_CALL.search(path.read_text(errors='replace'))
-        if m:
-            return m.group(1)
+        ref = platform_checks_call(path.read_text(errors='replace'))
+        if ref:
+            return ref
     return None
+
+
+def own_quality(work, ref):
+    """The commit's own .github/quality, for a repo whose CI checks with its own copy and calls no checks.yaml
+    (homelab-apps itself; magehand, which is public and can't call the platform's private workflow), or None.
+    --apps-dir still wins: it names the config to use."""
+    own = work / QUALITY_DIR
+    if APPS_DIR or ref is not None or not (own / 'pre-commit-config.yaml').is_file():
+        return None
+    return own
 
 
 def quality_pin(ref='main'):
@@ -5878,7 +5974,7 @@ def python_for_pre_commit():
         exe = shutil.which(name)
         if not exe:
             continue
-        out = subprocess.run([exe, '-c', 'import sys; print(sys.version_info >= (3, 10))'],  # nosec B603
+        out = subprocess.run([exe, '-c', 'import sys; print(sys.version_info >= (3, 10))'],  # nosec B603  # noqa: PLW1510
                              capture_output=True, text=True)
         if out.stdout.strip() == 'True':
             return exe
@@ -5995,7 +6091,7 @@ def record_verified(top, sha):
 
 def clean_checkout(top):
     """True when no tracked file differs from HEAD (then the commit checked is what you have)."""
-    out = subprocess.run(['git', '-C', str(top), 'status', '--porcelain', '--untracked-files=no'],  # nosec B603 B607
+    out = subprocess.run(['git', '-C', str(top), 'status', '--porcelain', '--untracked-files=no'],  # nosec B603 B607  # noqa: PLW1510
                          capture_output=True, text=True)
     return out.returncode == 0 and not out.stdout.strip()
 
@@ -6014,10 +6110,10 @@ def run_to(cmd, out, **kwargs):
     try:
         out.fileno()
     except (AttributeError, OSError, ValueError):
-        done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kwargs)  # nosec B603
+        done = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kwargs)  # nosec B603  # noqa: PLW1510
         out.write(done.stdout or '')
         return done.returncode
-    return subprocess.run(cmd, stdout=out, **kwargs).returncode  # nosec B603
+    return subprocess.run(cmd, stdout=out, **kwargs).returncode  # nosec B603  # noqa: PLW1510
 
 
 @contextlib.contextmanager
@@ -6025,7 +6121,7 @@ def commit_checkout(top, sha):
     """A temporary worktree of commit `sha` (detached, removed afterwards)."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix='magehand-verify-'))
     path = tmp / 'src'
-    out = subprocess.run(['git', '-C', str(top), 'worktree', 'add', '--detach', '--quiet', str(path), sha],  # nosec B603 B607
+    out = subprocess.run(['git', '-C', str(top), 'worktree', 'add', '--detach', '--quiet', str(path), sha],  # nosec B603 B607  # noqa: PLW1510
                          capture_output=True, text=True, env=child_env())
     if out.returncode != 0:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -6033,7 +6129,8 @@ def commit_checkout(top, sha):
     try:
         yield path
     finally:
-        subprocess.run(['git', '-C', str(top), 'worktree', 'remove', '--force', str(path)],  # nosec B603 B607
+        # ast-grep-ignore: subprocess-result-discarded  # best effort: the directory is removed below either way
+        subprocess.run(['git', '-C', str(top), 'worktree', 'remove', '--force', str(path)],  # nosec B603 B607  # noqa: PLW1510
                        capture_output=True, env=child_env())
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -6067,12 +6164,18 @@ def cmd_verify(a):
             # Everything about the checks comes from the commit itself: the checks.yaml ref its workflows call, and
             # whether it has JS/TS for ESLint (magehand#110's review), not from the checkout you are in.
             ref = checks_ref(work)
+            own = own_quality(work, ref)
             with setup_lock():
-                quality = quality_tree(quality_pin(ref or 'main'))
+                # --apps-dir names the config: no pin to look up (magehand#112's review).
+                quality = own or quality_tree(None if APPS_DIR else quality_pin(ref or 'main'))
                 ensure_eslint(quality, work)
                 pc = pre_commit_bin(quality)
             (work / PLATFORM_LINK).symlink_to(quality, target_is_directory=True)
-            rng = ['--all-files'] if frm is None else ['--from-ref', frm, '--to-ref', to]
+            # A repo with its own copy checks every file when the copy or its workflows change, as its CI does (a new
+            # rule must hold for code the change didn't touch; magehand#112's review).
+            everything = frm is None or (own is not None and git_out(
+                ['diff', '--name-only', f'{frm}...{to}', '--', QUALITY_DIR, '.github/workflows'], work) != '')
+            rng = ['--all-files'] if everything else ['--from-ref', frm, '--to-ref', to]
             ok = run_pre_commit(pc, work, rng, a.only, out)
             if ok and not a.only and is_app_checkout(work):
                 # An app repo: the platform's rules too, strict as CI runs them (a rule whose tool is missing here
@@ -6081,7 +6184,7 @@ def cmd_verify(a):
                             env=child_env()) == 0
         # A record stands for "CI's checks pass on this commit": the CI range, every check, the config CI uses.
         recorded = bool(ok and ci_range and not a.only and not APPS_DIR and record_verified(top, sha))
-        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref})
+        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref, 'everything': everything})
     ok = all(r['ok'] for r in results)
     if a.pre_push:
         if not ok:
@@ -6089,7 +6192,7 @@ def cmd_verify(a):
                   'shows the same; in an emergency `git push --no-verify`, and CI still checks the PR)', file=sys.stderr)
         sys.exit(0 if ok else 1)
     head = results[0]
-    scope = 'every file' if a.all else f'the files changed since {default_base(top)}'
+    scope = 'every file' if head['everything'] else f'the files changed since {default_base(top)}'
     dirty = not clean_checkout(top)
     why_not = ('--only runs one check' if a.only else '--apps-dir is not what CI runs' if APPS_DIR else None)
     step = ('`magehand pr ready` once the PR\'s checks are green' if ok and head['recorded'] and not dirty else
@@ -6498,7 +6601,7 @@ def codex_rules_problem(path):
     if not shutil.which('codex'):
         return None
     try:
-        out = subprocess.run(['codex', 'execpolicy', 'check', f'--rules={path}', '--', 'magehand', 'status'],  # nosec B603 B607
+        out = subprocess.run(['codex', 'execpolicy', 'check', f'--rules={path}', '--', 'magehand', 'status'],  # nosec B603 B607  # noqa: PLW1510
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as error:
         return f'codex execpolicy check failed ({error})'
@@ -6580,7 +6683,7 @@ def dns_answer(server, host):
     """What `server` answers for `host` (A record), or None. Uses dig (macOS)."""
     if not shutil.which('dig'):
         return None
-    out = subprocess.run(['dig', '+short', '+time=3', '+tries=1', f'@{server}', host],  # nosec B603 B607
+    out = subprocess.run(['dig', '+short', '+time=3', '+tries=1', f'@{server}', host],  # nosec B603 B607  # noqa: PLW1510
                          capture_output=True, text=True)
     lines = [line for line in out.stdout.split() if line and line[0].isdigit()]
     return lines[0] if out.returncode == 0 and lines else None
@@ -6624,7 +6727,7 @@ def local_network_blocked(error=None):
             error = failed
     if getattr(getattr(error, 'reason', error), 'errno', None) != errno.EHOSTUNREACH:  # urlopen wraps it
         return False
-    curl = subprocess.run(['/usr/bin/curl', '-sS', '-o', '/dev/null', '--max-time', '5',  # nosec B603
+    curl = subprocess.run(['/usr/bin/curl', '-sS', '-o', '/dev/null', '--max-time', '5',  # nosec B603  # noqa: PLW1510
                            f'{OPENBAO}/v1/sys/health'], capture_output=True)
     return curl.returncode == 0
 
@@ -6639,7 +6742,7 @@ def can_move_to_apple_python():
     Command Line Tools present (without them /usr/bin/python3 is a stub that opens their installer)."""
     return (sys.platform == 'darwin' and not on_apple_python() and install_method() == 'uv'
             and bool(shutil.which('uv')) and os.path.exists(APPLE_PYTHON)
-            and subprocess.run(['xcode-select', '-p'], capture_output=True).returncode == 0)  # nosec B603 B607
+            and subprocess.run(['xcode-select', '-p'], capture_output=True).returncode == 0)  # nosec B603 B607  # noqa: PLW1510
 
 
 def local_network_step():
@@ -6653,11 +6756,11 @@ def move_to_apple_python():
     latest): `magehand==X` would pin it and stop `upgrade`. uv records the Python, so upgrades stay on it."""
     cmd = ['uv', 'tool', 'install', '--reinstall', '--python', APPLE_PYTHON, 'magehand']
     print(f"    Apple's own Python is exempt: {' '.join(cmd)}", flush=True)
-    if subprocess.run(cmd).returncode != 0:  # nosec B603  # a fixed command
+    if subprocess.run(cmd).returncode != 0:  # nosec B603  # a fixed command  # noqa: PLW1510
         die(f"could not reinstall magehand on Apple's Python (see above): {LOCAL_NETWORK_PERMISSION}; "
             'then `magehand setup` again')
     exe = pathlib.Path(sys.executable).with_name('magehand')  # the same tool directory, now on Apple's Python
-    sys.exit(subprocess.run([str(exe), 'setup']).returncode)  # nosec B603  # magehand's own executable
+    sys.exit(subprocess.run([str(exe), 'setup']).returncode)  # nosec B603  # magehand's own executable  # noqa: PLW1510
 
 
 def sudo_write_resolver(server):
@@ -6666,6 +6769,7 @@ def sudo_write_resolver(server):
     subprocess.run(['sudo', 'mkdir', '-p', str(RESOLVER.parent)], check=True)  # nosec B603 B607
     subprocess.run(['sudo', 'tee', str(RESOLVER)], input=f'nameserver {server}\n', text=True,  # nosec B603 B607
                    stdout=subprocess.DEVNULL, check=True)
+    # ast-grep-ignore: subprocess-result-discarded  # best effort: mDNSResponder re-reads resolvers on its own
     subprocess.run(['sudo', 'killall', '-HUP', 'mDNSResponder'], check=False)  # nosec B603 B607
 
 
@@ -6927,7 +7031,7 @@ PIN_COMMANDS = {'uv': lambda v: ['uv', 'tool', 'install', '--force', '--refresh-
 
 def exe_version(exe):
     """The version an installed magehand executable reports, or None."""
-    out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603  # our own executable
+    out = subprocess.run([str(exe), 'version'], capture_output=True, text=True)  # nosec B603  # our own executable  # noqa: PLW1510
     return out.stdout.splitlines()[0] if out.returncode == 0 and out.stdout else None
 
 
@@ -6945,7 +7049,7 @@ def cmd_upgrade(_a):
     else:
         upgraded, cmd = True, UPGRADE_COMMANDS[method]
         print(f'magehand {current or "?"} -> {latest or "latest"}: {shlex.join(cmd)}', flush=True)
-        if subprocess.run(cmd).returncode != 0:  # nosec B603  # fixed commands above
+        if subprocess.run(cmd).returncode != 0:  # nosec B603  # fixed commands above  # noqa: PLW1510
             die('the upgrade failed (see above)')
     # The new version, from this install's own bin (not whatever is first on PATH).
     exe = pathlib.Path(sys.executable).with_name('magehand')
@@ -6960,7 +7064,7 @@ def cmd_upgrade(_a):
         pin = PIN_COMMANDS[method](latest)
         print(f'still {now}: `{shlex.join(cmd)}` did not see {latest} (its package index is older than the release); '
               f'installing it by version: {shlex.join(pin)}', flush=True)
-        if subprocess.run(pin).returncode != 0:  # nosec B603  # fixed commands above, a version from our tags
+        if subprocess.run(pin).returncode != 0:  # nosec B603  # fixed commands above, a version from our tags  # noqa: PLW1510
             die(f'could not install magehand {latest} (PyPI has it a few minutes after the tag): '
                 f'`{shlex.join(pin)}` again in a few minutes')
         now = exe_version(exe)
@@ -6969,10 +7073,14 @@ def cmd_upgrade(_a):
     print(f'now: magehand {now or "?"}', flush=True)
     # The new version's own setup, quietly: it refreshes the skill and the approvals where setup put them, and
     # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
-    code = subprocess.run([str(exe), 'setup', '--refresh']).returncode  # nosec B603
+    code = subprocess.run([str(exe), 'setup', '--refresh']).returncode  # nosec B603  # noqa: PLW1510
     if code == 2:
-        if skill_installed():
-            subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL)  # nosec B603
+        if skill_installed() and subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL,  # nosec B603
+                                                check=False).returncode != 0:
+            # The skill keeps the old version's text (magehand#112's review).
+            print('could not refresh the skill (see above)')
+            print(next_line('`magehand skill --install`'))
+            return
         print(next_line(None))
     elif code != 0:  # its own `next:` may not have been printed
         print("the new version's quiet setup failed (see above)")
@@ -7398,7 +7506,7 @@ def cron_problem(schedule):
     if len(fields) != 5:
         return (f'{text!r} is not a cron schedule: five fields (minute hour day-of-month month day-of-week), '
                 f'or one of {", ".join(CRON_MACROS)}')
-    for field, (what, low, high, names) in zip(fields, CRON_FIELDS):
+    for field, (what, low, high, names) in zip(fields, CRON_FIELDS):  # noqa: B905  # zip(strict=) needs Python 3.10; magehand supports 3.9
         problem = cron_field_problem(field, low, high, names)
         if problem:
             return f'{what} {field!r}: {problem}'
@@ -7447,7 +7555,7 @@ def cron_too_frequent(schedule):
     ordered = sorted(minutes)
     if len(ordered) < 2:
         return False
-    gaps = [b - a for a, b in zip(ordered, ordered[1:])] + [60 - ordered[-1] + ordered[0]]
+    gaps = [b - a for a, b in zip(ordered, ordered[1:])] + [60 - ordered[-1] + ordered[0]]  # noqa: B905  # zip(strict=) needs Python 3.10; magehand supports 3.9
     return min(gaps) < JOB_MIN_INTERVAL
 
 
@@ -7584,7 +7692,7 @@ def deploy_documents(local, zone=''):
     """(file, document) for every YAML document in deploy/base, dev and prod; with zone='fetch', in the fetch zone's
     deploy/fetch/base, dev and prod instead."""
     for part in DEPLOY_DIRS:
-        part = f'{zone}/{part}' if zone else part
+        part = f'{zone}/{part}' if zone else part  # noqa: PLW2901
         for path in sorted((local / part).glob('*.y*ml')) if (local / part).is_dir() else ():
             try:
                 docs = list(yaml.safe_load_all(path.read_text()))
@@ -8241,7 +8349,7 @@ def pr_watch(a):
             target = [str(pr['number']), '-R', repo]  # stay on this PR
             by_bot = login_of(pr.get('author')) != BOT.lower()
             result, what, step = watch_step(pr, memory, time.monotonic(),
-                                            lambda: open_threads_of(repo, pr['number'], by_bot) or [])
+                                            lambda: open_threads_of(repo, pr['number'], by_bot) or [])  # noqa: B023
             if what != last:
                 print(f'{time.strftime("%H:%M")} PR #{pr["number"]}: {what}', file=sys.stderr, flush=True)
             last = what
@@ -8904,7 +9012,7 @@ def build_parser():
     p = command('new', cmd_new, "create an app's repo for the platform, or repair one",
                 "create an app's private repo from homelab-app-template, invite OpenClaw's bot (write) and add\n"
                 "the rulesets 'main: owner approves' (an approval) and 'main: checks must pass' (green\n"
-                "security / scan and image / result, no bypass); on an existing repo, add whichever is missing",
+                "security / scan, image / result and checks / pre-commit, no bypass); on an existing repo, add whichever is missing",
                 'Uses gh as you (only the owner can create the repo).\n\n'
                 'Repair: run it again on a repo made without it (`magehand doctor` says when one is). It\n'
                 'invites a missing bot, gives a read-only one write, renews a pending invitation and adds a\n'
@@ -9282,7 +9390,7 @@ def build_parser():
                 "check GitHub access, homelab reach, sign-in, the app repo's setup and the container runtime",
                 'In an app repo it also checks that OpenClaw\'s bot can write to it (a pending invitation is\n'
                 "a note), that it is private, that the ruleset 'main: owner approves' is active on the\n"
-                'default branch, and that merges wait for security / scan and image / result with no bypass.\n'
+                'default branch, and that merges wait for security / scan, image / result and checks / pre-commit with no bypass.\n'
                 'Each failure names its fix (`magehand new REPO` repairs the repo). What\n'
                 'needs admin to read (the ruleset, invitations) is a note when unreadable, not a failure;\n'
                 'an archived repo is not checked. Run it at the start of a session. Exit 1 on a failure.\n\n'

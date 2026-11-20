@@ -1,0 +1,17 @@
+id: subprocess-result-discarded
+language: python
+severity: error
+message: The result of subprocess.run is thrown away, so a failure goes unnoticed.
+note: >-
+  Keep the result and check returncode (or pass check=True). homelab#611: host-check's telegram() ignored curl's
+  failure and recorded an alert as delivered, so a network blip silenced it.
+rule:
+  pattern: subprocess.run($$$ARGS)
+  inside:
+    kind: expression_statement
+  not:
+    has:
+      kind: argument_list
+      has:
+        kind: keyword_argument
+        regex: '^check\s*=\s*True$'

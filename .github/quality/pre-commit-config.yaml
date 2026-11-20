@@ -1,0 +1,39 @@
+# The platform's static checks (homelab#611): one definition, run the same way in CI (the reusable
+# .github/workflows/checks.yaml) and on a laptop before every push (magehand). The files referenced below are
+# this directory, copied to .platform-quality/ in the repo being checked, so a repo can't loosen them.
+# Each hook is pinned to a full commit (the tag is in the comment); Renovate's pre-commit manager bumps them.
+# A repo adds checks of its own in its .pre-commit-config.yaml (both run).
+minimum_pre_commit_version: "4.0.0"
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 9026c9127e153371d7a78dfcb0c45ae2046a3d10  # frozen: v0.17.6
+    hooks:
+      - id: ruff-check
+        name: ruff (the platform's bug rules)
+        args: [--config, .platform-quality/ruff-checks.toml]
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: 745eface02aef23e168a8afb6b5737818efbea95  # frozen: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=warning]
+  - repo: local
+    hooks:
+      - id: eslint
+        name: ESLint (the platform's bug rules)
+        description: >-
+          ESLint's recommended rules, with typescript-eslint for .ts/.tsx (eslint-checks.config.mjs). ESLint and its
+          plugins are the hash-locked ones in package-lock.json: `npm ci --prefix .platform-quality --ignore-scripts`.
+        language: system
+        entry: >-
+          bash -c 'eslint=.platform-quality/node_modules/.bin/eslint;
+          [ -x "$eslint" ] || { echo "ESLint is not installed: npm ci --prefix .platform-quality --ignore-scripts"; exit 2; };
+          exec "$eslint" -c .platform-quality/eslint-checks.config.mjs -- "$@"' --
+        # By extension: pre-commit's identify gives .mts and .cts no tag, so types_or skipped them (#536's review).
+        files: '\.(js|mjs|cjs|jsx|ts|tsx|mts|cts)$'
+      - id: platform-rules
+        name: the platform's own rules (ast-grep)
+        description: Bug patterns found in this lab (ast-grep/rules/); scan.py also checks Python scripts without .py.
+        language: python
+        additional_dependencies: [ast-grep-cli==0.51.3]
+        entry: python .platform-quality/ast-grep/scan.py
+        types: [python]
