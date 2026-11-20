@@ -8324,7 +8324,8 @@ class Verify(unittest.TestCase):
             f'refs/heads/same {a} refs/heads/same {a}',   # nothing new
             'garbage'])
         r = f'{base}..{a}'
-        self.assertEqual(targets, [(a, base, a, True, r), (a, base, a, False, r), (a, None, None, False, None)])
+        # A new default branch on the remote (a mirror): every file, no record, and still the commits since main.
+        self.assertEqual(targets, [(a, base, a, True, r), (a, base, a, False, r), (a, None, None, False, r)])
         # --all still scans the branch's commits for secrets, from the merge base (magehand#114's review)...
         self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True, r)])
         # ...and with no shared history there is no range to scan, so no record either, push or --all.
@@ -8351,6 +8352,9 @@ class Verify(unittest.TestCase):
         self.assertIn('not recorded: no merge base', out)
         self.assertIn('git fetch origin', out)
         self.assertNotIn('--apps-dir', out)
+        with mock.patch.object(magehand, 'git_out', lambda args, root=None: 'true' if '--is-shallow-repository' in args
+                               else 'origin/main'):
+            self.assertIn('git fetch --unshallow origin', magehand.fetch_step(top))  # a shallow clone
 
     def test_verify_json_is_only_json(self):
         # magehand#110's review: pre-commit's own output went to stdout before the JSON object.

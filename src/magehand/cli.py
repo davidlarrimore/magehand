@@ -6054,8 +6054,12 @@ def verify_targets(top, pre_push_lines=None, everything=False):
         if local_sha == ZERO_SHA or local_ref.startswith('refs/tags/') or local_sha == remote_sha:
             continue
         if remote_ref == default_branch:  # the commits it adds (every file for a new default branch), no record
-            targets.append((local_sha, None, None, False, None) if remote_sha == ZERO_SHA else
-                           (local_sha, remote_sha, local_sha, False, f'{remote_sha}..{local_sha}'))
+            if remote_sha == ZERO_SHA:  # still the commits since origin's default branch, when there is one
+                base = git_out(['merge-base', local_sha, base_ref], top)
+                targets.append((local_sha, None, None, False,
+                                f'{base}..{local_sha}' if base and base != local_sha else None))
+            else:
+                targets.append((local_sha, remote_sha, local_sha, False, f'{remote_sha}..{local_sha}'))
             continue
         base = git_out(['merge-base', local_sha, base_ref], top)
         if base is None:  # no origin/<default> or no shared history: every file (magehand#110's review), no record
@@ -6063,6 +6067,16 @@ def verify_targets(top, pre_push_lines=None, everything=False):
         elif base != local_sha:
             targets.append((local_sha, base, local_sha, True, f'{base}..{local_sha}'))
     return targets
+
+
+def fetch_step(top):
+    """The step when a branch has no merge base with origin's default branch: a shallow clone needs its history;
+    otherwise fetch, and check the branch is the one you meant (unrelated history has no base to find)."""
+    base = default_base(top)
+    if git_out(['rev-parse', '--is-shallow-repository'], top) == 'true':
+        return f'`git fetch --unshallow origin` (a shallow clone has no merge base with {base}), then `magehand verify` again'
+    return (f'`git fetch origin`, then `magehand verify` again; if there is still no merge base, this branch has no '
+            f'history in common with {base}: check it is the branch you meant')
 
 
 def verified_path(top):
@@ -6211,8 +6225,7 @@ def cmd_verify(a):
             'commit your changes, then `magehand verify` again (it checks commits, not uncommitted edits)' if ok and dirty else
             f'`magehand verify` without {"--only" if a.only else "--apps-dir"} to record a pass'
             if ok and (a.only or APPS_DIR) else
-            f'`git fetch origin` so this branch shares history with {default_base(top)}, then `magehand verify` again'
-            if ok and no_base else
+            fetch_step(top) if ok and no_base else
             '`magehand verify` again' if ok else
             'fix what the checks found (each names its file and line), commit, then `magehand verify` again')
     if a.json:
