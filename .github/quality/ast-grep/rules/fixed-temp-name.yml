@@ -1,0 +1,14 @@
+id: fixed-temp-name
+language: python
+severity: error
+message: A temporary file with a fixed name (".new", ".tmp") collides when two runs write at once.
+note: >-
+  Two writers truncate each other's file and one rename fails. Use tempfile.mkstemp(dir=the target's directory)
+  and os.replace. homelab#611: the host check and setup-github-hooks.py corrupted github-hooks.json this way.
+rule:
+  any:
+    - pattern: $BASE + $SUFFIX
+    - pattern: $BASE.with_suffix($SUFFIX)
+constraints:
+  SUFFIX:
+    regex: '^[rbuRBU]?["'']\.(new|tmp|temp|part)["'']$'

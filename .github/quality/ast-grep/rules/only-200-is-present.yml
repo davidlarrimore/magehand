@@ -1,0 +1,11 @@
+id: only-200-is-present
+language: python
+severity: error
+message: Every status but 200 becomes "nothing there", so an outage reads as a missing object.
+note: >-
+  Tell 404 (missing) from other errors and report or retry the rest (review notes: "Missing is not removed").
+  homelab#611: the bucket broker read an OpenBao 503 as a missing key, then revoked and re-minted a working one.
+rule:
+  any:
+    - pattern: $VALUE if $STATUS == 200 else None
+    - pattern: None if $STATUS != 200 else $VALUE

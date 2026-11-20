@@ -1,0 +1,15 @@
+id: error-decided-by-text
+language: python
+severity: error
+message: An error is classified by searching its text for a status code.
+note: >-
+  The text also holds the request (a repo named app-404 matches '404'). Carry the status separately and compare
+  it. homelab#611: github_hooks.has_bot could read a 503 as "the bot was removed" and delete a working webhook.
+rule:
+  any:
+    - pattern: $CODE in str($ERR)
+    - pattern: $CODE in repr($ERR)
+    - pattern: $CODE in $ERR.args
+constraints:
+  CODE:
+    regex: '^[rbuRBU]?["'']\d{3}["'']$'

@@ -1,0 +1,9 @@
+id: error-decided-by-text
+valid:
+  - 'if error.status == 404: pass'
+  - 'if ''HTTP 404'' in str(error): pass'
+  - 'if ''not found'' in str(error): pass'
+invalid:
+  - 'if ''404'' in str(error): pass'
+  - 'if "503" in repr(error): pass'
+  - 'if ''404'' in error.args: pass'

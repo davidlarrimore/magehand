@@ -263,7 +263,7 @@ class LocalBucket(unittest.TestCase):
         return state
 
     def runs(self):
-        return [(a, e) for a, e in zip(self.engine_calls, self.engine_env) if a[0] == 'run']
+        return [(a, e) for a, e in zip(self.engine_calls, self.engine_env) if a[0] == 'run']  # noqa: B905  # zip(strict=) needs Python 3.10; magehand supports 3.9
 
     def test_it_starts_the_pinned_garage_on_loopback_with_its_data_in_a_volume(self):
         self.up()
@@ -320,7 +320,7 @@ class LocalBucket(unittest.TestCase):
                 mock.patch.object(magehand, 'save_local_state', lambda *_a: None), \
                 mock.patch.object(magehand, 'block_image', lambda *_a: 'img'), contextlib.redirect_stdout(io.StringIO()):
             magehand.cmd_dev(mock.Mock(action='up', app_flag=None, app=None))
-        for argv, env in zip(calls, envs):
+        for argv, env in zip(calls, envs):  # noqa: B905  # zip(strict=) needs Python 3.10; magehand supports 3.9
             if argv[0] == 'run':
                 self.assertTrue(env, 'a run with a password passes it through the environment')
                 for value in env.values():
@@ -613,7 +613,7 @@ class BucketCommands(unittest.TestCase):
         self.assertIn('files', self.run_cmd('--env', 'local', 'usage'))
 
     def test_the_signer_reproduces_awss_published_s3_example(self):
-        import datetime, hashlib
+        import hashlib
         h = magehand.s3_sign('GET', 'examplebucket.s3.amazonaws.com', '/test.txt', '', hashlib.sha256(b'').hexdigest(),
                              'AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'us-east-1',
                              {'range': 'bytes=0-9'}, when=datetime.datetime(2013, 5, 24, tzinfo=datetime.timezone.utc))
@@ -3826,7 +3826,7 @@ class PrReady(unittest.TestCase):
         code, out, writes = self.run_pr()
         self.assertEqual(code, 0)
         self.assertEqual([w[:2] for w in writes], [('api', '-X'), ('pr', 'ready')])
-        self.assertEqual(writes[0][3:], (f'repos/davidlarrimore/demo/pulls/12/requested_reviewers',
+        self.assertEqual(writes[0][3:], ('repos/davidlarrimore/demo/pulls/12/requested_reviewers',
                                          '-f', f'reviewers[]={magehand.BOT}'))
         self.assertIn(f'requested {magehand.BOT} (confirmed)', out)
         self.assertIn('`magehand pr watch 12`', out.splitlines()[-1])
@@ -4136,7 +4136,7 @@ class Scaffold(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             magehand.scaffold(tmp, 'demo', 'demo')
             # the Dockerfile's test stage runs exactly this, in /app
-            run = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'],
+            run = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests'],  # noqa: PLW1510
                                  cwd=tmp, capture_output=True, text=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
 
@@ -4247,7 +4247,8 @@ class Scaffold(unittest.TestCase):
                                   ('https://example.com/github.com/davidlarrimore/elvis.git', None),
                                   ('/srv/git/github.com/davidlarrimore/elvis.git', None)):
                 subprocess.run(['git', 'init', '-q', tmp], check=True)
-                subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)
+                # ast-grep-ignore: subprocess-result-discarded  # a fresh repo may have no origin to remove
+                subprocess.run(['git', '-C', tmp, 'remote', 'remove', 'origin'], capture_output=True)  # noqa: PLW1510
                 subprocess.run(['git', '-C', tmp, 'remote', 'add', 'origin', url], check=True)
                 self.assertEqual(magehand.origin_repo(tmp), expected, url)
 
@@ -4335,7 +4336,7 @@ class Approvals(unittest.TestCase):
     def hook(self, command, tool='Bash'):
         """The installed hook's decision for `command`: (decision, reason) or None, run as Claude Code runs it."""
         event = json.dumps({'tool_name': tool, 'tool_input': {'command': command}})
-        run = subprocess.run([sys.executable, '-I', str(self.plugin / 'hooks/approve.py')], input=event,
+        run = subprocess.run([sys.executable, '-I', str(self.plugin / 'hooks/approve.py')], input=event,  # noqa: PLW1510
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr)
         if not run.stdout.strip():
@@ -4401,7 +4402,7 @@ class Approvals(unittest.TestCase):
         (repo / 'src').mkdir(exist_ok=True)
         (repo / 'AGENTS.md').write_text(agents)
         script = magehand.SESSION_HOOK.format(generated='x', magehand=json.dumps([sys.executable, str(fake)]))
-        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,
+        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,  # noqa: PLW1510
                              input=json.dumps({'hook_event_name': 'SessionStart', 'cwd': str(repo / 'src')}))
         self.assertEqual(run.returncode, 0, run.stderr)
         return run.stdout
@@ -5924,7 +5925,7 @@ class AppApi(unittest.TestCase):
         for exposure, host in (('external', 'demo.davidlarrimore.com'), ('internal', 'demo.lab.davidlarrimore.com')):
             self.calls, self.replies = [], [(200, {}, b'')]
             text = f'demo:\n  exposure: {exposure}\n'
-            with mock.patch.object(magehand, 'file_at', lambda repo, path, ref: (text, None)):
+            with mock.patch.object(magehand, 'file_at', lambda repo, path, ref: (text, None)):  # noqa: B023
                 code, _, err = self.run_main('api', '-a', 'demo', '/x', '--prod', '-X', 'delete')
             self.assertEqual((code, self.calls[0][0], self.calls[0][1]), (0, f'https://{host}/x', 'DELETE'))
             self.assertIn('production', err)
@@ -6391,7 +6392,7 @@ class Status(unittest.TestCase):
             with mock.patch.object(magehand, 'status_target', lambda name=None: ('demo', 'o/demo')), \
                     mock.patch.object(magehand, 'lifecycle_stages',
                                       lambda repo, name: calls.append(1) or answers[min(len(calls), len(answers)) - 1]), \
-                    mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):
+                    mock.patch.object(magehand, 'collect_status', lambda *a, **k: json.loads(json.dumps(ok))):  # noqa: B023
                 code, out, _ = CommandLine.run_main(self, 'status', *watch, '--json')
             report = json.loads(out)
             self.assertEqual(report['ok'], done, answers)
@@ -6553,14 +6554,14 @@ class Status(unittest.TestCase):
 
             def kubectl(*a):
                 if a[0] == 'pods':
-                    return {'items': [self.pod()] if woken['n'] else []}, None
+                    return {'items': [self.pod()] if woken['n'] else []}, None  # noqa: B023
                 if a[0] == 'deployments':
                     return {'items': [{'metadata': {'name': 'demo', 'labels': {magehand.SLEEP_LABEL: 'true'}},
                                        'spec': {'replicas': 0}}]}, None
-                return (apps.pop(0) if apps else later), None
+                return (apps.pop(0) if apps else later), None  # noqa: B023
 
             def wake(name):
-                woken['n'] += 1
+                woken['n'] += 1  # noqa: B023
                 return True
             with mock.patch.object(magehand, 'gh_query', self.recorded('x', statuses=False)), \
                     mock.patch.object(magehand, 'kubectl_json', kubectl), mock.patch.object(magehand, 'wake_dev', wake), \
@@ -7499,7 +7500,7 @@ class Jobs(unittest.TestCase):
             calls = []
 
             def gh(*args, as_of=as_of):
-                calls.append(args)
+                calls.append(args)  # noqa: B023
                 return 0, json.dumps(self.published(as_of)), ''
             with mock.patch.object(magehand, 'kubectl_json', lambda *a: (None, 'kubectl has no context')), \
                     mock.patch.object(magehand, 'origin_repo', lambda root: 'davidlarrimore/demo'), \
@@ -8291,7 +8292,7 @@ class Verify(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         hook = pathlib.Path(tmp.name) / 'pre-push'
         hook.write_text(magehand.HOOK_SCRIPT)
-        out = subprocess.run(['/bin/sh', str(hook), 'origin', 'url'], capture_output=True, text=True,
+        out = subprocess.run(['/bin/sh', str(hook), 'origin', 'url'], capture_output=True, text=True,  # noqa: PLW1510
                              env={'PATH': '/usr/bin:/bin'}, input='')
         self.assertEqual(out.returncode, 0)
         self.assertIn('not checked', out.stderr)

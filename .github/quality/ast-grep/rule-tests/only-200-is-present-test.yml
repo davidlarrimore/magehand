@@ -1,0 +1,7 @@
+id: only-200-is-present
+valid:
+  - 'stored = body if status == 200 else missing(status)'
+  - 'stored = None if status == 404 else body'
+invalid:
+  - 'stored = (stored or {}).get(''data'') if status == 200 else None'
+  - 'stored = None if status != 200 else body'
