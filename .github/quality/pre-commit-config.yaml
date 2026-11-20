@@ -33,10 +33,10 @@ repos:
       - id: gitleaks
         name: secrets (gitleaks)
         description: >-
-          gitleaks' rules over the commits being checked (a PR, a push), or the tracked files without a range
-          (gitleaks.sh); gitleaks.toml allows the generic rule in test fixtures only. Built from its pinned module.
-        language: golang
-        additional_dependencies: [github.com/zricethezav/gitleaks/v8@v8.30.1]
+          gitleaks' rules over the commits being checked (a PR, a push; PLATFORM_CHECKS_RANGE when every file runs),
+          and the tracked files on an all-files run (gitleaks.sh); gitleaks.toml allows the generic rule in test
+          fixtures only. gitleaks is its sha256-pinned release binary from GitHub.
+        language: system
         entry: bash .platform-quality/gitleaks.sh
         pass_filenames: false
         always_run: true

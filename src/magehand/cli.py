@@ -6099,9 +6099,10 @@ def clean_checkout(top):
 def child_env():
     """The environment for the checks: without git's variables (the worktree's checks see their own repo) and
     without the ones that change what pre-commit runs (SKIP leaves hooks out; magehand#110's review). PRE_COMMIT_HOME
-    (where its tools are cached) stays."""
+    (where its tools are cached) stays. PLATFORM_CHECKS_RANGE is magehand's to set (run_pre_commit)."""
     return {k: v for k, v in os.environ.items()
-            if k not in GIT_ENV and k != 'SKIP' and not (k.startswith('PRE_COMMIT_') and k != 'PRE_COMMIT_HOME')}
+            if k not in GIT_ENV and k not in ('SKIP', 'PLATFORM_CHECKS_RANGE')
+            and not (k.startswith('PRE_COMMIT_') and k != 'PRE_COMMIT_HOME')}
 
 
 def run_to(cmd, out, **kwargs):
@@ -6135,8 +6136,13 @@ def commit_checkout(top, sha):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_pre_commit(pc, work, rng, only, out):
-    """pre-commit with the platform's config, then the repo's own (CI runs both), in `work`; True if all passed."""
+def run_pre_commit(pc, work, rng, only, out, commits=None):
+    """pre-commit with the platform's config, then the repo's own (CI runs both), in `work`; True if all passed.
+    `commits` (FROM..TO) is the range the secrets hook scans even when every file runs, as CI's
+    PLATFORM_CHECKS_RANGE (magehand#114's review)."""
+    env = child_env()
+    if commits:
+        env['PLATFORM_CHECKS_RANGE'] = commits
     configs = [PRE_COMMIT_CONFIG] + (['.pre-commit-config.yaml'] if (work / '.pre-commit-config.yaml').is_file() else [])
     ok = True
     for config in configs:
@@ -6144,7 +6150,7 @@ def run_pre_commit(pc, work, rng, only, out):
             continue
         cmd = [str(pc), 'run', '--config', config, *([only] if only else []), *rng, '--color',
                'always' if out.isatty() else 'never']
-        ok = run_to(cmd, out, cwd=work, env=child_env()) == 0 and ok
+        ok = run_to(cmd, out, cwd=work, env=env) == 0 and ok
     return ok
 
 
@@ -6176,7 +6182,7 @@ def cmd_verify(a):
             everything = frm is None or (own is not None and git_out(
                 ['diff', '--name-only', f'{frm}...{to}', '--', QUALITY_DIR, '.github/workflows'], work) != '')
             rng = ['--all-files'] if everything else ['--from-ref', frm, '--to-ref', to]
-            ok = run_pre_commit(pc, work, rng, a.only, out)
+            ok = run_pre_commit(pc, work, rng, a.only, out, commits=f'{frm}..{to}' if frm else None)
             if ok and not a.only and is_app_checkout(work):
                 # An app repo: the platform's rules too, strict as CI runs them (a rule whose tool is missing here
                 # fails instead of being skipped, so a record means they all ran; magehand#110's review).

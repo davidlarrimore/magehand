@@ -8058,7 +8058,7 @@ class PostDeployChecks(unittest.TestCase):
 # runs in. That's how real pre-commit behaves: it reads the files of its checkout, so a check of the wrong
 # directory's files gives the wrong answer (magehand#110's review).
 FAKE_PRE_COMMIT = '''#!/bin/sh
-echo "fake pre-commit: checking"
+echo "fake pre-commit: checking (commits: ${PLATFORM_CHECKS_RANGE:-none})"
 from=""; to=""; all=""
 while [ $# -gt 0 ]; do
   case "$1" in --from-ref) from="$2"; shift;; --to-ref) to="$2"; shift;; --all-files) all=1;; esac; shift
@@ -8195,6 +8195,11 @@ class Verify(unittest.TestCase):
             code, out, _ = self.main('verify')
             self.assertEqual(code, 1)
             self.assertIn('(every file', out)  # the scope it really checked (magehand#112's review)
+            # Every file, and still the commits, for the secrets hook (magehand#114's review).
+            base = self.git(top, 'merge-base', 'origin/main', 'HEAD')
+            self.assertIn(f"(commits: {base}..{self.git(top, 'rev-parse', 'HEAD')})", out)
+        with mock.patch.dict(os.environ, {'PLATFORM_CHECKS_RANGE': 'x..y'}):
+            self.assertNotIn('PLATFORM_CHECKS_RANGE', magehand.child_env())  # magehand's to set, never inherited
         # A repo that calls the platform's checks.yaml uses its pin, own copy or not; --apps-dir names the config.
         self.assertIsNone(magehand.own_quality(top, 'main'))
         with mock.patch.object(magehand, 'APPS_DIR', '/elsewhere'):
