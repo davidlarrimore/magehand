@@ -1,5 +1,6 @@
 # The platform's own rules (ast-grep, MIT; homelab#611): bug patterns found in this lab, each with the issue it
-# came from. scan.py runs them on the files pre-commit passes; `ast-grep test -c` runs rule-tests/.
+# came from. scan.py runs them on the files pre-commit passes; `ast-grep test -c sgconfig.yml
+# --skip-snapshot-tests` runs rule-tests/ (the cases carry no snapshots).
 # A finding that is right where it is: `# ast-grep-ignore: <rule-id>` on the line above, with the reason.
 ruleDirs: [rules]
 testConfigs:

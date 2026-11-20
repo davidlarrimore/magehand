@@ -5800,6 +5800,16 @@ def checks_ref(top):
     return None
 
 
+def own_quality(work, ref):
+    """The commit's own .github/quality, for a repo whose CI checks with its own copy and calls no checks.yaml
+    (homelab-apps itself; magehand, which is public and can't call the platform's private workflow), or None.
+    --apps-dir still wins: it names the config to use."""
+    own = work / QUALITY_DIR
+    if APPS_DIR or ref is not None or not (own / 'pre-commit-config.yaml').is_file():
+        return None
+    return own
+
+
 def quality_pin(ref='main'):
     """The homelab-apps commit whose .github/quality checks.yaml at `ref` uses: its tools pin."""
     text = github_file(APPS_REPO, CHECKS_WORKFLOW, ref=ref)
@@ -6068,12 +6078,17 @@ def cmd_verify(a):
             # Everything about the checks comes from the commit itself: the checks.yaml ref its workflows call, and
             # whether it has JS/TS for ESLint (magehand#110's review), not from the checkout you are in.
             ref = checks_ref(work)
+            own = own_quality(work, ref)
             with setup_lock():
-                quality = quality_tree(quality_pin(ref or 'main'))
+                quality = own or quality_tree(quality_pin(ref or 'main'))
                 ensure_eslint(quality, work)
                 pc = pre_commit_bin(quality)
             (work / PLATFORM_LINK).symlink_to(quality, target_is_directory=True)
-            rng = ['--all-files'] if frm is None else ['--from-ref', frm, '--to-ref', to]
+            # A repo with its own copy checks every file when the copy or its workflows change, as its CI does (a new
+            # rule must hold for code the change didn't touch; magehand#112's review).
+            everything = frm is None or (own is not None and git_out(
+                ['diff', '--name-only', f'{frm}...{to}', '--', QUALITY_DIR, '.github/workflows'], work) != '')
+            rng = ['--all-files'] if everything else ['--from-ref', frm, '--to-ref', to]
             ok = run_pre_commit(pc, work, rng, a.only, out)
             if ok and not a.only and is_app_checkout(work):
                 # An app repo: the platform's rules too, strict as CI runs them (a rule whose tool is missing here
@@ -6973,9 +6988,12 @@ def cmd_upgrade(_a):
     # says (with the `next:` line) whether `magehand setup` needs you. A version without --refresh: its skill.
     code = subprocess.run([str(exe), 'setup', '--refresh']).returncode  # nosec B603  # noqa: PLW1510
     if code == 2:
-        if skill_installed():
-            # ast-grep-ignore: subprocess-result-discarded  # baseline (magehand#109)
-            subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL)  # nosec B603  # noqa: PLW1510
+        if skill_installed() and subprocess.run([str(exe), 'skill', '--install'], stdout=subprocess.DEVNULL,  # nosec B603
+                                                check=False).returncode != 0:
+            # The skill keeps the old version's text (magehand#112's review).
+            print('could not refresh the skill (see above)')
+            print(next_line('`magehand skill --install`'))
+            return
         print(next_line(None))
     elif code != 0:  # its own `next:` may not have been printed
         print("the new version's quiet setup failed (see above)")

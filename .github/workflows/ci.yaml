@@ -51,15 +51,21 @@ jobs:
       - env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           rm -rf .platform-quality
           cp -R .github/quality .platform-quality
           python -m venv /tmp/pre-commit
           /tmp/pre-commit/bin/pip install --quiet --require-hashes --no-deps -r .platform-quality/pre-commit-requirements.txt
-          if [ "$EVENT" = pull_request ]; then
-            range=(--from-ref "$BASE" --to-ref "$HEAD")
+          # The files the PR changes, read from the merge commit checked out here (the PR's head alone can name a path
+          # the merge moved; #112's review). A change to the rules or this workflow checks every file (a new rule must
+          # hold for code it didn't touch), as `magehand verify` does.
+          # Each platform rule still catches what its tests say (the same ast-grep the hook installs).
+          version=$(grep -oE 'ast-grep-cli==[0-9.]+' .platform-quality/pre-commit-config.yaml)
+          /tmp/pre-commit/bin/pip install --quiet "$version"
+          /tmp/pre-commit/bin/ast-grep test -c .platform-quality/ast-grep/sgconfig.yml --skip-snapshot-tests
+          if [ "$EVENT" = pull_request ] && git diff --quiet "$BASE" HEAD -- .github/quality .github/workflows; then
+            range=(--from-ref "$BASE" --to-ref "$(git rev-parse HEAD)")
           else
             range=(--all-files)
           fi

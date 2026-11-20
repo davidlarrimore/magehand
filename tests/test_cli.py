@@ -4569,12 +4569,13 @@ class Approvals(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(calls, [['version'], ['setup', '--refresh']])
 
-    def upgrade_with_refresh(self, refresh_code):
+    def upgrade_with_refresh(self, refresh_code, skill_code=0):
         calls = []
 
         def run(cmd, **kw):
             calls.append(cmd[1:])
-            return mock.Mock(returncode=refresh_code if cmd[1:] == ['setup', '--refresh'] else 0,
+            code = {('setup', '--refresh'): refresh_code, ('skill', '--install'): skill_code}.get(tuple(cmd[1:]), 0)
+            return mock.Mock(returncode=code,
                              stdout='0.38.0\n', stderr='')
         with tempfile.TemporaryDirectory() as tmp:
             (pathlib.Path(tmp) / 'magehand').write_text('')
@@ -4592,6 +4593,9 @@ class Approvals(unittest.TestCase):
         self.assertEqual((code, calls[-1], out.splitlines()[-1]), (0, ['skill', '--install'], 'next: nothing'))
         code, out, calls = self.upgrade_with_refresh(1)  # a refresh that failed: setup is the step
         self.assertEqual((code, out.splitlines()[-1]), (0, 'next: `magehand setup`'))
+        code, out, calls = self.upgrade_with_refresh(2, skill_code=1)  # magehand#112's review: not "nothing"
+        self.assertEqual(out.splitlines()[-2:], ['could not refresh the skill (see above)',
+                                                 'next: `magehand skill --install`'])
 
     def test_doctor_notes_missing_approvals(self):
         with mock.patch.object(magehand, 'github_token', lambda: 't'), \
@@ -8081,6 +8085,31 @@ class Verify(unittest.TestCase):
                 self.assertRaises(SystemExit) as exit_:
             magehand.quality_tree('e' * 40)
         self.assertIn('predate homelab#611', str(exit_.exception.code))
+
+    def test_a_repo_with_its_own_copy_is_checked_with_it(self):
+        # magehand#112's review: magehand (public: it can't call the platform's private workflow) and homelab-apps
+        # check with their own .github/quality in CI, so a local pass must use that copy, not homelab-apps' main.
+        top = self.repo(files={'a.py': 'x = 1\n', 'old.py': 'BAD\n',
+                               '.github/quality/pre-commit-config.yaml': 'repos: []\n'})
+        refs = self.setup_verify(top)
+        used = []
+        pc = top.parent / 'pre-commit'
+        with mock.patch.object(magehand, 'pre_commit_bin', lambda q: used.append(q) or pc):
+            self.commit(top, 'a.py', 'x = 2\n', branch='feature')
+            code, _, _ = self.main('verify')
+            self.assertEqual(code, 0)  # old.py is outside the change
+            self.assertEqual(refs, [])  # no pin looked up
+            self.assertEqual(used[-1].relative_to(used[-1].parents[1]).as_posix(), magehand.QUALITY_DIR)
+            self.assertNotEqual(used[-1], top / magehand.QUALITY_DIR)  # the commit's copy, in its worktree
+            # A change to the copy checks every file, as CI does: old.py's finding now counts.
+            self.commit(top, '.github/quality/pre-commit-config.yaml', 'repos: []  # new rule\n')
+            code, _, _ = self.main('verify')
+            self.assertEqual(code, 1)
+        # A repo that calls the platform's checks.yaml uses its pin, own copy or not; --apps-dir names the config.
+        self.assertIsNone(magehand.own_quality(top, 'main'))
+        with mock.patch.object(magehand, 'APPS_DIR', '/elsewhere'):
+            self.assertIsNone(magehand.own_quality(top, None))
+        self.assertEqual(magehand.own_quality(top, None), top / magehand.QUALITY_DIR)
 
     def test_the_commit_is_checked_not_the_working_tree(self):
         # magehand#110's review: pre-commit reads the checkout's files, so a bad commit on another branch passed
