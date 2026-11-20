@@ -1,0 +1,18 @@
+# The platform's secrets check (gitleaks, MIT; homelab#611): gitleaks' own rules, plus where its generic,
+# entropy-based rule is expected to match. Run by gitleaks.sh, from pre-commit-config.yaml.
+[extend]
+useDefault = true
+
+# Test fixtures: hashes, golden outputs and fake tokens match the generic rule. Only that rule is allowed there:
+# the provider rules (AWS, GitHub, Slack, ...) still apply, so a real key pasted into a test is still caught.
+# A false positive elsewhere: `gitleaks:allow` on its line, or its fingerprint in the repo's .gitleaksignore.
+[[allowlists]]
+description = "test fixtures"
+targetRules = ["generic-api-key"]
+paths = [
+  '''(^|/)tests?/''',
+  '''(^|/)__tests__/''',
+  '''(^|/)fixtures?/''',
+  '''\.golden\.json$''',
+  '''\.(test|spec)\.[cm]?[jt]sx?$''',
+]

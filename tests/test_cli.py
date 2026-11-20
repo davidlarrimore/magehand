@@ -8058,7 +8058,7 @@ class PostDeployChecks(unittest.TestCase):
 # runs in. That's how real pre-commit behaves: it reads the files of its checkout, so a check of the wrong
 # directory's files gives the wrong answer (magehand#110's review).
 FAKE_PRE_COMMIT = '''#!/bin/sh
-echo "fake pre-commit: checking"
+echo "fake pre-commit: checking (commits: ${PLATFORM_CHECKS_RANGE:-none})"
 from=""; to=""; all=""
 while [ $# -gt 0 ]; do
   case "$1" in --from-ref) from="$2"; shift;; --to-ref) to="$2"; shift;; --all-files) all=1;; esac; shift
@@ -8195,6 +8195,11 @@ class Verify(unittest.TestCase):
             code, out, _ = self.main('verify')
             self.assertEqual(code, 1)
             self.assertIn('(every file', out)  # the scope it really checked (magehand#112's review)
+            # Every file, and still the commits, for the secrets hook (magehand#114's review).
+            base = self.git(top, 'merge-base', 'origin/main', 'HEAD')
+            self.assertIn(f"(commits: {base}..{self.git(top, 'rev-parse', 'HEAD')})", out)
+        with mock.patch.dict(os.environ, {'PLATFORM_CHECKS_RANGE': 'x..y'}):
+            self.assertNotIn('PLATFORM_CHECKS_RANGE', magehand.child_env())  # magehand's to set, never inherited
         # A repo that calls the platform's checks.yaml uses its pin, own copy or not; --apps-dir names the config.
         self.assertIsNone(magehand.own_quality(top, 'main'))
         with mock.patch.object(magehand, 'APPS_DIR', '/elsewhere'):
@@ -8318,8 +8323,58 @@ class Verify(unittest.TestCase):
             f'refs/heads/main {a} refs/heads/main {z}',     # a new default branch: every file, no record
             f'refs/heads/same {a} refs/heads/same {a}',   # nothing new
             'garbage'])
-        self.assertEqual(targets, [(a, base, a, True), (a, base, a, False), (a, None, None, False)])
-        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True)])
+        r = f'{base}..{a}'
+        # A new default branch on the remote (a mirror): every file, no record, and still the commits since main.
+        self.assertEqual(targets, [(a, base, a, True, r), (a, base, a, False, r), (a, None, None, False, r)])
+        # --all still scans the branch's commits for secrets, from the merge base (magehand#114's review)...
+        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, True, r)])
+        # ...and with no shared history there is no range to scan, so no record either, push or --all.
+        self.git(top, 'update-ref', '-d', 'refs/remotes/origin/main')
+        self.assertEqual(magehand.verify_targets(top, everything=True), [(a, None, None, False, None)])
+        self.assertEqual(magehand.verify_targets(top, [f'refs/heads/x {a} refs/heads/x {base}']),
+                         [(a, None, None, False, None)])
+
+    def test_verify_all_passes_the_commit_range_and_only_takes_gitleaks(self):
+        top = self.repo()
+        a = self.commit(top, 'b.py', 'fine\n', branch='feature')
+        base = self.git(top, 'merge-base', 'origin/main', 'HEAD')
+        self.setup_verify(top)
+        code, out, _ = self.main('verify', '--all')
+        self.assertEqual(code, 0)
+        self.assertIn(f'(commits: {base}..{a})', out)
+        self.assertIn('; recorded', out)
+        code, out, _ = self.main('verify', '--only', 'gitleaks')  # magehand#114's review: a valid choice
+        self.assertEqual(code, 0)
+        # No merge base: a pass, not recorded, and the reason and the fix are about the base, not --apps-dir.
+        self.git(top, 'update-ref', '-d', 'refs/remotes/origin/main')
+        code, out, _ = self.main('verify', '--all')
+        self.assertEqual(code, 0)
+        self.assertIn('not recorded: no merge base', out)
+        self.assertIn('git fetch origin', out)
+        self.assertNotIn('--apps-dir', out)
+        # Here origin/main is gone: fetch it explicitly as a remote-tracking ref.
+        self.assertIn('`git fetch origin refs/heads/main:refs/remotes/origin/main`', magehand.fetch_step(top))
+        # A single-branch shallow clone: unshallow and fetch the ref (#114's review), checked by doing it for real.
+        with tempfile.TemporaryDirectory() as tmp:
+            clone = pathlib.Path(tmp) / 'clone'
+            self.git(top, 'checkout', '-q', 'main')
+            self.commit(top, 'm.py', 'm\n')
+            self.git(top, 'checkout', '-q', 'feature')
+            self.commit(top, 'f.py', 'f\n')
+            subprocess.run(['git', 'clone', '-q', '--depth=1', '-b', 'feature', f'file://{top}', str(clone)],
+                           check=True, capture_output=True)
+            self.assertIsNone(magehand.git_out(['merge-base', 'HEAD', 'origin/main'], clone))
+            step = magehand.fetch_step(clone)
+            self.assertIn('git fetch --unshallow origin refs/heads/main:refs/remotes/origin/main', step)
+            subprocess.run(['git', '-C', str(clone), 'fetch', '-q', '--unshallow', 'origin',
+                            'refs/heads/main:refs/remotes/origin/main'], check=True, capture_output=True)
+            self.assertIsNotNone(magehand.git_out(['merge-base', 'HEAD', 'origin/main'], clone))  # the step works
+        # A default branch whose name holds shell syntax stays one quoted argument.
+        with mock.patch.object(magehand, 'default_base', lambda top: 'origin/a;touch x'), \
+                mock.patch.object(magehand, 'git_out', lambda args, root=None: None):
+            step = magehand.fetch_step(top)
+        command = step.split('`')[1]
+        self.assertEqual(shlex.split(command), ['git', 'fetch', 'origin', 'refs/heads/a;touch x:refs/remotes/origin/a;touch x'])
 
     def test_verify_json_is_only_json(self):
         # magehand#110's review: pre-commit's own output went to stdout before the JSON object.

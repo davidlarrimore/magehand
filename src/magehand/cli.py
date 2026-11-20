@@ -5845,7 +5845,7 @@ TOOLS_PIN = re.compile(r'\b' + re.escape(APPS_REPO) + r'/\.github/actions/tools@
 PLATFORM_LINK = '.platform-quality'
 PRE_COMMIT_CONFIG = f'{PLATFORM_LINK}/pre-commit-config.yaml'
 JS_TS = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts')
-HOOKS = ('ruff-check', 'eslint', 'shellcheck', 'platform-rules')
+HOOKS = ('ruff-check', 'eslint', 'shellcheck', 'gitleaks', 'platform-rules')
 ZERO_SHA = '0' * 40
 VERIFIED_KEEP = 20  # commits kept in .git/magehand/verified
 # Git's own variables point a child git at this checkout; the worktree's checks must see their own.
@@ -6029,19 +6029,21 @@ def default_base(top):
 
 
 def verify_targets(top, pre_push_lines=None, everything=False):
-    """[(commit, from, to, ci_range)] to check. A commit is checked over the range CI checks (its merge base on
-    origin's default branch to it; with `everything`, every file: from and to None), which is what a record may
-    stand for. For a pre-push hook's stdin lines (`local_ref local_sha remote_ref remote_sha`): a deleted ref and a
-    tag have nothing to check; a push to the default branch itself checks the commits it adds (not a CI range)."""
+    """[(commit, from, to, ci_range, commits)] to check. A commit is checked over the range CI checks (its merge base
+    on origin's default branch to it; with `everything`, every file: from and to None), which is what a record may
+    stand for. `commits` (BASE..COMMIT) is what the secrets hook scans, resolved once here with the record's
+    eligibility: no merge base, no commit scan, so no record (magehand#114's review). For a pre-push hook's stdin
+    lines (`local_ref local_sha remote_ref remote_sha`): a deleted ref and a tag have nothing to check; a push to the
+    default branch itself checks the commits it adds (not a CI range)."""
     base_ref = default_base(top)
     if pre_push_lines is None:
         head = git_out(['rev-parse', 'HEAD'], top)
+        base = git_out(['merge-base', head, base_ref], top) if head else None
         if everything:
-            return [(head, None, None, True)]
-        base = git_out(['merge-base', 'HEAD', base_ref], top)
+            return [(head, None, None, base is not None, f'{base}..{head}' if base and base != head else None)]
         if not head or not base:
             die(f'cannot find where this branch starts on {base_ref}: `git fetch`, or `magehand verify --all`')
-        return [(head, base, head, True)]
+        return [(head, base, head, True, f'{base}..{head}')]
     default_branch = 'refs/heads/' + base_ref.split('/', 1)[-1]
     targets = []
     for line in pre_push_lines:
@@ -6052,15 +6054,38 @@ def verify_targets(top, pre_push_lines=None, everything=False):
         if local_sha == ZERO_SHA or local_ref.startswith('refs/tags/') or local_sha == remote_sha:
             continue
         if remote_ref == default_branch:  # the commits it adds (every file for a new default branch), no record
-            targets.append((local_sha, None, None, False) if remote_sha == ZERO_SHA else
-                           (local_sha, remote_sha, local_sha, False))
+            if remote_sha == ZERO_SHA:  # still the commits since origin's default branch, when there is one
+                base = git_out(['merge-base', local_sha, base_ref], top)
+                targets.append((local_sha, None, None, False,
+                                f'{base}..{local_sha}' if base and base != local_sha else None))
+            else:
+                targets.append((local_sha, remote_sha, local_sha, False, f'{remote_sha}..{local_sha}'))
             continue
         base = git_out(['merge-base', local_sha, base_ref], top)
-        if base is None:  # no origin/<default> here, or no shared history: check every file (magehand#110's review)
-            targets.append((local_sha, None, None, True))
+        if base is None:  # no origin/<default> or no shared history: every file (magehand#110's review), no record
+            targets.append((local_sha, None, None, False, None))
         elif base != local_sha:
-            targets.append((local_sha, base, local_sha, True))
+            targets.append((local_sha, base, local_sha, True, f'{base}..{local_sha}'))
     return targets
+
+
+def fetch_step(top):
+    """The step when a branch has no merge base with origin's default branch: a shallow clone needs its history;
+    otherwise fetch, and check the branch is the one you meant (unrelated history has no base to find)."""
+    base = default_base(top)
+    remote, _, branch = base.partition('/')
+    shallow = git_out(['rev-parse', '--is-shallow-repository'], top) == 'true'
+    if git_out(['rev-parse', '--verify', '--quiet', f'refs/remotes/{base}'], top) is None:
+        # A single-branch clone (`git clone -b feature`, shallow or not) never fetches it (#114's review).
+        # Quoted as arguments: a branch name may hold shell syntax (#114's review).
+        fetch = ['git', 'fetch', *(['--unshallow'] if shallow else []), remote,
+                 f'refs/heads/{branch}:refs/remotes/{base}']
+        return f'`{shlex.join(fetch)}` (this clone has no {base} to compare with), then `magehand verify` again'
+    if shallow:
+        return (f"`{shlex.join(['git', 'fetch', '--unshallow', remote])}` (a shallow clone has no merge base with "
+                f'{base}), then `magehand verify` again')
+    return (f"`{shlex.join(['git', 'fetch', remote])}`, then `magehand verify` again; if there is still no merge base, "
+            f'this branch has no history in common with {base}: check it is the branch you meant')
 
 
 def verified_path(top):
@@ -6099,9 +6124,10 @@ def clean_checkout(top):
 def child_env():
     """The environment for the checks: without git's variables (the worktree's checks see their own repo) and
     without the ones that change what pre-commit runs (SKIP leaves hooks out; magehand#110's review). PRE_COMMIT_HOME
-    (where its tools are cached) stays."""
+    (where its tools are cached) stays. PLATFORM_CHECKS_RANGE is magehand's to set (run_pre_commit)."""
     return {k: v for k, v in os.environ.items()
-            if k not in GIT_ENV and k != 'SKIP' and not (k.startswith('PRE_COMMIT_') and k != 'PRE_COMMIT_HOME')}
+            if k not in GIT_ENV and k not in ('SKIP', 'PLATFORM_CHECKS_RANGE')
+            and not (k.startswith('PRE_COMMIT_') and k != 'PRE_COMMIT_HOME')}
 
 
 def run_to(cmd, out, **kwargs):
@@ -6135,8 +6161,13 @@ def commit_checkout(top, sha):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_pre_commit(pc, work, rng, only, out):
-    """pre-commit with the platform's config, then the repo's own (CI runs both), in `work`; True if all passed."""
+def run_pre_commit(pc, work, rng, only, out, commits=None):
+    """pre-commit with the platform's config, then the repo's own (CI runs both), in `work`; True if all passed.
+    `commits` (FROM..TO) is the range the secrets hook scans even when every file runs, as CI's
+    PLATFORM_CHECKS_RANGE (magehand#114's review)."""
+    env = child_env()
+    if commits:
+        env['PLATFORM_CHECKS_RANGE'] = commits
     configs = [PRE_COMMIT_CONFIG] + (['.pre-commit-config.yaml'] if (work / '.pre-commit-config.yaml').is_file() else [])
     ok = True
     for config in configs:
@@ -6144,7 +6175,7 @@ def run_pre_commit(pc, work, rng, only, out):
             continue
         cmd = [str(pc), 'run', '--config', config, *([only] if only else []), *rng, '--color',
                'always' if out.isatty() else 'never']
-        ok = run_to(cmd, out, cwd=work, env=child_env()) == 0 and ok
+        ok = run_to(cmd, out, cwd=work, env=env) == 0 and ok
     return ok
 
 
@@ -6159,7 +6190,7 @@ def cmd_verify(a):
             sys.exit(0)  # a tag, a deleted branch or nothing new: nothing to check
     out = sys.stderr if a.json or a.pre_push else sys.stdout  # --json: the tools' output must not mix with the JSON
     results = []
-    for sha, frm, to, ci_range in targets:
+    for sha, frm, to, ci_range, commits in targets:
         with commit_checkout(top, sha) as work:
             # Everything about the checks comes from the commit itself: the checks.yaml ref its workflows call, and
             # whether it has JS/TS for ESLint (magehand#110's review), not from the checkout you are in.
@@ -6176,7 +6207,7 @@ def cmd_verify(a):
             everything = frm is None or (own is not None and git_out(
                 ['diff', '--name-only', f'{frm}...{to}', '--', QUALITY_DIR, '.github/workflows'], work) != '')
             rng = ['--all-files'] if everything else ['--from-ref', frm, '--to-ref', to]
-            ok = run_pre_commit(pc, work, rng, a.only, out)
+            ok = run_pre_commit(pc, work, rng, a.only, out, commits=commits)
             if ok and not a.only and is_app_checkout(work):
                 # An app repo: the platform's rules too, strict as CI runs them (a rule whose tool is missing here
                 # fails instead of being skipped, so a record means they all ran; magehand#110's review).
@@ -6184,7 +6215,8 @@ def cmd_verify(a):
                             env=child_env()) == 0
         # A record stands for "CI's checks pass on this commit": the CI range, every check, the config CI uses.
         recorded = bool(ok and ci_range and not a.only and not APPS_DIR and record_verified(top, sha))
-        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref, 'everything': everything})
+        results.append({'commit': sha, 'ok': ok, 'recorded': recorded, 'ci_ref': ref, 'everything': everything,
+                        'commits': commits})
     ok = all(r['ok'] for r in results)
     if a.pre_push:
         if not ok:
@@ -6194,10 +6226,16 @@ def cmd_verify(a):
     head = results[0]
     scope = 'every file' if head['everything'] else f'the files changed since {default_base(top)}'
     dirty = not clean_checkout(top)
-    why_not = ('--only runs one check' if a.only else '--apps-dir is not what CI runs' if APPS_DIR else None)
+    no_base = not head['commits']
+    why_not = ('--only runs one check' if a.only else '--apps-dir is not what CI runs' if APPS_DIR else
+               f'no merge base with {default_base(top)}, so the commits were not scanned for secrets (only the files)'
+               if no_base else None)
     step = ('`magehand pr ready` once the PR\'s checks are green' if ok and head['recorded'] and not dirty else
             'commit your changes, then `magehand verify` again (it checks commits, not uncommitted edits)' if ok and dirty else
-            f'`magehand verify` without {"--only" if a.only else "--apps-dir"} to record a pass' if ok else
+            f'`magehand verify` without {"--only" if a.only else "--apps-dir"} to record a pass'
+            if ok and (a.only or APPS_DIR) else
+            fetch_step(top) if ok and no_base else
+            '`magehand verify` again' if ok else
             'fix what the checks found (each names its file and line), commit, then `magehand verify` again')
     if a.json:
         print(json.dumps({'ok': ok, 'checked': scope, 'commit': head['commit'], 'only': a.only,
