@@ -30,6 +30,16 @@ repos:
           exec "$eslint" -c .platform-quality/eslint-checks.config.mjs -- "$@"' --
         # By extension: pre-commit's identify gives .mts and .cts no tag, so types_or skipped them (#536's review).
         files: '\.(js|mjs|cjs|jsx|ts|tsx|mts|cts)$'
+      - id: gitleaks
+        name: secrets (gitleaks)
+        description: >-
+          gitleaks' rules over the commits being checked (a PR, a push), or the tracked files without a range
+          (gitleaks.sh); gitleaks.toml allows the generic rule in test fixtures only. Built from its pinned module.
+        language: golang
+        additional_dependencies: [github.com/zricethezav/gitleaks/v8@v8.30.1]
+        entry: bash .platform-quality/gitleaks.sh
+        pass_filenames: false
+        always_run: true
       - id: platform-rules
         name: the platform's own rules (ast-grep)
         description: Bug patterns found in this lab (ast-grep/rules/); scan.py also checks Python scripts without .py.
