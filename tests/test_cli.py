@@ -8215,6 +8215,18 @@ class Verify(unittest.TestCase):
         self.assertEqual((code, refs), (0, []))
         self.assertIn('not recorded: --apps-dir', out)
 
+    def test_the_checkout_is_at_its_real_path(self):
+        # homelab-apps#561: npm ci failed under macOS's symlinked temporary directory; a symlinked TMPDIR here too.
+        top = self.repo()
+        with tempfile.TemporaryDirectory() as real:
+            link = pathlib.Path(real).parent / (pathlib.Path(real).name + '-link')
+            link.symlink_to(real)
+            self.addCleanup(link.unlink)
+            with mock.patch.object(magehand.tempfile, 'tempdir', str(link)):
+                with magehand.commit_checkout(top, self.git(top, 'rev-parse', 'HEAD')) as work:
+                    self.assertEqual(work, work.resolve())
+                    self.assertTrue((work / 'a.py').is_file())
+
     def test_the_commit_is_checked_not_the_working_tree(self):
         # magehand#110's review: pre-commit reads the checkout's files, so a bad commit on another branch passed
         # while a good file was checked out. Checks run in a worktree of the exact commit.

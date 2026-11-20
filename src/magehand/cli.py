@@ -6144,8 +6144,10 @@ def run_to(cmd, out, **kwargs):
 
 @contextlib.contextmanager
 def commit_checkout(top, sha):
-    """A temporary worktree of commit `sha` (detached, removed afterwards)."""
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix='magehand-verify-'))
+    """A temporary worktree of commit `sha` (detached, removed afterwards), at its real path: macOS's temporary
+    directory is behind a symlink (/var -> /private/var), and npm ci given the symlinked path of a repo's own
+    .github/quality failed with "Missing: quality@ from lock file" (homelab-apps#561, verifying homelab-apps)."""
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix='magehand-verify-')).resolve()
     path = tmp / 'src'
     out = subprocess.run(['git', '-C', str(top), 'worktree', 'add', '--detach', '--quiet', str(path), sha],  # nosec B603 B607  # noqa: PLW1510
                          capture_output=True, text=True, env=child_env())
