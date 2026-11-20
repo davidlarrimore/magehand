@@ -6073,9 +6073,15 @@ def fetch_step(top):
     """The step when a branch has no merge base with origin's default branch: a shallow clone needs its history;
     otherwise fetch, and check the branch is the one you meant (unrelated history has no base to find)."""
     base = default_base(top)
-    if git_out(['rev-parse', '--is-shallow-repository'], top) == 'true':
-        return f'`git fetch --unshallow origin` (a shallow clone has no merge base with {base}), then `magehand verify` again'
-    return (f'`git fetch origin`, then `magehand verify` again; if there is still no merge base, this branch has no '
+    remote, _, branch = base.partition('/')
+    shallow = git_out(['rev-parse', '--is-shallow-repository'], top) == 'true'
+    if git_out(['rev-parse', '--verify', '--quiet', f'refs/remotes/{base}'], top) is None:
+        # A single-branch clone (`git clone -b feature`, shallow or not) never fetches it (#114's review).
+        return (f'`git fetch {"--unshallow " if shallow else ""}{remote} refs/heads/{branch}:refs/remotes/{base}` '
+                f'(this clone has no {base} to compare with), then `magehand verify` again')
+    if shallow:
+        return f'`git fetch --unshallow {remote}` (a shallow clone has no merge base with {base}), then `magehand verify` again'
+    return (f'`git fetch {remote}`, then `magehand verify` again; if there is still no merge base, this branch has no '
             f'history in common with {base}: check it is the branch you meant')
 
 

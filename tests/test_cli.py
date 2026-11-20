@@ -8352,9 +8352,23 @@ class Verify(unittest.TestCase):
         self.assertIn('not recorded: no merge base', out)
         self.assertIn('git fetch origin', out)
         self.assertNotIn('--apps-dir', out)
-        with mock.patch.object(magehand, 'git_out', lambda args, root=None: 'true' if '--is-shallow-repository' in args
-                               else 'origin/main'):
-            self.assertIn('git fetch --unshallow origin', magehand.fetch_step(top))  # a shallow clone
+        # Here origin/main is gone: fetch it explicitly as a remote-tracking ref.
+        self.assertIn('`git fetch origin refs/heads/main:refs/remotes/origin/main`', magehand.fetch_step(top))
+        # A single-branch shallow clone: unshallow and fetch the ref (#114's review), checked by doing it for real.
+        with tempfile.TemporaryDirectory() as tmp:
+            clone = pathlib.Path(tmp) / 'clone'
+            self.git(top, 'checkout', '-q', 'main')
+            self.commit(top, 'm.py', 'm\n')
+            self.git(top, 'checkout', '-q', 'feature')
+            self.commit(top, 'f.py', 'f\n')
+            subprocess.run(['git', 'clone', '-q', '--depth=1', '-b', 'feature', f'file://{top}', str(clone)],
+                           check=True, capture_output=True)
+            self.assertIsNone(magehand.git_out(['merge-base', 'HEAD', 'origin/main'], clone))
+            step = magehand.fetch_step(clone)
+            self.assertIn('git fetch --unshallow origin refs/heads/main:refs/remotes/origin/main', step)
+            subprocess.run(['git', '-C', str(clone), 'fetch', '-q', '--unshallow', 'origin',
+                            'refs/heads/main:refs/remotes/origin/main'], check=True, capture_output=True)
+            self.assertIsNotNone(magehand.git_out(['merge-base', 'HEAD', 'origin/main'], clone))  # the step works
 
     def test_verify_json_is_only_json(self):
         # magehand#110's review: pre-commit's own output went to stdout before the JSON object.
