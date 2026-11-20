@@ -30,6 +30,7 @@ from unittest import mock
 from magehand import cli as magehand
 
 APP_BUILD = '.github/workflows/build.yaml'  # the template's Build workflow, as GitHub reports its runs
+TEMPLATE_BUILD = ('jobs:\n  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n')
 
 os.environ['MAGEHAND_NO_UPDATE_CHECK'] = '1'  # tests never ask GitHub for the latest version
 
@@ -1884,10 +1885,13 @@ class CheckCode(unittest.TestCase):
     def test_build_workflow_calls_the_quality_check(self):
         flow = 'jobs:\n  image:\n    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n'
         quality = '  quality:\n    uses: davidlarrimore/homelab-apps/.github/workflows/quality.yaml@main\n'
+        checks = '  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n'
         texts = [f['text'] for f in self.run_check({'.github/workflows/build.yaml': flow}) if f['where'] ==
                  '.github/workflows/build.yaml']
-        self.assertTrue(texts and "doesn't call the platform's quality check" in texts[0])
-        self.assertFalse([f for f in self.run_check({'.github/workflows/build.yaml': flow + quality})
+        self.assertEqual(len(texts), 2, texts)
+        self.assertIn("doesn't call the platform's quality check", texts[0])
+        self.assertIn("doesn't run the platform's static checks", texts[1])  # homelab#611
+        self.assertFalse([f for f in self.run_check({'.github/workflows/build.yaml': flow + quality + checks})
                           if f['where'] == '.github/workflows/build.yaml'])
         self.assertFalse([f for f in self.run_check({}) if f['where'] == '.github/workflows/build.yaml'])
 
@@ -2855,10 +2859,11 @@ class New(unittest.TestCase):
     def setUp(self):
         self.saved = magehand.gh_cli
         self.calls = []
+        self.posted = []
         self.addCleanup(setattr, magehand, 'gh_cli', self.saved)
 
     def fake(self, exists=None, collaborator=False, ruleset=False, ruleset_status=0, existing=None, invited=False,
-             checks=None):
+             checks=None, build=TEMPLATE_BUILD):
         """`existing` is the ruleset already on the repo (default: ours when `ruleset`); `checks` is the
         required-checks ruleset on it (default: ours when `ruleset`); `collaborator` is True (write), 'read' or
         False, and `invited` says an invitation for the bot is pending."""
@@ -2867,6 +2872,10 @@ class New(unittest.TestCase):
 
         def gh(*args, **kw):
             self.calls.append(args)
+            if args[:3] == ('api', '-X', 'POST'):
+                self.posted.append(kw.get('stdin'))
+            if args[:2] == ('api', 'repos/davidlarrimore/elvis/contents/.github/workflows/build.yaml') and '-H' in args:
+                return (0, build, '') if build is not None else (1, '', 'gh: Not Found (HTTP 404)')
             if args[:2] == ('api', 'repos/davidlarrimore/elvis/rulesets'):
                 listed = [{'id': 7, 'name': existing['name']}] if existing else []
                 return ruleset_status, json.dumps(listed), 'HTTP 403' if ruleset_status else ''
@@ -2937,11 +2946,31 @@ class New(unittest.TestCase):
             self.run_new('elvis')
         self.assertIn('without a review', err.getvalue())
 
+    def required_posted(self):
+        return [[c['context'] for r in json.loads(body)['rules'] if r['type'] == 'required_status_checks'
+                 for c in r['parameters']['required_status_checks']] for body in self.posted]
+
+    def test_an_older_app_is_not_made_to_wait_for_a_check_it_doesnt_run(self):
+        # magehand#112's review: repairing an app made before homelab#611 must not require checks / pre-commit,
+        # which its build.yaml doesn't report: every PR would wait for it.
+        import contextlib
+        import io
+        for build in ('jobs:\n  image:\n    uses: x\n', None):  # no checks job; build.yaml unreadable
+            self.posted = []
+            self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={}, build=build)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.run_new('elvis')
+            self.assertEqual(self.required_posted(), [['security / scan', 'image / result']])
+            self.assertIn("add homelab-app-template's `checks` job", err.getvalue())
+
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
+        self.posted = []
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
         self.run_new('elvis')
         posted = [c for c in self.calls if c[:3] == ('api', '-X', 'POST')]
         self.assertEqual(posted, [('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-')])
+        self.assertEqual(self.required_posted(), [['security / scan', 'image / result', 'checks / pre-commit']])
         self.assertEqual(magehand.CHECKS_RULESET['bypass_actors'], [])
         rule = next(r for r in magehand.CHECKS_RULESET['rules'] if r['type'] == 'required_status_checks')
         self.assertEqual([c['context'] for c in rule['parameters']['required_status_checks']],

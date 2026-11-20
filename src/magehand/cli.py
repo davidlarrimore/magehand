@@ -2693,9 +2693,21 @@ def ensure_ruleset(repo):
     return 'failed'
 
 
+PLATFORM_CHECK = 'checks / pre-commit'
+
+
+def runs_platform_checks(repo):
+    """Whether the repo's build.yaml (on its default branch) calls the platform's checks.yaml, the job that
+    reports `checks / pre-commit`. False when it can't be read: requiring a check nothing reports blocks every PR."""
+    code, out, _ = gh_cli('api', f'repos/{repo}/contents/{BUILD_WORKFLOW}', '-H', 'Accept: application/vnd.github.raw')
+    return code == 0 and bool(CHECKS_CALL.search(out or ''))
+
+
 def ensure_checks(repo):
     """Make sure a merge waits for the required checks: 'exists', 'created', 'weak' or 'failed' (a warning, as
-    for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes one."""
+    for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes one. A repo
+    whose build.yaml doesn't run the platform's checks yet (an app made before them) gets the others only:
+    requiring a check nothing reports would leave every PR waiting (magehand#112's review)."""
     state, detail = checks_status(repo)
     name = CHECKS_RULESET['name']
     if state == 'ok':
@@ -2706,10 +2718,21 @@ def ensure_checks(repo):
               "(magehand leaves an existing ruleset alone)", file=sys.stderr)
         return 'weak'
     if state == 'missing':
+        ruleset, names = CHECKS_RULESET, REQUIRED_NAMES
+        if not runs_platform_checks(repo):
+            contexts = [check for check in REQUIRED_CHECKS if check != PLATFORM_CHECK]
+            names = ' and '.join(contexts)
+            ruleset = dict(CHECKS_RULESET, rules=[
+                rule if rule['type'] != 'required_status_checks' else dict(rule, parameters=dict(
+                    rule['parameters'], required_status_checks=[{'context': c} for c in contexts]))
+                for rule in CHECKS_RULESET['rules']])
+            print(f"{repo}: {BUILD_WORKFLOW} doesn't run the platform's checks yet, so {PLATFORM_CHECK} is not "
+                  "required: add homelab-app-template's `checks` job, then add the check in Settings > Rules",
+                  file=sys.stderr)
         code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-',
-                                 stdin=json.dumps(CHECKS_RULESET))
+                                 stdin=json.dumps(ruleset))
         if code == 0:
-            print(f"{repo}: ruleset '{name}' added (a PR merges only when {REQUIRED_NAMES} pass; "
+            print(f"{repo}: ruleset '{name}' added (a PR merges only when {names} pass; "
                   'nobody can bypass it)', file=sys.stderr)
             return 'created'
     print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
@@ -5060,6 +5083,17 @@ def check_quality_job(root):
                     "homelab-app-template's `quality` job (agents can't change workflows)", QUALITY_SEE)]
 
 
+def check_checks_job(root):
+    """The Build workflow calls the platform's static checks (homelab-app-template's `checks` job, homelab#611).
+    A warning naming who fixes it, as for the quality job."""
+    path = root / BUILD_WORKFLOW
+    if not path.is_file() or CHECKS_CALL.search(path.read_text(errors='replace')):
+        return []
+    return [finding('warning', BUILD_WORKFLOW, "doesn't run the platform's static checks: ask the owner to add "
+                    "homelab-app-template's `checks` job (agents can't change workflows)",
+                    'homelab-apps docs/development/quality.md "Checks"')]
+
+
 # A Prometheus metric definition (Python prometheus_client, JS prom-client, Go client_golang) and the label names
 # that would put a person or a document into a series label (homelab-apps docs/platform/metrics.md "Labels").
 METRIC_DEFINITION = re.compile(r'\b(?:New)?(?:Counter|Gauge|Histogram|Summary)(?:Vec)?\s*\(|\blabel_?[nN]ames\b')
@@ -5158,7 +5192,7 @@ def check_code(root, app, catalog=None):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
                                  'homelab-apps AGENTS.md "Apps with their own repo"'))
-    found += check_dockerfile(root) + check_quality_job(root) + check_dotenv(root, app)
+    found += check_dockerfile(root) + check_quality_job(root) + check_checks_job(root) + check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
         try:
