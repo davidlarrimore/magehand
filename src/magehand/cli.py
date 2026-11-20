@@ -2717,8 +2717,8 @@ def platform_checks_call(text, on_pull_requests=False):
             return None
         # A `types` list must keep the default activities, or a later push to the PR doesn't run it.
         types = filters.get('types') if isinstance(filters, dict) else None
-        if types is not None and not {'opened', 'synchronize', 'reopened'} <= set(
-                [types] if isinstance(types, str) else types if isinstance(types, list) else []):
+        listed = [types] if isinstance(types, str) else types if isinstance(types, list) else []
+        if types is not None and not {'opened', 'synchronize', 'reopened'} <= {t for t in listed if isinstance(t, str)}:
             return None
     prefix = f'{APPS_REPO}/{CHECKS_WORKFLOW}@'
     jobs = flow.get('jobs') if isinstance(flow.get('jobs'), dict) else {}
