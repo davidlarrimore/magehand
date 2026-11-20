@@ -2707,14 +2707,24 @@ def platform_checks_call(text, on_pull_requests=False):
     if not isinstance(flow, dict):
         return None
     if on_pull_requests:
+        # Every pull request: a `paths`, `paths-ignore` or `branches` filter leaves some PRs without the check, and
+        # a required check that never reports blocks them (magehand#112's review).
         on = flow.get('on', flow.get(True))  # YAML 1.1 reads a bare `on:` key as true
         if not (on == 'pull_request' or (isinstance(on, (list, dict)) and 'pull_request' in on)):
             return None
+        filters = on.get('pull_request') if isinstance(on, dict) else None
+        if isinstance(filters, dict) and set(filters) & {'paths', 'paths-ignore', 'branches', 'branches-ignore'}:
+            return None
     prefix = f'{APPS_REPO}/{CHECKS_WORKFLOW}@'
-    for job in (flow.get('jobs') or {}).values() if isinstance(flow.get('jobs'), dict) else []:
+    jobs = flow.get('jobs') if isinstance(flow.get('jobs'), dict) else {}
+    for job_id, job in jobs.items():
         uses = job.get('uses') if isinstance(job, dict) else None
-        if isinstance(uses, str) and uses.startswith(prefix) and len(uses) > len(prefix):
-            return uses[len(prefix):]
+        if not (isinstance(uses, str) and uses.startswith(prefix) and len(uses) > len(prefix)):
+            continue
+        # The check's name is `<job> / pre-commit`: with on_pull_requests, the job must be the template's `checks`.
+        if on_pull_requests and (job_id != 'checks' or job.get('name', 'checks') != 'checks'):
+            continue
+        return uses[len(prefix):]
     return None
 
 
@@ -3344,12 +3354,16 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
 
 def checks_steps(repo, checks):
     """What the required-checks ruleset leaves you, from ensure_checks' result."""
+    # The third check only once it reports on every PR: required and never reported, it blocks them all.
+    third = (f"require {PLATFORM_CHECK} only once a recent PR's checks list it: {BUILD_WORKFLOW} must run "
+             "homelab-app-template's `checks` job, under that name, on every pull request (no `paths` or `branches` "
+             "filter; `magehand check` warns otherwise)")
     if checks == 'weak':
-        return [f"do:    require the checks {REQUIRED_NAMES} on main with no bypass in the repo's "
-                'Settings > Rules (magehand leaves an existing ruleset alone)']
+        others = ' and '.join(c for c in REQUIRED_CHECKS if c != PLATFORM_CHECK)
+        return [f"do:    require {others} on main with no bypass in the repo's Settings > Rules (magehand leaves "
+                f"an existing ruleset alone); {third}"]
     if checks == 'partial':
-        return [f"do:    once {BUILD_WORKFLOW} runs homelab-app-template's `checks` job on pull requests (a PR; "
-                f"`magehand check` warns while it doesn't), require {PLATFORM_CHECK} in Settings > Rules"]
+        return [f'do:    {third}; then add it in Settings > Rules']
     if checks == 'failed':
         return [f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
                 f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules"]

@@ -2978,17 +2978,30 @@ class New(unittest.TestCase):
             self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), 'partial')
         self.assertFalse([c for c in self.calls if '-X' in c])  # never changed
         step = magehand.checks_steps('davidlarrimore/elvis', 'partial')[0]
-        self.assertIn("once .github/workflows/build.yaml runs homelab-app-template's `checks` job", step)
+        self.assertIn("only once a recent PR's checks list it", step)
+        # Mixed defects (a bypass, or image / result missing too): the first two now, the third still conditional.
+        step = magehand.checks_steps('davidlarrimore/elvis', 'weak')[0]
+        self.assertIn('require security / scan and image / result on main', step)
+        self.assertIn("checks / pre-commit only once a recent PR's checks list it", step)
 
     def test_only_a_jobs_real_call_counts(self):
         call = 'davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main'
-        self.assertEqual(magehand.platform_checks_call(f'on: [pull_request]\njobs:\n  c:\n    uses: "{call}"\n',
+        self.assertEqual(magehand.platform_checks_call(f'on: [pull_request]\njobs:\n  checks:\n    uses: "{call}"\n',
                                                        on_pull_requests=True), 'main')  # quoted: still a call
-        for text in (f'on: [pull_request]\njobs:\n  c:\n    runs-on: x\n    # uses: {call}\n',  # a comment
+        for text in (f'on: [pull_request]\njobs:\n  checks:\n    runs-on: x\n    # uses: {call}\n',  # a comment
                      f'on: [push]\njobs:\n  c:\n    uses: {call}\n',  # never on a PR: never reports there
-                     f'on: [pull_request]\nenv:\n  X: "uses: {call}"\n', 'not: [valid', ''):
+                     f'on: [pull_request]\nenv:\n  X: "uses: {call}"\n', 'not: [valid', '',
+                     # magehand#112's review: not every PR, or another check name
+                     f'on:\n  pull_request:\n    paths: [src/**]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on:\n  pull_request:\n    branches: [main]\njobs:\n  checks:\n    uses: {call}\n',
+                     f'on: [pull_request]\njobs:\n  lint:\n    uses: {call}\n',
+                     f'on: [pull_request]\njobs:\n  checks:\n    name: Lint\n    uses: {call}\n'):
             self.assertIsNone(magehand.platform_checks_call(text, on_pull_requests=True), text)
         self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
+        # The template's own job: skipped only on workflow_dispatch, so every PR reports it.
+        template = (f"on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\njobs:\n  checks:\n"
+                    f"    if: github.event_name != 'workflow_dispatch'\n    uses: {call}\n")
+        self.assertEqual(magehand.platform_checks_call(template, on_pull_requests=True), 'main')
 
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
