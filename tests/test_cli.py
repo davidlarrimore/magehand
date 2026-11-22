@@ -5871,6 +5871,11 @@ class AppApiSession(unittest.TestCase):
         self.assertEqual(self.token(), (None, 0))
         self.assertEqual(self.posts, [])
 
+    def test_a_renewal_without_a_new_refresh_token_keeps_the_saved_one(self):
+        self.session(86400, -5)
+        token, _ = self.token(reply=(200, {'access_token': 'new-access', 'expires_in': 3600}))
+        self.assertEqual((token, self.store['api-refresh-token']), ('new-access', 'old-refresh'))
+
     def test_idle_for_days_renews_without_a_sign_in(self):
         self.session(5 * 86400, -4 * 86400)
         self.assertEqual(self.token()[0], 'new-access')

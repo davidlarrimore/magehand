@@ -915,7 +915,9 @@ def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
                                                   'client_id': API_CLIENT})
                 if status == 200:
                     try:
-                        if api_store(tokens or {}, started):
+                        # authentik may keep the same refresh token (no new one in the answer): then the week it
+                        # was issued for is the server's own limit, and the saved one stays in use.
+                        if api_store({'refresh_token': refresh, **(tokens or {})}, started):
                             rejected = None
                             token, left, started, wanted = saved()
                     except OSError as error:
