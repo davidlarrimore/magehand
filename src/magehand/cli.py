@@ -541,14 +541,31 @@ TOKEN_CHARS = re.compile(r'^[A-Za-z0-9._~+/=-]+$')  # what an OpenBao token is m
 _warned_env = []
 
 
+SECURITY_LINE_MAX = 4000  # `security -i` splits a longer line and runs its first part: a truncated write
+
+
 def keychain_add(token, account='openbao-token', what='OpenBao'):
     """Put the token in the macOS Keychain without it ever being an argument: `security -i` reads the
     command from stdin, so `ps` never shows the token."""
     if not TOKEN_CHARS.match(token):
         die(f'{what} returned a token in a form magehand will not store; sign in again: magehand login')
     command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w {token}\n'
+    if len(command) > SECURITY_LINE_MAX:
+        raise OSError(f'{what} returned a token too long for the Keychain command; nothing was written')
     subprocess.run(['security', '-i'], input=command, text=True,  # nosec B603 B607
                    check=True, capture_output=True)
+
+
+def replace_file(path, text):
+    """Replace a file whole, readable only by its owner: several sessions read these, and one must never see half."""
+    fd, temp = tempfile.mkstemp(dir=str(path.parent), prefix=f'.{path.name}.')  # created 0600
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+        os.replace(temp, path)
+    except BaseException:
+        pathlib.Path(temp).unlink(missing_ok=True)
+        raise
 
 
 def secret_put(account, token, what='OpenBao'):
@@ -561,10 +578,7 @@ def secret_put(account, token, what='OpenBao'):
     if not TOKEN_CHARS.match(token):
         die(f'{what} returned a token in a form magehand will not store; sign in again: magehand login')
     # No credential store in the standard library: a file only its owner can read, never created wider.
-    fd = os.open(STATE / account, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as handle:
-        os.fchmod(handle.fileno(), 0o600)
-        handle.write(token)
+    replace_file(STATE / account, token)
 
 
 def secret_get(account):
@@ -614,17 +628,24 @@ def signin_left(token=None, soft=False):
 def minutes(seconds):
     if seconds >= NO_EXPIRY:
         return 'no expiry'
-    return 'under 1 min' if seconds < 60 else f'{seconds // 60} min'
+    if seconds < 60:
+        return 'under 1 min'
+    if seconds < 2 * 3600:
+        return f'{seconds // 60} min'
+    if seconds < 2 * 86400:
+        return f'{seconds // 3600} h'
+    days, hours = divmod((seconds + 1800) // 3600, 24)  # to the nearest hour: a new week isn't "6 days"
+    return f'{days} days' + (f' {hours} h' if hours else '')
 
 
-RENEW_BELOW = 1800  # seconds: a session with less than this left is renewed (for an hour, up to the role's 8h)
+RENEW_BELOW = 1800  # seconds: a session with less than this left is renewed (for an hour, up to the role's maximum)
 RENEW_FOR = '1h'
 
 
 def renewed(token, left):
     """Seconds left after renewing a session that is running low (renew-self, as OpenBao's default policy allows),
-    so a working day needs one passkey sign-in, not one an hour. OpenBao never renews past the role's maximum
-    (8h from sign-in): then the time left stays what it was. Unchanged when it isn't low or the renewal fails."""
+    for a homelab whose role gives short tokens. OpenBao never renews past the role's maximum: then the time left
+    stays what it was. Unchanged when it isn't low or the renewal fails."""
     if left is None or left >= RENEW_BELOW or left >= NO_EXPIRY:
         return left
     status, body = bao('POST', 'auth/token/renew-self', token, body={'increment': RENEW_FOR}, soft=True)
@@ -661,16 +682,24 @@ def login_check(a):
     left = renewed(token, signin_left(token)) if token else None
     need = a.min * 60
     ok = left is not None and left >= need
-    api = api_left() if left is not None else None
+    problem = []
+    api = api_left(problem) if left is not None else None
+    unavailable = problem[0] if problem else None  # for now: signing in would fix nothing
+    until = 0  # how long it keeps renewing itself: what decides whether to ask for a sign-in
+    if api is not None:
+        until = max(api, (api_session().get('signed_in_at') or 0) + API_SESSION_MAX - int(time.time()))
     if a.json:
         print(json.dumps({'signed_in': left is not None, 'seconds_left': left or 0, 'min_minutes': a.min, 'ok': ok,
-                          'api_signed_in': api is not None, 'api_seconds_left': api or 0}))
+                          'api_signed_in': api is not None, 'api_seconds_left': api or 0,
+                          'api_renewable_seconds_left': until, 'api_unavailable': unavailable}))
     elif left is None:
         print('magehand: not signed in: run `magehand login`', file=sys.stderr)
     else:
         print(f'signed in, {minutes(left)} left' + ('' if ok else f' (less than {a.min} min): run `magehand login`'))
-        print('app APIs: ' + (f'{minutes(api)} left' if api is not None else 'signed out (`magehand login`)'),
-              file=sys.stderr)
+        print('app APIs: ' + (f'signed in, {minutes(until)} left (its token renews itself)'
+                              + (f"; can't renew right now ({unavailable})" if unavailable else '') if api is not None
+                              else f"can't tell right now ({unavailable}); try again shortly" if unavailable
+                              else 'signed out (`magehand login`)'), file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
@@ -733,8 +762,7 @@ def cmd_login(args):
         print(json.dumps({'signed_in': True, 'email': email, 'policies': auth.get('policies', []),
                           'seconds_left': lease, 'api': api_ok, 'api_note': api_note}))
     else:
-        print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {lease // 3600}h; '
-              'renewed while you use magehand, up to 8h after this sign-in).')
+        print(f'Signed in as {email or "?"} (policy {", ".join(auth.get("policies", []))}, {minutes(lease)}).')
         print(f'App APIs (magehand api): {api_note}')
     return auth['client_token']
 
@@ -743,14 +771,17 @@ def cmd_login(args):
 # `magehand login` signs in to authentik a second time, as magehand's own client, right after the OpenBao
 # sign-in (same browser, step-up just done: no second passkey tap). The access token goes to apps as
 # `Authorization: Bearer` through their forward auth, which accepts it; the app sees the owner's usual
-# X-authentik-* headers. Tokens live in the Keychain; STATE/api-session.json holds only times.
+# X-authentik-* headers. The access token and its two times are one Keychain item, written in one call, so a
+# reader needs no lock and can never pair one sign-in's token with another's times.
 
 AUTHENTIK = os.environ.get('MAGEHAND_AUTHENTIK', 'https://auth.davidlarrimore.com')
 API_CLIENT = 'magehand'
 API_CALLBACK_PATH = '/authentik/callback'
 API_CALLBACK = 'http://localhost:8250' + API_CALLBACK_PATH
-API_SESSION_MAX = 8 * 3600  # like the OpenBao session: renewed while used, never past 8h from sign-in
-API_RENEW_BELOW = 300       # seconds left on the access token below which it is renewed
+API_SESSION_MAX = 7 * 86400  # renewed while used, never past a week from sign-in (authentik may end it sooner)
+API_RENEW_BELOW = SIGNIN_WARN  # seconds left on the access token below which it is renewed (before any warning)
+API_LOCK_WAIT = 20          # seconds to wait for another session's renewal (its request times out after 15)
+API_CALLBACK_SIGNATURE = 'X-authentik-auth-callback'
 API_SIGNIN_WAIT = 60        # the second sign-in should pass by itself; don't keep the person waiting
 
 
@@ -779,26 +810,40 @@ def authentik_token(form):
             return resp.status, json.loads(resp.read() or b'{}')
     except urllib.error.HTTPError as error:
         return error.code, None
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return 0, None
 
 
+API_ITEM = 'api-session'  # 'v1~<signed in at>~<expires at>~<access token>'. Not JSON: a `security -i` line has
+                          # SECURITY_LINE_MAX characters, and quoting or base64 would spend that on a JWT.
+
+
 def api_session():
-    path = STATE / 'api-session.json'
+    """The app-API sign-in, from one read: {'signed_in_at', 'expires_at', 'token'}; {} when there is none."""
+    item = secret_get(API_ITEM)
+    if item:
+        parts = item.split('~', 3)
+        if len(parts) != 4 or parts[0] != 'v1' or not (parts[1].isdecimal() and parts[2].isdecimal()):
+            return {}
+        return {'signed_in_at': int(parts[1]), 'expires_at': int(parts[2]), 'token': parts[3]}
+    path = STATE / 'api-session.json'  # 0.62 and older: the times here, the token in an item of its own
     try:
         data = json.loads(path.read_text()) if path.is_file() else {}
-    except ValueError:
+    except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    return dict(data, token=secret_get('api-access-token')) if isinstance(data, dict) and data else {}
 
 
 def api_store(tokens, signed_in_at):
+    """Save a sign-in or a renewal (call it holding api_lock). Readers see all of the old one or all of the new:
+    the refresh token, which only a lock holder reads, goes first and the session item last."""
     if not tokens.get('access_token') or not tokens.get('refresh_token'):
         return False
-    secret_put('api-access-token', tokens['access_token'], 'authentik')
-    secret_put('api-refresh-token', tokens['refresh_token'], 'authentik')
     expires = int(time.time()) + int(tokens.get('expires_in') or 3600)
-    (STATE / 'api-session.json').write_text(json.dumps({'signed_in_at': signed_in_at, 'expires_at': expires}))
+    secret_put('api-refresh-token', tokens['refresh_token'], 'authentik')
+    secret_put(API_ITEM, f"v1~{int(signed_in_at)}~{expires}~{tokens['access_token']}", 'authentik')
+    with contextlib.suppress(OSError):  # the older format's times: an item that reads as missing mustn't revive them
+        (STATE / 'api-session.json').unlink()
     return True
 
 
@@ -829,39 +874,127 @@ def api_signin():
     status, tokens = authentik_token({'grant_type': 'authorization_code', 'code': params['code'],
                                       'redirect_uri': API_CALLBACK, 'client_id': API_CLIENT,
                                       'code_verifier': verifier})
-    if status != 200 or not api_store(tokens or {}, int(time.time())):
+    if status != 200:
         return False, f'not signed in: authentik refused the token (HTTP {status})'
-    return True, 'signed in (1h, renewed while you use it, up to 8h)'
+    with api_lock() as held:  # not while a renewal of the old sign-in is in flight: it would write over this one
+        if held is None:
+            return False, f"not signed in: {STATE} can't be written; fix that, then run `magehand login` again"
+        if not held:
+            return False, "not signed in: another magehand holds the sign-in's lock; run `magehand login` again"
+        try:
+            stored = api_store(tokens or {}, int(time.time()))
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, f"not signed in: can't save the sign-in ({type(error).__name__})"
+        if not stored:
+            return False, f'not signed in: authentik returned no refresh token (HTTP {status})'
+    return True, 'signed in (1h tokens, renewed while you use it, for up to a week)'
 
 
-def api_token(renew=True, below=API_RENEW_BELOW):
-    """(access token, seconds left) for app APIs, renewed when under `below` seconds are left and the 8 hours
-    aren't up; (None, 0) when signed out or expired."""
-    session, now = api_session(), int(time.time())
-    expires, started = session.get('expires_at') or 0, session.get('signed_in_at') or 0
-    token = secret_get('api-access-token') if expires > now else None
-    # The last renewal must end by the 8-hour mark: an access token lasts an hour.
-    if renew and expires - now < below and now + 3600 <= started + API_SESSION_MAX:
-        refresh = secret_get('api-refresh-token')
-        if refresh:
-            status, tokens = authentik_token({'grant_type': 'refresh_token', 'refresh_token': refresh,
-                                              'client_id': API_CLIENT})
-            if status == 200 and api_store(tokens or {}, started):
-                return api_token(renew=False)
-    return (token, expires - now) if token else (None, 0)
+@contextlib.contextmanager
+def api_lock():
+    """The app-API sign-in's lock, shared by every magehand on the machine: True once held, False when it can't be
+    had in API_LOCK_WAIT seconds, None when the state directory can't be written (waiting won't fix that)."""
+    try:
+        STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = (STATE / 'api-session.lock').open('a')
+    except OSError:
+        yield None
+        return
+    with lock:
+        deadline, held = time.monotonic() + API_LOCK_WAIT, False
+        while not held:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        yield held
 
 
-def api_left():
-    """Seconds left on the app-API sign-in (renewing it), or None when signed out."""
-    token, left = api_token()
+def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
+    """(access token, seconds left) for app APIs, renewed when under `below` seconds are left, or when the saved
+    token is `rejected` (authentik deletes access tokens with the browser session they came from, which ends
+    within the week), and the week isn't up; (None, 0) when signed out or expired. One process renews at a
+    time: a refresh token works once, so a second one waiting for the lock takes the first one's result.
+    A renewal that failed for now, while the sign-in itself may be fine, appends why to `problem` (a list)."""
+    def saved():
+        session, now = api_session(), int(time.time())
+        expires, started = session.get('expires_at') or 0, session.get('signed_in_at') or 0
+        token = session.get('token') if expires > now else None
+        dead = bool(rejected) and token == rejected
+        # The last renewal must end by the week's end: an access token lasts an hour.
+        wanted = renew and (dead or expires - now < below) and now + 3600 <= started + API_SESSION_MAX
+        return None if dead else token, expires - now, started, wanted
+
+    def later(why):
+        if problem is not None:
+            problem.append(why)
+
+    token, left, started, wanted = saved()
+    if token and not wanted:  # reading takes no lock: the token and its times are one item
+        return token, left
+    # To renew, and when nothing was read: macOS's `security` can find nothing (or crash) for an instant while
+    # another process updates the item. Never a mix, but not a sign-out either: wait for the writer, read again.
+    with api_lock() as held:
+        token, left, started, wanted = saved()  # again: someone may have renewed while this waited
+        if held is None and wanted:
+            later(f"{STATE} can't be written (fix that)")
+        elif held is False and (wanted or not api_session()):
+            later(f"can't lock {STATE / 'api-session.lock'} (another magehand is renewing)")
+        elif held and wanted:
+            refresh = secret_get('api-refresh-token')
+            if refresh:
+                status, tokens = authentik_token({'grant_type': 'refresh_token', 'refresh_token': refresh,
+                                                  'client_id': API_CLIENT})
+                if status == 200:
+                    try:
+                        # authentik may keep the same refresh token (no new one in the answer): then the week it
+                        # was issued for is the server's own limit, and the saved one stays in use.
+                        if api_store({'refresh_token': refresh, **(tokens or {})}, started):
+                            rejected = None
+                            token, left, started, wanted = saved()
+                    except (OSError, subprocess.SubprocessError) as error:
+                        later(f"can't save the renewed sign-in ({type(error).__name__})")
+                elif status == 0 or status == 429 or status >= 500:
+                    later(f"authentik can't be reached to renew it ({status or 'no answer'})")
+    return (token, left) if token else (None, 0)
+
+
+def api_rejected(token):
+    """Whether authentik says it no longer knows this access token (it can be gone before its hour is up). False
+    when authentik can't be asked."""
+    req = urllib.request.Request(f'{AUTHENTIK}/application/o/userinfo/',
+                                 headers={'Authorization': f'Bearer {token}', 'User-Agent': 'magehand'})
+    try:
+        with no_redirect_open(req, timeout=15) as resp:
+            return resp.status == 401
+    except (OSError, http.client.HTTPException):
+        return False
+
+
+def api_left(problem=None):
+    """Seconds left on the app-API sign-in (renewing it, and asking authentik whether it still knows the token),
+    or None when signed out, or when it can't be renewed for now (then why is appended to `problem`)."""
+    token, left = api_token(problem=problem)
+    if token and api_rejected(token):
+        token, left = api_token(rejected=token, problem=problem)
     return left if token else None
 
 
-def api_session_token(below=API_RENEW_BELOW, need=0):
+def api_session_token(below=API_RENEW_BELOW, need=0, failed=None):
     """(app-API access token, seconds left), with at least `need` seconds left, or exit saying how to sign in. In
     a terminal it offers to sign in now; that dialogue and the login's output go to stderr, so stdout stays the
-    command's result (a token captured by `$(magehand api token)`, a response body, JSON)."""
-    token, left = api_token(below=below)
+    command's result (a token captured by `$(magehand api token)`, a response body, JSON). With `failed` (a list),
+    a renewal that failed for now is appended there and (None, 0) returned, for a caller that reports it itself."""
+    problem = []
+    token, left = api_token(below=below, problem=problem)
+    if (not token or left < need) and problem:  # for now only: a passkey tap would fix nothing
+        if failed is not None:
+            failed.append(problem[0])
+            return None, 0
+        die(f'the app-API sign-in can\'t be renewed right now: {problem[0]}. Try again shortly')
     if (not token or left < need) and sys.stdin.isatty() and sys.stderr.isatty():
         why = 'not signed in for app APIs' if not token else (
             f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed')
@@ -871,13 +1004,15 @@ def api_session_token(below=API_RENEW_BELOW, need=0):
                 cmd_login(None)
             token, left = api_token(below=below)
     if not token:
-        die('not signed in for app APIs, or the 8 hours are up: run `magehand login` '
+        die('not signed in for app APIs, or the sign-in ended (a week at most): run `magehand login` '
             '(an agent: ask the owner to run it)')
     if left < need:
-        die(f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed (the 8 hours since '
-            'sign-in are nearly up, or authentik refused): run `magehand login` (an agent: ask the owner)')
+        die(f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed (the week since '
+            'sign-in is nearly up, or authentik refused): run `magehand login` (an agent: ask the owner)')
     if left < SIGNIN_WARN:
-        print(f'magehand: app-API sign-in has {minutes(left)} left; `magehand login` renews it', file=sys.stderr)
+        print(f'magehand: app-API token has {minutes(left)} left and '
+              + (f"can't be renewed right now ({problem[0]}); it is tried again at the next command" if problem
+                 else "can't be renewed; `magehand login` renews it"), file=sys.stderr)
     return token, left
 
 
@@ -886,6 +1021,13 @@ def api_print_token(a):
     the 1-hour access token, renewed first so at least 10 minutes are left; the refresh token never leaves
     the Keychain."""
     token, left = api_session_token(below=SIGNIN_WARN, need=SIGNIN_WARN)
+    if api_rejected(token):
+        problem = []
+        token, left = api_token(below=SIGNIN_WARN, rejected=token, problem=problem)
+        if not token and problem:
+            die(f'the app-API sign-in can\'t be renewed right now: {problem[0]}. Try again shortly')
+        if not token:
+            die('authentik ended the app-API sign-in: run `magehand login` (an agent: ask the owner to run it)')
     expires = int(time.time()) + left
     if a.json:
         print(json.dumps({'token': token, 'expires_at': expires, 'seconds_left': left}))
@@ -946,6 +1088,24 @@ def signin_redirect(status, headers):
                                     or where.startswith(AUTHENTIK))
 
 
+def forward_auth_refused(status, headers):
+    """Whether a response looks like forward auth refusing the token: its redirect has an outpost's own callback as
+    the redirect_uri. An app could answer the same, so this only ever re-sends a GET or HEAD."""
+    try:
+        where = urllib.parse.urlsplit(headers.get('Location') or headers.get('location') or '')
+        query = urllib.parse.parse_qs(where.query)
+        (target,) = query.get('redirect_uri', [''])
+        back = urllib.parse.urlsplit(target)
+    except ValueError:
+        return False
+    sign_in = urllib.parse.urlsplit(AUTHENTIK).netloc
+    return (300 <= status < 400 and where.netloc == sign_in
+            and where.path.rstrip('/') == '/application/o/authorize'
+            and back.netloc in (sign_in, f'auth.{LAB}', f'auth-dev.{LAB}')
+            and back.path == '/outpost.goauthentik.io/callback'
+            and API_CALLBACK_SIGNATURE in urllib.parse.parse_qs(back.query))
+
+
 def cmd_api(a):
     if a.path == 'token':
         api_print_token(a)
@@ -981,10 +1141,28 @@ def cmd_api(a):
         print(f'magehand: {method} to production: this changes {name}\'s real data, as you', file=sys.stderr)
     # Cloudflare (public production hosts) refuses Python's default User-Agent with a 403.
     headers = dict({'User-Agent': 'magehand'}, **extra)
-    headers['Authorization'] = f'Bearer {api_session_token()[0]}'
-    started, deadline = time.monotonic(), time.monotonic() + a.wait
-    error = None
-    while True:
+    failed = []
+    token = api_session_token(failed=failed)[0]
+    started = time.monotonic()
+    status, got, data, error = 0, {}, b'', None
+    if not token and failed:
+        error = 'renewal_failed'
+        print(f"magehand: the app-API sign-in can't be renewed right now: {failed[0]}. Try again shortly"
+              ' (nothing was sent)', file=sys.stderr)
+    replayable = method in ('GET', 'HEAD')
+    # A write is never sent twice: a redirect can't prove the app didn't run it. So its token is checked first.
+    if not error and not replayable and api_rejected(token):
+        problem = []
+        token = api_token(rejected=token, problem=problem)[0]
+        if not token:
+            error = 'renewal_failed' if problem else 'signed_out'
+            print('magehand: ' + (f"the app-API sign-in can't be renewed right now: {problem[0]}. Try again shortly"
+                                  if problem else 'authentik ended the app-API sign-in; run `magehand login`')
+                  + ' (nothing was sent)', file=sys.stderr)
+    headers['Authorization'] = f'Bearer {token}'
+    retried = False
+    deadline = time.monotonic() + a.wait  # from here: checking and renewing the token can't wake the app
+    while not error or error == 'waking':
         try:
             status, got, data = api_call(url, method, headers, body)
         except OSError as failed:
@@ -995,6 +1173,20 @@ def cmd_api(a):
             status, got, data, error = 0, {}, b'', 'unreachable'
             print(f'magehand: cannot reach {url}: {why}', file=sys.stderr)
             break
+        if replayable and not retried and forward_auth_refused(status, got):
+            retried = True
+            problem = []
+            fresh = api_token(rejected=token, problem=problem)[0]
+            if fresh and fresh != token:
+                token = fresh
+                headers['Authorization'] = f'Bearer {token}'
+                deadline = time.monotonic() + a.wait  # the refused request never reached the app to wake it
+                continue
+            if problem:
+                error = 'renewal_failed'
+                print(f"magehand: the app-API sign-in can't be renewed right now: {problem[0]}. Try again shortly",
+                      file=sys.stderr)
+                break
         asleep = not a.prod and status == 200 and SABLIER_PAGE.search(data[:4096])
         if not asleep:
             break
@@ -9297,11 +9489,11 @@ def build_parser():
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
     json_option(p)
     # run it locally
-    p = command('login', cmd_login, 'sign in to OpenBao and app APIs with your passkey', 'sign in through authentik with your passkey: OpenBao (keys for `run`) and app APIs (`api`); 1h, renewed up to 8h',
-                'One sign-in per machine, for every app. The session is an hour, renewed by itself while you use\n'
-                'magehand (when under 30 minutes are left), up to 8 hours after you signed in: about one passkey\n'
-                'tap a working day. Commands that need it show the time left and, in a terminal, offer to sign\n'
-                'in again when it has expired. An agent cannot tap the passkey: check first (a check renews too).\n\n'
+    p = command('login', cmd_login, 'sign in to OpenBao and app APIs with your passkey', 'sign in through authentik with your passkey: OpenBao (keys for `run`) and app APIs (`api`); up to a week',
+                'One sign-in per machine, for every app, for as long as the homelab allows (up to a week; a\n'
+                'shorter session is renewed while you use it). App-API tokens last an hour and renew by themselves.\n'
+                'Commands that need it show the time left and, in a terminal, offer to sign in again when it\n'
+                'has expired. An agent cannot tap the passkey: check first (a check renews too).\n\n'
                 'examples:\n  magehand login\n  magehand login --check            exit 1 unless signed in, 10+ min left\n'
                 '  magehand login --check --min 30 --json')
     p.add_argument('--check', action='store_true', help='only report the time left (exit 1 when signed out or low)')
