@@ -5607,7 +5607,7 @@ class SignIn(unittest.TestCase):
         self.names = ('bao', 'saved_token', 'cmd_login', 'api_left')
         self.saved = {n: getattr(magehand, n) for n in self.names}
         self.ttl = {'tok': 720}
-        magehand.api_left = lambda: 1500
+        magehand.api_left = lambda problem=None: 1500
         magehand.saved_token = lambda: 'tok'
         magehand.bao = lambda method, path, token=None, body=None, soft=False: (
             (200, {'data': {'ttl': self.ttl[token]}}) if token in self.ttl else (403, None))
@@ -5985,6 +5985,45 @@ class AppApiSession(unittest.TestCase):
                 mock.patch.object(magehand, 'authentik_token', lambda form: (400, None)):
             self.assertIsNone(magehand.api_left())
 
+    def test_login_check_says_cant_tell_during_a_blip(self):
+        self.session(86400, 3000)
+        problem = []
+        with mock.patch.object(magehand, 'api_rejected', lambda token: token == 'old-access'), \
+                mock.patch.object(magehand, 'authentik_token', lambda form: (0, None)):
+            self.assertIsNone(magehand.api_left(problem))
+            self.assertTrue(problem)
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(magehand, 'saved_token', lambda: 't'), \
+                    mock.patch.object(magehand, 'signin_left', lambda *a, **k: 86400), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as done:
+                magehand.main(['login', '--check', '--json'])
+        got = json.loads(out.getvalue())
+        self.assertEqual((done.exception.code, got['api_signed_in']), (0, False))
+        self.assertIn('reached', got['api_unavailable'])
+
+    def test_a_reader_never_pairs_a_new_token_with_old_times(self):
+        self.session(86400, 700)
+        half = threading.Event()
+        put = self.store.__setitem__
+
+        def slow_put(account, token, what=''):
+            put(account, token)
+            if account == 'api-access-token':
+                half.set()
+                time.sleep(0.2)  # between the token and its times
+        with mock.patch.object(magehand, 'secret_put', slow_put):
+            def login():
+                with magehand.api_lock():
+                    magehand.api_store({'access_token': 'fresh', 'refresh_token': 'r2', 'expires_in': 3600},
+                                       int(time.time()))
+            writer = threading.Thread(target=login)
+            writer.start()
+            half.wait(5)
+            token, left = magehand.api_token(renew=False)
+            writer.join()
+        self.assertEqual(token, 'fresh')
+        self.assertGreater(left, 3500)
+
     def test_api_token_never_prints_a_token_authentik_dropped(self):
         self.session(86400, 3000)
         with mock.patch.object(magehand, 'api_rejected', lambda token: token == 'old-access'):
@@ -6224,18 +6263,48 @@ class AppApi(unittest.TestCase):
         return 302, {'Location': f'{magehand.AUTHENTIK}/application/o/authorize?redirect_uri=' + urllib.parse.quote(
             f'https://auth-dev.{magehand.LAB}/outpost.goauthentik.io/callback?X-authentik-auth-callback=true', safe='')}, b''
 
-    def test_a_token_forward_auth_dropped_is_renewed_and_the_request_sent_again_once(self):
+    def test_a_token_forward_auth_dropped_is_renewed_and_a_read_sent_again_once(self):
         asked = []
         with mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: asked.append(rejected) or ('new', 3600)):
             self.replies = [self.refusal(), (200, {}, b'{}')]
-            self.assertEqual(self.run_main('api', '-a', 'demo', '/x', '-d', '{"a": 1}')[0], 0)
-            self.assertEqual([(m, b) for _, m, _, b in self.calls], [('POST', b'{"a": 1}')] * 2)
+            self.assertEqual(self.run_main('api', '-a', 'demo', '/x')[0], 0)
+            self.assertEqual([m for _, m, _, _ in self.calls], ['GET'] * 2)
             self.assertEqual(self.calls[-1][2]['Authorization'], 'Bearer new')
             self.assertEqual(asked, ['tok'])
             self.calls.clear()
             self.replies = [self.refusal(), self.refusal()]
             self.run_main('api', '-a', 'demo', '/x')
             self.assertEqual(len(self.calls), 2)  # never a third
+
+    def test_a_write_is_never_sent_twice_even_on_forward_auths_own_redirect(self):
+        asked = []
+        with mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: asked.append(1) or ('new', 3600)):
+            for extra in (('-d', '{}'), ('-X', 'DELETE'), ('-X', 'PUT'), ('-X', 'PATCH'), ('-X', 'POST')):
+                self.calls.clear()
+                self.replies = [self.refusal()]
+                code, _, err = self.run_main('api', '-a', 'demo', '/x', *extra)
+                self.assertEqual((code, len(self.calls), asked), (1, 1, []), extra)
+
+    def test_a_write_gets_a_fresh_token_before_it_is_sent(self):
+        with mock.patch.object(magehand, 'api_rejected', lambda token: token == 'tok'), \
+                mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: ('new', 3600)):
+            self.replies = [(200, {}, b'{}')]
+            self.assertEqual(self.run_main('api', '-a', 'demo', '/x', '-d', '{}')[0], 0)
+        self.assertEqual([c[2]['Authorization'] for c in self.calls], ['Bearer new'])
+
+    def test_a_failed_renewal_still_answers_in_json(self):
+        def blip(rejected=None, problem=None):
+            problem.append("authentik can't be reached to renew it (502)")
+            return None, 0
+        with mock.patch.object(magehand, 'api_rejected', lambda token: True), \
+                mock.patch.object(magehand, 'api_token', blip):
+            for extra, sent in ((('-d', '{}'), 0), ((), 1)):  # a write: before sending; a read: after the refusal
+                self.calls.clear()
+                self.replies = [self.refusal()]
+                code, out, err = self.run_main('api', '-a', 'demo', '/x', '--json', *extra)
+                self.assertEqual((code, json.loads(out)['error'], len(self.calls)), (1, 'renewal_failed', sent))
+                self.assertIn('Try again shortly', err)
+                self.assertNotIn('magehand login', err)
 
     def test_no_second_request_when_renewal_fails(self):
         self.replies = [self.refusal()]
