@@ -5772,9 +5772,7 @@ class AppApiSession(unittest.TestCase):
         now = int(time.time())
         magehand.api_store({'access_token': 'old-access', 'refresh_token': 'old-refresh', 'expires_in': 3600},
                            now - started_ago)
-        data = json.loads((magehand.STATE / 'api-session.json').read_text())
-        data['expires_at'] = now + expires_in
-        (magehand.STATE / 'api-session.json').write_text(json.dumps(data))
+        self.store['api-session'] = f'v1~{now - started_ago}~{now + expires_in}~old-access'
 
     def token(self, reply=(200, {'access_token': 'new-access', 'refresh_token': 'new-refresh', 'expires_in': 3600})):
         def post(form):
@@ -5824,7 +5822,6 @@ class AppApiSession(unittest.TestCase):
         login's own messages must not end up in the token."""
         for extra in ((), ('--json',)):
             self.store.clear()
-            (magehand.STATE / 'api-session.json').unlink(missing_ok=True)
 
             def login(_args):
                 print('Signed in as someone (policy dev-read, 1h).')
@@ -5860,7 +5857,7 @@ class AppApiSession(unittest.TestCase):
         self.assertEqual(self.posts, [{'grant_type': 'refresh_token', 'refresh_token': 'old-refresh',
                                        'client_id': 'magehand'}])
         self.assertEqual(self.store['api-refresh-token'], 'new-refresh')  # authentik rotates it
-        started = json.loads((magehand.STATE / 'api-session.json').read_text())['signed_in_at']
+        started = magehand.api_session()['signed_in_at']
         self.assertLess(started, time.time() - 3500)  # the sign-in time is kept, so the week still counts
 
     def test_not_renewed_past_a_week(self):
@@ -5932,7 +5929,7 @@ class AppApiSession(unittest.TestCase):
                 magehand.api_store({'access_token': 'fresh', 'refresh_token': 'fresh-r', 'expires_in': 3600},
                                    int(time.time()))
             worker.join()
-        self.assertEqual((self.store['api-access-token'], self.store['api-refresh-token']), ('fresh', 'fresh-r'))
+        self.assertEqual((magehand.api_session()['token'], self.store['api-refresh-token']), ('fresh', 'fresh-r'))
         self.assertGreater(magehand.api_session()['signed_in_at'], time.time() - 60)
 
     def test_readers_never_see_half_a_session_file(self):
@@ -6006,28 +6003,96 @@ class AppApiSession(unittest.TestCase):
         self.assertEqual((done.exception.code, got['api_signed_in']), (0, False))
         self.assertIn('reached', got['api_unavailable'])
 
-    def test_a_reader_never_pairs_a_new_token_with_old_times(self):
-        self.session(86400, 700)
-        half = threading.Event()
+    def test_a_reader_never_pairs_a_token_with_another_sign_ins_times(self):
+        """Whatever write a writer stops after, holding the lock or not: all old or all new, and no waiting."""
         put = self.store.__setitem__
+        for stop_before in range(3):
+            self.session(86400, 700)
+            seen, writes = [], []
 
-        def slow_put(account, token, what=''):
-            put(account, token)
-            if account == 'api-access-token':
-                half.set()
-                time.sleep(0.2)  # between the token and its times
-        with mock.patch.object(magehand, 'secret_put', slow_put):
-            def login():
+            def stalling_put(account, token, what='', stop_before=stop_before, seen=seen, writes=writes):
+                if len(writes) == stop_before:
+                    seen.append(magehand.api_token(renew=False))  # a reader, while the writer holds the lock
+                writes.append(account)
+                put(account, token)
+            with mock.patch.object(magehand, 'secret_put', stalling_put), \
+                    mock.patch.object(magehand, 'API_LOCK_WAIT', 5):
+                began = time.monotonic()
                 with magehand.api_lock():
                     magehand.api_store({'access_token': 'fresh', 'refresh_token': 'r2', 'expires_in': 3600},
                                        int(time.time()))
-            writer = threading.Thread(target=login)
-            writer.start()
-            half.wait(5)
-            token, left = magehand.api_token(renew=False)
-            writer.join()
-        self.assertEqual(token, 'fresh')
-        self.assertGreater(left, 3500)
+                    if len(writes) == stop_before:
+                        seen.append(magehand.api_token(renew=False))
+                self.assertLess(time.monotonic() - began, 1)  # the reader didn't wait for the lock
+            token, left = seen[0]
+            if token == 'fresh':
+                self.assertGreater(left, 3500)
+            else:
+                self.assertEqual(token, 'old-access')
+                self.assertLess(left, 701)
+        self.assertEqual(token, 'fresh')  # the last round read after the last write
+
+    def test_a_reader_that_does_not_renew_needs_no_lock(self):
+        self.session(600, 3000)
+        with mock.patch.object(magehand, 'api_lock', mock.Mock(side_effect=AssertionError('took the lock'))):
+            self.assertEqual(self.token()[0], 'old-access')
+
+    def older_release(self, expires_in):
+        now = int(time.time())
+        self.store.update({'api-access-token': 'old-access', 'api-refresh-token': 'old-refresh'})
+        (magehand.STATE / 'api-session.json').write_text(
+            json.dumps({'signed_in_at': now - 3600, 'expires_at': now + expires_in}))
+        return now - 3600
+
+    def test_an_older_releases_sign_in_is_still_read(self):
+        self.older_release(3000)
+        self.assertEqual((self.token()[0], self.posts), ('old-access', []))
+
+    def test_an_older_releases_sign_in_renews_into_the_one_item(self):
+        started = self.older_release(120)
+        self.assertEqual(self.token()[0], 'new-access')
+        self.assertTrue(self.store['api-session'].startswith(f'v1~{started}~'))
+        self.assertFalse((magehand.STATE / 'api-session.json').exists())
+        (magehand.STATE / 'api-session.json').write_text('{"signed_in_at": 1, "expires_at": 2}')
+        self.assertEqual(self.token()[0], 'new-access')  # the item wins over anything left in the old format
+
+    def test_the_item_fits_what_the_keychain_command_takes(self):
+        jwt = '.'.join(('h' * 100, 'p' * 1500, 's' * 683))
+        magehand.api_store({'access_token': jwt, 'refresh_token': 'r', 'expires_in': 3600}, int(time.time()))
+        self.assertLessEqual(len(self.store['api-session']) - len(jwt), 30)
+        self.assertRegex(self.store['api-session'], magehand.TOKEN_CHARS)
+        self.assertEqual(magehand.api_session()['token'], jwt)
+
+    def test_a_read_that_finds_nothing_during_an_update_is_not_a_sign_out(self):
+        self.session(600, 3000)
+        reads = []
+
+        def flaky(account):  # what `security` does now and then while another process updates the item
+            reads.append(account)
+            return None if len(reads) == 1 else self.store.get(account)
+        with mock.patch.object(magehand, 'secret_get', flaky):
+            self.assertEqual(self.token()[0], 'old-access')
+        self.assertEqual(self.posts, [])
+
+    def test_nothing_read_and_no_lock_says_try_again_not_sign_in(self):
+        problem = []
+        with mock.patch.object(magehand, 'API_LOCK_WAIT', 0.2), magehand.api_lock():
+            self.assertEqual(magehand.api_token(problem=problem), (None, 0))
+        self.assertIn('lock', problem[0])
+
+    def test_a_damaged_item_is_signed_out_not_a_crash(self):
+        for item in ('garbage', 'v1~x~y~t', 'v1~1~2', 'v2~1~2~t', 'v1~~~t'):
+            self.store['api-session'] = item
+            self.assertEqual(self.token(), (None, 0), item)
+
+    def test_a_keychain_that_refuses_the_write_is_not_a_crash(self):
+        self.session(86400, 120)
+        refuse = mock.Mock(side_effect=subprocess.CalledProcessError(1, ['security', '-i']))
+        problem = []
+        with mock.patch.object(magehand, 'secret_put', refuse), mock.patch.object(
+                magehand, 'authentik_token', lambda form: (200, {'access_token': 'n', 'expires_in': 3600})):
+            self.assertEqual(magehand.api_token(problem=problem)[0], 'old-access')
+        self.assertIn('save', problem[0])
 
     def test_api_token_never_prints_a_token_authentik_dropped(self):
         self.session(86400, 3000)
@@ -6103,7 +6168,7 @@ class AppApiSession(unittest.TestCase):
         verifier = seen['form']['code_verifier']
         digest = base64.urlsafe_b64encode(__import__('hashlib').sha256(verifier.encode()).digest()).rstrip(b'=')
         self.assertEqual(digest.decode(), seen['code_challenge'])
-        self.assertEqual((self.store['api-access-token'], self.store['api-refresh-token']), ('a', 'r'))
+        self.assertEqual((magehand.api_session()['token'], self.store['api-refresh-token']), ('a', 'r'))
 
     def test_signin_refused_in_the_browser(self):
         class Redirect:
@@ -6316,6 +6381,28 @@ class AppApi(unittest.TestCase):
         with mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: (None, 0)):
             self.run_main('api', '-a', 'demo', '/x')
         self.assertEqual(len(self.calls), 1)
+
+    def test_checking_and_renewing_the_token_do_not_spend_the_wake_budget(self):
+        waking = (200, {}, b'<html>sablier waking</html>')
+        for method, replies in (('POST', [waking, (200, {}, b'{}')]),
+                                ('GET', [self.refusal(), waking, (200, {}, b'{}')])):
+            clock = [1000.0]
+
+            def slow_check(token, clock=clock):
+                clock[0] += 15
+                return True
+
+            def slow_renewal(rejected=None, problem=None, clock=clock):
+                clock[0] += 15
+                return 'new', 3600
+            self.calls.clear()
+            self.replies = list(replies)
+            with mock.patch.object(magehand.time, 'monotonic', lambda clock=clock: clock[0]), \
+                    mock.patch.object(magehand, 'api_rejected', slow_check), \
+                    mock.patch.object(magehand, 'api_token', slow_renewal), \
+                    mock.patch.object(magehand, 'SABLIER_PAGE', __import__('re').compile(b'sablier')):
+                code, _, err = self.run_main('api', '-a', 'demo', '/x', '-X', method, '--wait', '10')
+            self.assertEqual((code, len(self.calls)), (0, len(replies)), err)
 
     def test_an_apps_own_redirect_never_sends_a_write_twice(self):
         asked = []

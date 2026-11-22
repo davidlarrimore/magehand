@@ -762,7 +762,8 @@ def cmd_login(args):
 # `magehand login` signs in to authentik a second time, as magehand's own client, right after the OpenBao
 # sign-in (same browser, step-up just done: no second passkey tap). The access token goes to apps as
 # `Authorization: Bearer` through their forward auth, which accepts it; the app sees the owner's usual
-# X-authentik-* headers. Tokens live in the Keychain; STATE/api-session.json holds only times.
+# X-authentik-* headers. The access token and its two times are one Keychain item, written in one call, so a
+# reader needs no lock and can never pair one sign-in's token with another's times.
 
 AUTHENTIK = os.environ.get('MAGEHAND_AUTHENTIK', 'https://auth.davidlarrimore.com')
 API_CLIENT = 'magehand'
@@ -804,22 +805,36 @@ def authentik_token(form):
         return 0, None
 
 
+API_ITEM = 'api-session'  # 'v1~<signed in at>~<expires at>~<access token>'. Not JSON: `security -i` refuses
+                          # lines over about 4000 characters, and quoting or base64 would spend that on a JWT.
+
+
 def api_session():
-    path = STATE / 'api-session.json'
+    """The app-API sign-in, from one read: {'signed_in_at', 'expires_at', 'token'}; {} when there is none."""
+    item = secret_get(API_ITEM)
+    if item:
+        parts = item.split('~', 3)
+        if len(parts) != 4 or parts[0] != 'v1' or not (parts[1] + parts[2]).isdecimal():
+            return {}
+        return {'signed_in_at': int(parts[1]), 'expires_at': int(parts[2]), 'token': parts[3]}
+    path = STATE / 'api-session.json'  # 0.62 and older: the times here, the token in an item of its own
     try:
         data = json.loads(path.read_text()) if path.is_file() else {}
-    except ValueError:
+    except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    return dict(data, token=secret_get('api-access-token')) if isinstance(data, dict) and data else {}
 
 
 def api_store(tokens, signed_in_at):
+    """Save a sign-in or a renewal (call it holding api_lock). Readers see all of the old one or all of the new:
+    the refresh token, which only a lock holder reads, goes first and the session item last."""
     if not tokens.get('access_token') or not tokens.get('refresh_token'):
         return False
-    secret_put('api-access-token', tokens['access_token'], 'authentik')
-    secret_put('api-refresh-token', tokens['refresh_token'], 'authentik')
     expires = int(time.time()) + int(tokens.get('expires_in') or 3600)
-    replace_file(STATE / 'api-session.json', json.dumps({'signed_in_at': signed_in_at, 'expires_at': expires}))
+    secret_put('api-refresh-token', tokens['refresh_token'], 'authentik')
+    secret_put(API_ITEM, f"v1~{int(signed_in_at)}~{expires}~{tokens['access_token']}", 'authentik')
+    with contextlib.suppress(OSError):  # the older format's times: an item that reads as missing mustn't revive them
+        (STATE / 'api-session.json').unlink()
     return True
 
 
@@ -855,7 +870,11 @@ def api_signin():
     with api_lock() as held:  # not while a renewal of the old sign-in is in flight: it would write over this one
         if not held:
             return False, "not signed in: another magehand holds the sign-in's lock; run `magehand login` again"
-        if not api_store(tokens or {}, int(time.time())):
+        try:
+            stored = api_store(tokens or {}, int(time.time()))
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, f"not signed in: can't save the sign-in ({type(error).__name__})"
+        if not stored:
             return False, f'not signed in: authentik returned no refresh token (HTTP {status})'
     return True, 'signed in (1h tokens, renewed while you use it, for up to a week)'
 
@@ -892,7 +911,7 @@ def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
     def saved():
         session, now = api_session(), int(time.time())
         expires, started = session.get('expires_at') or 0, session.get('signed_in_at') or 0
-        token = secret_get('api-access-token') if expires > now else None
+        token = session.get('token') if expires > now else None
         dead = bool(rejected) and token == rejected
         # The last renewal must end by the week's end: an access token lasts an hour.
         wanted = renew and (dead or expires - now < below) and now + 3600 <= started + API_SESSION_MAX
@@ -902,11 +921,14 @@ def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
         if problem is not None:
             problem.append(why)
 
-    if not api_session():
-        return None, 0
-    with api_lock() as held:  # reading too: a token and its times are stored one after the other
-        token, left, started, wanted = saved()
-        if wanted and not held:
+    token, left, started, wanted = saved()
+    if token and not wanted:  # reading takes no lock: the token and its times are one item
+        return token, left
+    # To renew, and when nothing was read: macOS's `security` can find nothing (or crash) for an instant while
+    # another process updates the item. Never a mix, but not a sign-out either: wait for the writer, read again.
+    with api_lock() as held:
+        token, left, started, wanted = saved()  # again: someone may have renewed while this waited
+        if not held and (wanted or not api_session()):
             later(f"can't lock {STATE / 'api-session.lock'} (another magehand is renewing, or it isn't writable)")
         elif wanted:
             refresh = secret_get('api-refresh-token')
@@ -920,8 +942,8 @@ def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
                         if api_store({'refresh_token': refresh, **(tokens or {})}, started):
                             rejected = None
                             token, left, started, wanted = saved()
-                    except OSError as error:
-                        later(f"can't save the renewed sign-in in {STATE} ({type(error).__name__})")
+                    except (OSError, subprocess.SubprocessError) as error:
+                        later(f"can't save the renewed sign-in ({type(error).__name__})")
                 elif status == 0 or status == 429 or status >= 500:
                     later(f"authentik can't be reached to renew it ({status or 'no answer'})")
     return (token, left) if token else (None, 0)
@@ -1101,7 +1123,7 @@ def cmd_api(a):
     # Cloudflare (public production hosts) refuses Python's default User-Agent with a 403.
     headers = dict({'User-Agent': 'magehand'}, **extra)
     token = api_session_token()[0]
-    started, deadline = time.monotonic(), time.monotonic() + a.wait
+    started = time.monotonic()
     status, got, data, error = 0, {}, b'', None
     replayable = method in ('GET', 'HEAD')
     # A write is never sent twice: a redirect can't prove the app didn't run it. So its token is checked first.
@@ -1115,6 +1137,7 @@ def cmd_api(a):
                   + ' (nothing was sent)', file=sys.stderr)
     headers['Authorization'] = f'Bearer {token}'
     retried = False
+    deadline = time.monotonic() + a.wait  # from here: checking and renewing the token can't wake the app
     while not error or error == 'waking':
         try:
             status, got, data = api_call(url, method, headers, body)
@@ -1133,6 +1156,7 @@ def cmd_api(a):
             if fresh and fresh != token:
                 token = fresh
                 headers['Authorization'] = f'Bearer {token}'
+                deadline = time.monotonic() + a.wait  # the refused request never reached the app to wake it
                 continue
             if problem:
                 error = 'renewal_failed'
