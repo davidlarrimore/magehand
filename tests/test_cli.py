@@ -5847,11 +5847,11 @@ class AppApiSession(unittest.TestCase):
             self.assertIn('Signed in as someone', err.getvalue())
 
     def test_a_caller_can_ask_for_more_time_left(self):
-        self.session(600, 500)  # 8 min left: fine for a request, too little for a printed token
+        self.session(600, 700)  # over the 10 minutes a request renews at
         self.assertEqual(self.token()[0], 'old-access')
         with mock.patch.object(magehand, 'authentik_token', lambda form: self.posts.append(form) or
                                (200, {'access_token': 'new-access', 'refresh_token': 'r2', 'expires_in': 3600})):
-            self.assertEqual(magehand.api_token(below=600)[0], 'new-access')
+            self.assertEqual(magehand.api_token(below=900)[0], 'new-access')
 
     def test_renewed_when_low_with_the_refresh_token(self):
         self.session(3600, 120)
@@ -5910,6 +5910,81 @@ class AppApiSession(unittest.TestCase):
                 worker.join()
         self.assertEqual((got, len(self.posts)), (['new-access'] * 5, 1))
 
+    def test_a_login_during_a_renewal_wins(self):
+        self.session(6 * 86400, -5)
+        renewing = threading.Event()
+
+        def post(form):
+            renewing.set()
+            time.sleep(0.3)
+            return 200, {'access_token': 'old-chain', 'refresh_token': 'old-chain-r', 'expires_in': 3600}
+        with mock.patch.object(magehand, 'authentik_token', post):
+            worker = threading.Thread(target=magehand.api_token)
+            worker.start()
+            renewing.wait(5)
+            with magehand.api_lock() as held:  # what api_signin does
+                self.assertTrue(held)
+                magehand.api_store({'access_token': 'fresh', 'refresh_token': 'fresh-r', 'expires_in': 3600},
+                                   int(time.time()))
+            worker.join()
+        self.assertEqual((self.store['api-access-token'], self.store['api-refresh-token']), ('fresh', 'fresh-r'))
+        self.assertGreater(magehand.api_session()['signed_in_at'], time.time() - 60)
+
+    def test_readers_never_see_half_a_session_file(self):
+        self.session(600, 3000)
+        seen = []
+        stop = threading.Event()
+
+        def read():
+            while not stop.is_set():
+                seen.append(bool(magehand.api_session()))
+        reader = threading.Thread(target=read)
+        reader.start()
+        for _ in range(400):
+            magehand.api_store({'access_token': 'a', 'refresh_token': 'r', 'expires_in': 3600}, 1)
+        stop.set()
+        reader.join()
+        self.assertTrue(all(seen))
+
+    def test_a_blip_is_not_the_end_of_the_sign_in(self):
+        for status in (0, 429, 502):
+            self.session(86400, -5)
+            problem = []
+            with mock.patch.object(magehand, 'authentik_token', lambda form, status=status: (status, None)):
+                self.assertEqual(magehand.api_token(problem=problem), (None, 0))
+            self.assertTrue(problem, status)
+            code, out, err = self.print_token(reply=(status, None))
+            self.assertEqual((code, out), (1, ''))
+            self.assertIn('Try again shortly', err)
+            self.assertNotIn('magehand login', err)
+
+    def test_a_refusal_is_the_end_of_the_sign_in(self):
+        self.session(86400, -5)
+        problem = []
+        with mock.patch.object(magehand, 'authentik_token', lambda form: (400, None)):
+            magehand.api_token(problem=problem)
+        self.assertEqual(problem, [])
+
+    def test_a_stuck_lock_holder_does_not_hang_the_others(self):
+        self.session(86400, 120)
+        problem = []
+        with mock.patch.object(magehand, 'API_LOCK_WAIT', 0.2), magehand.api_lock() as held:
+            self.assertTrue(held)
+            self.assertEqual(magehand.api_token(problem=problem)[0], 'old-access')  # still valid: used
+        self.assertIn('lock', problem[0])
+
+    def test_an_unwritable_state_directory_uses_the_token_it_has(self):
+        self.session(86400, 120)
+        magehand.STATE.chmod(0o500)
+        self.addCleanup(magehand.STATE.chmod, 0o700)
+        self.assertEqual(self.token()[0], 'old-access')
+
+    def test_login_check_sees_a_dropped_token(self):
+        self.session(86400, 3000)
+        with mock.patch.object(magehand, 'api_rejected', lambda token: token == 'old-access'), \
+                mock.patch.object(magehand, 'authentik_token', lambda form: (400, None)):
+            self.assertIsNone(magehand.api_left())
+
     def test_api_token_never_prints_a_token_authentik_dropped(self):
         self.session(86400, 3000)
         with mock.patch.object(magehand, 'api_rejected', lambda token: token == 'old-access'):
@@ -5922,16 +5997,23 @@ class AppApiSession(unittest.TestCase):
 
     def test_only_forward_auths_own_redirect_is_safe_to_retry(self):
         refusal = (f'{magehand.AUTHENTIK}/application/o/authorize?client_id=x&redirect_uri='
-                   + urllib.parse.quote('https://auth-dev.example.com/outpost.goauthentik.io/callback', safe=''))
+                   + urllib.parse.quote(f'https://auth-dev.{magehand.LAB}/outpost.goauthentik.io/callback?X-authentik-auth-callback=true', safe=''))
         self.assertTrue(magehand.forward_auth_refused(302, {'Location': refusal}))
         for status, where in ((200, refusal), (302, '/login'), (302, magehand.AUTHENTIK + '/if/flow/x/'),
                               (302, f'{magehand.AUTHENTIK}/application/o/authorize?client_id=an-app'),
                               (302, 'https://example.com/outpost.goauthentik.io/callback'),
-                              (302, 'https://example.com/application/o/authorize?r=/outpost.goauthentik.io/callback')):
+                              (302, 'https://example.com/application/o/authorize?r=/outpost.goauthentik.io/callback'),
+                              # an app's own sign-in that echoes the callback's path, or sends it to its own host
+                              (302, f'{magehand.AUTHENTIK}/application/o/authorize/?client_id=app&state='
+                                    '%2Foutpost.goauthentik.io%2Fcallback%3FX-authentik-auth-callback%3Dtrue'),
+                              (302, f'{magehand.AUTHENTIK}/application/o/authorize/?redirect_uri=' + urllib.parse.quote(
+                                  'https://app.example.com/outpost.goauthentik.io/callback?X-authentik-auth-callback=true',
+                                  safe=''))):
             self.assertFalse(magehand.forward_auth_refused(status, {'Location': where}), (status, where))
 
     def test_time_left_reads_in_days_and_hours(self):
-        for seconds, words in ((59, 'under 1 min'), (3600, '60 min'), (3 * 3600, '3 h'), (7 * 86400, '7 days')):
+        for seconds, words in ((59, 'under 1 min'), (3600, '60 min'), (3 * 3600, '3 h'), (7 * 86400, '7 days'), (7 * 86400 - 1, '7 days'),
+                               (6 * 86400 + 5 * 3600, '6 days 5 h')):
             self.assertEqual(magehand.minutes(seconds), words)
 
     def test_expired_and_refused_is_signed_out(self):
@@ -6132,7 +6214,7 @@ class AppApi(unittest.TestCase):
 
     def test_token_when_signed_out(self):
         with mock.patch.object(magehand, 'api_session_token', self.real_session_token), \
-                mock.patch.object(magehand, 'api_token', lambda renew=True, below=300: (None, 0)), \
+                mock.patch.object(magehand, 'api_token', lambda renew=True, below=600, problem=None: (None, 0)), \
                 mock.patch.object(magehand.sys.stdin, 'isatty', lambda: False):
             code, out, err = self.run_main('api', 'token')
         self.assertEqual((code, out), (1, ''))
@@ -6140,11 +6222,11 @@ class AppApi(unittest.TestCase):
 
     def refusal(self):
         return 302, {'Location': f'{magehand.AUTHENTIK}/application/o/authorize?redirect_uri=' + urllib.parse.quote(
-            'https://auth-dev.example.com/outpost.goauthentik.io/callback', safe='')}, b''
+            f'https://auth-dev.{magehand.LAB}/outpost.goauthentik.io/callback?X-authentik-auth-callback=true', safe='')}, b''
 
     def test_a_token_forward_auth_dropped_is_renewed_and_the_request_sent_again_once(self):
         asked = []
-        with mock.patch.object(magehand, 'api_token', lambda rejected=None: asked.append(rejected) or ('new', 3600)):
+        with mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: asked.append(rejected) or ('new', 3600)):
             self.replies = [self.refusal(), (200, {}, b'{}')]
             self.assertEqual(self.run_main('api', '-a', 'demo', '/x', '-d', '{"a": 1}')[0], 0)
             self.assertEqual([(m, b) for _, m, _, b in self.calls], [('POST', b'{"a": 1}')] * 2)
@@ -6157,7 +6239,7 @@ class AppApi(unittest.TestCase):
 
     def test_no_second_request_when_renewal_fails(self):
         self.replies = [self.refusal()]
-        with mock.patch.object(magehand, 'api_token', lambda rejected=None: (None, 0)):
+        with mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: (None, 0)):
             self.run_main('api', '-a', 'demo', '/x')
         self.assertEqual(len(self.calls), 1)
 
@@ -6166,7 +6248,7 @@ class AppApi(unittest.TestCase):
         for where in ('/done', f'{magehand.AUTHENTIK}/if/flow/sign-out/'):
             self.calls.clear()
             self.replies = [(302, {'Location': where}, b'')]
-            with mock.patch.object(magehand, 'api_token', lambda rejected=None: asked.append(1) or ('new', 3600)):
+            with mock.patch.object(magehand, 'api_token', lambda rejected=None, problem=None: asked.append(1) or ('new', 3600)):
                 self.run_main('api', '-a', 'demo', '/x', '-d', '{}')
             self.assertEqual((len(self.calls), asked), (1, []))
 
