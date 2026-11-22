@@ -5,6 +5,7 @@ import contextlib
 import datetime
 import errno
 import fcntl
+import http.client
 import http.server
 import io
 import json
@@ -6080,8 +6081,52 @@ class AppApiSession(unittest.TestCase):
             self.assertEqual(magehand.api_token(problem=problem), (None, 0))
         self.assertIn('lock', problem[0])
 
+    def test_signed_out_with_an_unwritable_state_directory_says_sign_in(self):
+        magehand.STATE.chmod(0o500)
+        self.addCleanup(magehand.STATE.chmod, 0o700)
+        problem = []
+        self.assertEqual(magehand.api_token(problem=problem), (None, 0))
+        self.assertEqual(problem, [])  # not "try again shortly": that would never work
+
+    def test_authentik_answering_garbage_is_not_a_crash(self):
+        with mock.patch.object(magehand, 'no_redirect_open', mock.Mock(side_effect=http.client.BadStatusLine('x'))):
+            self.assertFalse(magehand.api_rejected('t'))
+
+    def test_an_expired_token_and_a_blip_still_answer_in_json(self):
+        self.session(86400, -5)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(magehand, 'authentik_token', lambda form: (502, None)), \
+                mock.patch.object(magehand, 'scoped_app', lambda *a, **k: 'demo'), \
+                mock.patch.object(magehand, 'api_call', mock.Mock(side_effect=AssertionError('sent'))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            magehand.main(['api', '-a', 'demo', '/x', '--json'])
+        self.assertEqual(json.loads(out.getvalue())['error'], 'renewal_failed')
+        self.assertNotIn('magehand login', err.getvalue())
+
+    def test_login_check_shows_the_week_not_the_tokens_hour(self):
+        self.session(86400, 1500)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(magehand, 'api_rejected', lambda token: False), \
+                mock.patch.object(magehand, 'saved_token', lambda: 't'), \
+                mock.patch.object(magehand, 'signin_left', lambda *a, **k: 6 * 86400), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            magehand.main(['login', '--check'])
+        self.assertIn('signed in, 6 days left (its token renews itself)', err.getvalue())
+
+    def test_a_blip_with_a_little_time_left_never_says_log_in(self):
+        self.session(86400, 300)
+        err = io.StringIO()
+        with mock.patch.object(magehand, 'authentik_token', lambda form: (502, None)), contextlib.redirect_stderr(err):
+            self.assertEqual(magehand.api_session_token()[0], 'old-access')
+        self.assertNotIn('magehand login', err.getvalue())
+
+    def test_a_line_the_keychain_command_would_split_is_never_run(self):
+        with mock.patch.object(magehand.subprocess, 'run') as run, self.assertRaises(OSError):
+            magehand.keychain_add('a' * magehand.SECURITY_LINE_MAX, 'api-session', 'authentik')
+        run.assert_not_called()
+
     def test_a_damaged_item_is_signed_out_not_a_crash(self):
-        for item in ('garbage', 'v1~x~y~t', 'v1~1~2', 'v2~1~2~t', 'v1~~~t'):
+        for item in ('garbage', 'v1~x~y~t', 'v1~1~2', 'v2~1~2~t', 'v1~~~t', 'v1~1795000000~~t', 'v1~~1795000000~t'):
             self.store['api-session'] = item
             self.assertEqual(self.token(), (None, 0), item)
 
@@ -6188,7 +6233,7 @@ class AppApi(unittest.TestCase):
         self.calls = []
         self.replies = []
         self.real_session_token = magehand.api_session_token
-        for name, value in (('api_session_token', lambda below=300, need=0: ('tok', 3000)), ('app_checkout', lambda root=None: None),
+        for name, value in (('api_session_token', lambda below=300, need=0, failed=None: ('tok', 3000)), ('app_checkout', lambda root=None: None),
                             ('current_app', lambda root=None: 'demo'), ('api_call', self.fake_call),
                             ('api_rejected', lambda token: False)):
             patch = mock.patch.object(magehand, name, value)

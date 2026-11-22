@@ -541,12 +541,17 @@ TOKEN_CHARS = re.compile(r'^[A-Za-z0-9._~+/=-]+$')  # what an OpenBao token is m
 _warned_env = []
 
 
+SECURITY_LINE_MAX = 4000  # `security -i` splits a longer line and runs its first part: a truncated write
+
+
 def keychain_add(token, account='openbao-token', what='OpenBao'):
     """Put the token in the macOS Keychain without it ever being an argument: `security -i` reads the
     command from stdin, so `ps` never shows the token."""
     if not TOKEN_CHARS.match(token):
         die(f'{what} returned a token in a form magehand will not store; sign in again: magehand login')
     command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w {token}\n'
+    if len(command) > SECURITY_LINE_MAX:
+        raise OSError(f'{what} returned a token too long for the Keychain command; nothing was written')
     subprocess.run(['security', '-i'], input=command, text=True,  # nosec B603 B607
                    check=True, capture_output=True)
 
@@ -679,16 +684,20 @@ def login_check(a):
     ok = left is not None and left >= need
     problem = []
     api = api_left(problem) if left is not None else None
-    unavailable = problem[0] if problem and api is None else None  # for now: signing in would fix nothing
+    unavailable = problem[0] if problem else None  # for now: signing in would fix nothing
+    until = 0  # how long it keeps renewing itself: what decides whether to ask for a sign-in
+    if api is not None:
+        until = max(api, (api_session().get('signed_in_at') or 0) + API_SESSION_MAX - int(time.time()))
     if a.json:
         print(json.dumps({'signed_in': left is not None, 'seconds_left': left or 0, 'min_minutes': a.min, 'ok': ok,
                           'api_signed_in': api is not None, 'api_seconds_left': api or 0,
-                          'api_unavailable': unavailable}))
+                          'api_renewable_seconds_left': until, 'api_unavailable': unavailable}))
     elif left is None:
         print('magehand: not signed in: run `magehand login`', file=sys.stderr)
     else:
         print(f'signed in, {minutes(left)} left' + ('' if ok else f' (less than {a.min} min): run `magehand login`'))
-        print('app APIs: ' + (f'{minutes(api)} left' if api is not None
+        print('app APIs: ' + (f'signed in, {minutes(until)} left (its token renews itself)'
+                              + (f"; can't renew right now ({unavailable})" if unavailable else '') if api is not None
                               else f"can't tell right now ({unavailable}); try again shortly" if unavailable
                               else 'signed out (`magehand login`)'), file=sys.stderr)
     sys.exit(0 if ok else 1)
@@ -801,12 +810,12 @@ def authentik_token(form):
             return resp.status, json.loads(resp.read() or b'{}')
     except urllib.error.HTTPError as error:
         return error.code, None
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return 0, None
 
 
-API_ITEM = 'api-session'  # 'v1~<signed in at>~<expires at>~<access token>'. Not JSON: `security -i` refuses
-                          # lines over about 4000 characters, and quoting or base64 would spend that on a JWT.
+API_ITEM = 'api-session'  # 'v1~<signed in at>~<expires at>~<access token>'. Not JSON: a `security -i` line has
+                          # SECURITY_LINE_MAX characters, and quoting or base64 would spend that on a JWT.
 
 
 def api_session():
@@ -814,7 +823,7 @@ def api_session():
     item = secret_get(API_ITEM)
     if item:
         parts = item.split('~', 3)
-        if len(parts) != 4 or parts[0] != 'v1' or not (parts[1] + parts[2]).isdecimal():
+        if len(parts) != 4 or parts[0] != 'v1' or not (parts[1].isdecimal() and parts[2].isdecimal()):
             return {}
         return {'signed_in_at': int(parts[1]), 'expires_at': int(parts[2]), 'token': parts[3]}
     path = STATE / 'api-session.json'  # 0.62 and older: the times here, the token in an item of its own
@@ -868,6 +877,8 @@ def api_signin():
     if status != 200:
         return False, f'not signed in: authentik refused the token (HTTP {status})'
     with api_lock() as held:  # not while a renewal of the old sign-in is in flight: it would write over this one
+        if held is None:
+            return False, f"not signed in: {STATE} can't be written; fix that, then run `magehand login` again"
         if not held:
             return False, "not signed in: another magehand holds the sign-in's lock; run `magehand login` again"
         try:
@@ -882,12 +893,12 @@ def api_signin():
 @contextlib.contextmanager
 def api_lock():
     """The app-API sign-in's lock, shared by every magehand on the machine: True once held, False when it can't be
-    had in API_LOCK_WAIT seconds or the state directory can't be written."""
+    had in API_LOCK_WAIT seconds, None when the state directory can't be written (waiting won't fix that)."""
     try:
         STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock = (STATE / 'api-session.lock').open('a')
     except OSError:
-        yield False
+        yield None
         return
     with lock:
         deadline, held = time.monotonic() + API_LOCK_WAIT, False
@@ -928,9 +939,11 @@ def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
     # another process updates the item. Never a mix, but not a sign-out either: wait for the writer, read again.
     with api_lock() as held:
         token, left, started, wanted = saved()  # again: someone may have renewed while this waited
-        if not held and (wanted or not api_session()):
-            later(f"can't lock {STATE / 'api-session.lock'} (another magehand is renewing, or it isn't writable)")
-        elif wanted:
+        if held is None and wanted:
+            later(f"{STATE} can't be written (fix that)")
+        elif held is False and (wanted or not api_session()):
+            later(f"can't lock {STATE / 'api-session.lock'} (another magehand is renewing)")
+        elif held and wanted:
             refresh = secret_get('api-refresh-token')
             if refresh:
                 status, tokens = authentik_token({'grant_type': 'refresh_token', 'refresh_token': refresh,
@@ -957,7 +970,7 @@ def api_rejected(token):
     try:
         with no_redirect_open(req, timeout=15) as resp:
             return resp.status == 401
-    except OSError:
+    except (OSError, http.client.HTTPException):
         return False
 
 
@@ -970,13 +983,17 @@ def api_left(problem=None):
     return left if token else None
 
 
-def api_session_token(below=API_RENEW_BELOW, need=0):
+def api_session_token(below=API_RENEW_BELOW, need=0, failed=None):
     """(app-API access token, seconds left), with at least `need` seconds left, or exit saying how to sign in. In
     a terminal it offers to sign in now; that dialogue and the login's output go to stderr, so stdout stays the
-    command's result (a token captured by `$(magehand api token)`, a response body, JSON)."""
+    command's result (a token captured by `$(magehand api token)`, a response body, JSON). With `failed` (a list),
+    a renewal that failed for now is appended there and (None, 0) returned, for a caller that reports it itself."""
     problem = []
     token, left = api_token(below=below, problem=problem)
     if (not token or left < need) and problem:  # for now only: a passkey tap would fix nothing
+        if failed is not None:
+            failed.append(problem[0])
+            return None, 0
         die(f'the app-API sign-in can\'t be renewed right now: {problem[0]}. Try again shortly')
     if (not token or left < need) and sys.stdin.isatty() and sys.stderr.isatty():
         why = 'not signed in for app APIs' if not token else (
@@ -993,7 +1010,9 @@ def api_session_token(below=API_RENEW_BELOW, need=0):
         die(f'the app-API sign-in has only {minutes(left)} left and can\'t be renewed (the week since '
             'sign-in is nearly up, or authentik refused): run `magehand login` (an agent: ask the owner)')
     if left < SIGNIN_WARN:
-        print(f'magehand: app-API sign-in has {minutes(left)} left; `magehand login` renews it', file=sys.stderr)
+        print(f'magehand: app-API token has {minutes(left)} left and '
+              + (f"can't be renewed right now ({problem[0]}); it is tried again at the next command" if problem
+                 else "can't be renewed; `magehand login` renews it"), file=sys.stderr)
     return token, left
 
 
@@ -1122,12 +1141,17 @@ def cmd_api(a):
         print(f'magehand: {method} to production: this changes {name}\'s real data, as you', file=sys.stderr)
     # Cloudflare (public production hosts) refuses Python's default User-Agent with a 403.
     headers = dict({'User-Agent': 'magehand'}, **extra)
-    token = api_session_token()[0]
+    failed = []
+    token = api_session_token(failed=failed)[0]
     started = time.monotonic()
     status, got, data, error = 0, {}, b'', None
+    if not token and failed:
+        error = 'renewal_failed'
+        print(f"magehand: the app-API sign-in can't be renewed right now: {failed[0]}. Try again shortly"
+              ' (nothing was sent)', file=sys.stderr)
     replayable = method in ('GET', 'HEAD')
     # A write is never sent twice: a redirect can't prove the app didn't run it. So its token is checked first.
-    if not replayable and api_rejected(token):
+    if not error and not replayable and api_rejected(token):
         problem = []
         token = api_token(rejected=token, problem=problem)[0]
         if not token:
