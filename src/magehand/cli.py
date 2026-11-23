@@ -258,7 +258,7 @@ class PinnedApp(Exception):
 
 
 def pinned_source(spec):
-    """The `source: {repo, ref, image}` of a pinned app.yaml (docs/pinned-refs-plan.md), or None."""
+    """The `source: {repo, ref, image}` of a pinned app.yaml (homelab docs/app-deployment.md), or None."""
     source = (spec or {}).get('source')
     return source if isinstance(source, dict) and source.get('ref') else None
 
@@ -1263,17 +1263,14 @@ def search_sections(pages, query, limit=3):
 
 
 def guide_pages(topics):
-    pages = {t: github_file(APPS_REPO, f'docs/platform/{t}.md') for t in topics}
-    pages['homelab-apps AGENTS.md'] = github_file(APPS_REPO, 'AGENTS.md')
-    return pages
+    return {t: github_file(APPS_REPO, f'docs/platform/{t}.md') for t in topics}
 
 
 def cmd_guide(a):
     args = ([a.topic] if a.topic else []) + a.rest
     topics = [n[:-3] for n in github_dir(APPS_REPO, 'docs/platform') if n.endswith('.md')]
-    if not topics:  # before docs/platform exists
-        print(github_file(APPS_REPO, 'AGENTS.md'))
-        return
+    if not topics:
+        die(f'cannot read {APPS_REPO} docs/platform/; check your GitHub access with `magehand doctor`')
     topic = args[0] if args else 'README'
     if topic == 'search':
         if len(args) < 2:
@@ -1905,7 +1902,7 @@ def post_deploy_stage(repo, sha, name):
     statuses = [s for s in result.get('statuses', []) if s.get('context') == 'homelab/post-deploy']
     if not statuses:
         return {'stage': 'post-deploy', 'state': 'unknown', 'commit': sha,
-                'text': 'homelab/post-deploy: no result for this commit (legacy apps may skip checks)'}
+                'text': 'homelab/post-deploy: no result for this commit yet'}
     latest = max(statuses, key=lambda s: s.get('id', 0))
     state = {'success': 'ok', 'failure': 'failed', 'error': 'failed', 'pending': 'pending'}.get(
         latest.get('state'), 'unknown')
@@ -4610,7 +4607,7 @@ def env_findings(app, container, deployment_file, catalog):
         var, secret, key = item.get('name'), ref.get('name'), ref.get('key')
         block, kind = block_of(app, secret)
         if not block and secret in app.get('provided', ()):
-            continue  # the app's own ExternalSecret (homelab-apps AGENTS.md "Secrets")
+            continue  # the app's own ExternalSecret (guide: rules "Secrets")
         if not block:
             found.append(finding('error', deployment_file, f'env {var}: Secret {secret!r} is neither '
                                  'a block\'s nor made by an ExternalSecret in the app\'s manifests, so the pod would '
@@ -4640,7 +4637,7 @@ def env_findings(app, container, deployment_file, catalog):
 
 # What the platform lets an app deploy (the only copy of this list: app CI runs `check --strict`; Argo CD's
 # agent-app-bundles project and Kyverno enforce it in the cluster): namespace, quota, limits and network policy come from the platform.
-# What an app's own deploy/fetch overlays may hold (homelab docs/restricted-egress-plan.md, "Admission rules"): the
+# What an app's own deploy/fetch overlays may hold (homelab docs/fetch-zones.md, "Admission rules"): the
 # fetcher's workloads and config. The platform adds the queue, its Secret and the zone's policies.
 FETCH_ALLOWED_KINDS = {
     ('', 'ConfigMap'), ('apps', 'Deployment'), ('batch', 'Job'), ('batch', 'CronJob'),
@@ -4750,7 +4747,7 @@ def check_rollout_room(where, overlay, docs, services):
                                      f'ones, the rest of the app and its blocks), more than the {quota[i]}Mi {overlay} '
                                      f'quota: the new pod is refused and the old image keeps running. Lower the '
                                      f'{kind}, allow the rollout to stop an old pod first (rollingUpdate.maxUnavailable: 1), '
-                                     f'or use spec.strategy.type: Recreate (about a minute of downtime per deploy)', 'homelab-apps AGENTS.md "Storage and resources"'))
+                                     f'or use spec.strategy.type: Recreate (about a minute of downtime per deploy)', 'rules "Storage and resources"'))
                 break
     return found
 
@@ -4814,13 +4811,13 @@ def check_rendered(root, name):
                                      f'the queue)', 'fetch'))
             elif (group, kind) not in ALLOWED_KINDS:
                 found.append(finding('error', label, f'{kind} ({group or "core"}) is not allowed in an app',
-                                     'homelab-apps AGENTS.md "Not allowed"'))
+                                     'rules "Not allowed"'))
             if kind == 'Ingress':
                 hosts = {r.get('host') for r in (doc.get('spec') or {}).get('rules') or []}
                 middlewares = [m.strip() for m in (meta.get('annotations') or {}).get(
                     'traefik.ingress.kubernetes.io/router.middlewares', '').split(',') if m.strip()]
                 allowed = {lab, public} if overlay == 'prod' else {lab}
-                see = 'homelab-apps AGENTS.md "Networking and access"'
+                see = 'rules "Networking and access"'
                 if len(hosts) != 1 or not hosts <= allowed:
                     found.append(finding('error', label, f'one host per Ingress, one of {", ".join(sorted(allowed))} '
                                          f'(found {", ".join(sorted(h or "none" for h in hosts)) or "none"})', see))
@@ -4835,7 +4832,7 @@ def check_rendered(root, name):
                 if 'app' not in containers:
                     found.append(finding('error', label, f'needs a container named `app` (it has {containers}): the '
                                          'platform pins the commit and image on it',
-                                         'homelab-apps AGENTS.md "Apps with their own repo"'))
+                                         'rules "Apps with their own repo"'))
     if rendered:
         more, missed = check_admission(name, rendered)
         found, skipped = found + more, skipped + missed
@@ -4844,7 +4841,7 @@ def check_rendered(root, name):
     return found, skipped
 
 
-# App metrics (homelab docs/app-metrics-plan.md): a pod opts in with this label and a container port named
+# App metrics (homelab docs/app-metrics.md): a pod opts in with this label and a container port named
 # `metrics`; the platform's PodMonitor scrapes that port for the apps' own Prometheus, which alone may reach it.
 METRICS_LABEL = 'homelab.davidlarrimore.com/metrics'
 METRICS_SEE = 'metrics "Opting in"'
@@ -4926,7 +4923,7 @@ def check_admission(name, rendered):
     names = [n for n in github_dir(APPS_REPO, POLICY_DIR) if n.endswith(('.yaml', '.yml'))]
     if not names:
         return [], [f'{DEPLOY}: admission policies not checked (cannot read {APPS_REPO} {POLICY_DIR}); CI checks them']
-    found, skipped, see = [], [], 'homelab-apps AGENTS.md "Every workload must"'
+    found, skipped, see = [], [], 'rules "Every workload must"'
     with tempfile.TemporaryDirectory() as tmp:
         policies = pathlib.Path(tmp) / 'policies'
         policies.mkdir()
@@ -5058,7 +5055,7 @@ def parse_post_checks(text):
 def check_post_checks(root):
     path = pathlib.Path(root) / DEPLOY / 'checks.yaml'
     if not path.exists():
-        return []  # optional for legacy apps
+        return []  # optional
     try:
         with path.open('rb') as stream:
             raw = stream.read(32769)
@@ -5068,7 +5065,7 @@ def check_post_checks(root):
     except (OSError, UnicodeError, ValueError) as error:
         return [finding('error', f'{DEPLOY}/checks.yaml',
                         f'{error}; fix deploy/checks.yaml or remove it to skip dev checks',
-                        'README "Post-deploy checks"')]
+                        'rules "Post-deploy checks"')]
     return []
 
 
@@ -5134,7 +5131,7 @@ FETCH_QUEUE_SIZES = ('1Gi',)  # the zone's quota: one 1Gi volume
 
 
 def check_fetch_zone(local, name):
-    """An app's fetch zone (homelab docs/restricted-egress-plan.md): deploy/app.yaml's `fetch:` block, written as a
+    """An app's fetch zone (homelab docs/fetch-zones.md): deploy/app.yaml's `fetch:` block, written as a
     block mapping holding exactly `services: {queue: {type: redis}}` (the platform's deploy controller copies it as
     text, and the queue's Secret queue-connection is the only one the app's store may read), and the fetcher in
     deploy/fetch/base/ with the overlays fetch/dev/ (and fetch/prod/ for production). Either both or neither."""
@@ -5255,7 +5252,7 @@ def check_dockerfile(root):
     if not path.is_file():
         return []  # check_code reports it missing
     text = path.read_text(errors='replace')
-    see = 'homelab-apps AGENTS.md "Your own code (container images)"'
+    see = 'rules "Your own code (container images)"'
     found = []
     froms = [(n, line.split()) for n, line in enumerate(text.splitlines(), 1) if re.match(r'^\s*FROM\s', line, re.I)]
     stages = {words[-1] for _, words in froms if len(words) >= 4 and words[-2].upper() == 'AS'}
@@ -5434,7 +5431,7 @@ def check_code(root, app, catalog=None):
     for name in ('Dockerfile', 'ui-check.yaml'):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
-                                 'homelab-apps AGENTS.md "Apps with their own repo"'))
+                                 'rules "Apps with their own repo"'))
     found += check_dockerfile(root) + check_quality_job(root) + check_checks_job(root) + check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
@@ -5488,12 +5485,12 @@ def check_code(root, app, catalog=None):
             found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'{lib}: authentik signs users '
                                  'in before a request reaches the app; read the X-authentik-* headers instead of '
                                  'building login, sessions or password storage',
-                                 'homelab-apps AGENTS.md "Knowing who the user is"'))
+                                 'rules "Knowing who the user is"'))
         for match in LOCAL_DB.finditer(text):
             found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', 'a database file: the pod\'s '
                                  'root filesystem is read-only and replaced on every deploy; keep data in a postgres '
                                  'block, or on a mounted volume (PVC) if it must be a file',
-                                 'homelab-apps AGENTS.md "Storage and resources"'))
+                                 'rules "Storage and resources"'))
         for match in IN_PROCESS_SCHEDULER.finditer(text):
             lib = next(g for g in match.groups() if g)
             found.append(finding('warning', f'{rel}:{line_of(text, match.start())}', f'{lib}: a scheduler in the '
@@ -5605,7 +5602,7 @@ def check_agents_drift(root):
     if not why:
         return []
     return [finding('warning', 'AGENTS.md', f'{why}: run `magehand update-agents` and commit the diff',
-                    'homelab-apps AGENTS.md')]
+                    'recipes "Keep this repo\'s rules current"')]
 
 
 def agents_behind(text, platform):
@@ -5980,8 +5977,7 @@ def cmd_check(a):
     print(f'magehand check {name}: code {"(skipped)" if manifests_only else root.resolve()}, deployment '
           + (app['where'] if app else 'none yet (code rules only)'))
     for f in sorted(found, key=lambda f: (f['level'] != 'error', f['where'])):
-        see = f['see'] if f['see'].startswith('homelab-apps') else f"magehand guide {f['see']}"
-        print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> {see}")
+        print(f"{f['level']:7} {f['where']}: {f['text']}\n        -> magehand guide {f['see']}")
     for line in skipped:
         print(f'skipped {line}')
     print(f'{len(found)} finding(s), {errors} error(s)' if found else 'no findings')
@@ -7708,7 +7704,7 @@ def cmd_bucket(a):
 
 
 # --- job: scheduled work, a CronJob in the app's own deploy/base ---------------------------
-# The hosted-platform model (homelab docs/app-jobs-plan.md): a job is the app's image run with another command
+# The hosted-platform model (homelab-apps docs/development/jobs.md): a job is the app's image run with another command
 # on a schedule, with the app's env. `job add` writes the CronJob; merging deploys it like the rest of deploy/.
 
 JOB_NAME = re.compile(r'^[a-z]([a-z0-9-]{0,50}[a-z0-9])?$')  # a CronJob name: its Jobs add 11 characters (63 at most)
@@ -8037,7 +8033,7 @@ def check_job_documents(app, catalog, documents, own, base, listed, fetch=False)
             found.append(finding('error', where, f'{label}: image {image or "(none)"}: a job runs the app\'s own image '
                                  f'(ghcr.io/davidlarrimore/homelab-apps/{app["name"]}, without a digest)', JOB_SEE))
         if fetch:
-            # A fetcher holds no credential but its queue's (homelab docs/restricted-egress-plan.md); the app's blocks
+            # A fetcher holds no credential but its queue's (homelab docs/fetch-zones.md); the app's blocks
             # and their Secrets are in the app's namespace, out of its reach.
             other = sorted(fetch_secret_refs(pod) - {FETCH_SECRET})
             if other:
@@ -9061,7 +9057,7 @@ def cmd_icon(a):
     print(next_line(step))
 
 
-# `magehand fetch`: the scaffold of an app's fetch zone (homelab docs/restricted-egress-plan.md; guide: fetch).
+# `magehand fetch`: the scaffold of an app's fetch zone (homelab docs/fetch-zones.md; guide: fetch).
 FETCH_BLOCK = ('\n# The fetch zone (magehand guide fetch): its own namespace, reaching only the public web on 80/443\n'
                '# and this queue; deploy/fetch/ holds the fetcher.\n'
                'fetch:\n  services:\n    queue: {type: redis}\n')

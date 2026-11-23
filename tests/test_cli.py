@@ -1982,7 +1982,7 @@ FETCH_FILES = {'deploy/fetch/base/kustomization.yaml': 'resources: [fetcher.yaml
 
 
 class FetchZone(unittest.TestCase):
-    """deploy/app.yaml `fetch:` and deploy/fetch/: an app's fetch zone (homelab docs/restricted-egress-plan.md)."""
+    """deploy/app.yaml `fetch:` and deploy/fetch/: an app's fetch zone (homelab docs/fetch-zones.md)."""
 
     def found(self, app_yaml=FETCH_APP, files=FETCH_FILES):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2836,6 +2836,14 @@ class GuideSearch(unittest.TestCase):
 
     def test_no_match(self):
         self.assertEqual(magehand.search_sections(self.PAGES, 'kubernetes operators'), [])
+
+    def test_pages_are_the_guide_only(self):
+        # homelab-apps' AGENTS.md is that repo's own instructions; the rules every app follows are the guide's rules page.
+        read = []
+        with mock.patch.object(magehand, 'github_file', lambda repo, path, **_: read.append(path) or ''):
+            pages = magehand.guide_pages(['README', 'rules'])
+        self.assertEqual(list(pages), ['README', 'rules'])
+        self.assertEqual(read, ['docs/platform/README.md', 'docs/platform/rules.md'])
 
 
 class Skill(unittest.TestCase):
@@ -7798,7 +7806,7 @@ class FetchScaffold(unittest.TestCase):
 
 
 class Jobs(unittest.TestCase):
-    """`magehand job add/rm/ls` and the CronJob rules of `check` (homelab docs/app-jobs-plan.md)."""
+    """`magehand job add/rm/ls` and the CronJob rules of `check` (homelab-apps docs/development/jobs.md)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
