@@ -3977,16 +3977,24 @@ class SpecCommand(unittest.TestCase):
         """cmd_spec with gh faked: `reads` are the successive comment reads ((list, None) or (None, error)).
         Returns (exit code, stdout, the gh calls)."""
         calls, left, clock = [], list(reads), [0.0]
+        self.timeouts, self.clock = [], clock
 
         def query(*args):
             calls.append(args)
-            if args[0] in ('issue', 'pr'):
-                return {'number': 12, 'url': self.URL, 'state': 'OPEN'}, None
-            return left.pop(0) if left else ([], None)
+            return {'number': 12, 'url': self.URL, 'state': 'OPEN'}, None
 
-        def cli(*args, stdin=None):
+        def cli(*args, stdin=None, timeout=60):
             calls.append(args)
-            return post
+            self.timeouts.append((clock[0], timeout))
+            if '-f' in args:
+                if isinstance(post, Exception):
+                    raise post
+                return post
+            found, err = left.pop(0) if left else ([], None)
+            if isinstance(found, Exception):
+                clock[0] += timeout
+                raise found
+            return (0, json.dumps(found), '') if err is None else (1, '', err)
 
         def sleep(seconds):
             clock[0] += seconds
@@ -4034,6 +4042,16 @@ class SpecCommand(unittest.TestCase):
         self.assertIn('no answer yet after 1 minutes', out)
         self.assertIn('asking again starts another run', out)
         self.assertEqual(len([c for c in calls if '-f' in c]), 1)
+
+    def test_the_timeout_bounds_the_whole_wait_and_a_stalled_post_is_said(self):
+        # magehand#130's review: a sleep and a slow read could start with no time left.
+        stall = subprocess.TimeoutExpired('gh', 30)
+        code, out, calls = self.run_spec('check', [(stall, None)] * 10, timeout=1)
+        self.assertEqual(code, 1)
+        self.assertLessEqual(self.clock[0], 60)  # never past the minute asked for
+        self.assertTrue(all(at + t <= 60 for at, t in self.timeouts[1:]), self.timeouts)
+        code, _, _ = self.run_spec('check', [], post=stall)
+        self.assertIn('may or may not be there', str(code))
 
     def test_a_command_that_could_not_be_posted_stops(self):
         code, _, calls = self.run_spec('check', [], post=(1, '', 'HTTP 403'))

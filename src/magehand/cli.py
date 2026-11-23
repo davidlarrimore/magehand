@@ -2663,15 +2663,15 @@ def gh_without_gh(args):
     return None
 
 
-def gh_cli(*args, stdin=None):
+def gh_cli(*args, stdin=None, timeout=60):
     """`gh ARGS` as the signed-in user: (exit status, stdout, stderr). Without gh, a read goes to GitHub's
-    API with GITHUB_TOKEN (gh_without_gh)."""
+    API with GITHUB_TOKEN (gh_without_gh). A gh that doesn't answer in `timeout` seconds raises TimeoutExpired."""
     if not shutil.which('gh'):
         found = None if stdin is not None else gh_without_gh(args)
         if found is not None:
             return found
         die('needs the GitHub CLI: `brew install gh`, then `gh auth login`' + (TOKEN_ONLY if github_env_token() else ''))
-    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607  # noqa: PLW1510
+    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=timeout, input=stdin)  # nosec B603 B607  # noqa: PLW1510
     return out.returncode, out.stdout, out.stderr.strip()
 
 
@@ -8281,6 +8281,7 @@ def requested(pr):
 # with a line that names that comment. Reads only after that one write.
 
 SPEC_POLL = 20          # seconds between reads of the answer
+SPEC_READ_TIMEOUT = 30  # seconds one GitHub call may take
 SPEC_TIMEOUT = 45       # minutes, by default: a check takes 1-3, but it waits its turn behind reviews
 SPEC_REPLY_MARK = '<!-- spec-reply to='
 SPEC_VERDICT = re.compile(r'\*\*Spec (?:check|verify)(?::\s*`([a-z_]+)`)?')
@@ -8318,7 +8319,12 @@ def cmd_spec(a):
                                                        ' (`gh auth status`; is it in this repo?)'))
     repo = '/'.join(item['url'].split('/')[3:5])
     since = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 60))
-    code, out, err = gh_cli('api', f'repos/{repo}/issues/{number}/comments', '-f', f'body=/spec {mode}', '--jq', '.id')
+    try:
+        code, out, err = gh_cli('api', f'repos/{repo}/issues/{number}/comments', '-f', f'body=/spec {mode}', '--jq', '.id',
+                                timeout=SPEC_READ_TIMEOUT)
+    except subprocess.TimeoutExpired:  # GitHub may have taken it: asking again could start a second run
+        die(f'posting `/spec {mode}` on #{number} got no answer from GitHub, so it may or may not be there: look at '
+            f'{item["url"]} before asking again (its answer will appear there if it was posted)')
     if code != 0 or not out.strip().isdigit():
         die(f'could not post `/spec {mode}` on #{number}: {err or "gh failed"}')
     asked = int(out.strip())
@@ -8326,11 +8332,20 @@ def cmd_spec(a):
           file=sys.stderr, flush=True)
     deadline = time.monotonic() + 60 * (a.timeout or SPEC_TIMEOUT)
     answer = None
-    while answer is None and time.monotonic() < deadline:
-        time.sleep(SPEC_POLL)
-        comments, err = gh_query('api', f'repos/{repo}/issues/{number}/comments?since={since}&per_page=100')
-        if err:
-            print(f'{time.strftime("%H:%M")} could not read the comments ({err}); retrying', file=sys.stderr)
+    # --timeout bounds the whole wait: each sleep and each read gets only the time left (magehand#130's review).
+    while answer is None and deadline - time.monotonic() > 1:
+        time.sleep(min(SPEC_POLL, max(0, deadline - time.monotonic() - 1)))
+        left = deadline - time.monotonic()
+        if left <= 1:
+            break
+        try:
+            code, out, err = gh_cli('api', f'repos/{repo}/issues/{number}/comments?since={since}&per_page=100',
+                                    timeout=max(1, min(SPEC_READ_TIMEOUT, left)))
+            comments = json.loads(out) if code == 0 else None
+        except (subprocess.TimeoutExpired, ValueError):
+            code, comments, err = 1, None, 'no answer, or not JSON'
+        if comments is None:
+            print(f'{time.strftime("%H:%M")} could not read the comments ({err or "gh failed"}); retrying', file=sys.stderr)
             continue
         answer = spec_answer(comments if isinstance(comments, list) else [], asked)
     if answer is None:
