@@ -3969,6 +3969,103 @@ class PrReady(unittest.TestCase):
         self.assertIn('no review is requested', out)
 
 
+class SpecCommand(unittest.TestCase):
+    """`spec check|verify`: one command comment, then OpenClaw's answer to exactly that comment."""
+    URL = 'https://github.com/davidlarrimore/demo/issues/12'
+
+    def run_spec(self, mode, reads, post=(0, '9001\n', ''), json_=False, timeout=None):
+        """cmd_spec with gh faked: `reads` are the successive comment reads ((list, None) or (None, error)).
+        Returns (exit code, stdout, the gh calls)."""
+        calls, left, clock = [], list(reads), [0.0]
+        self.timeouts, self.clock = [], clock
+
+        def query(*args):
+            calls.append(args)
+            return {'number': 12, 'url': self.URL, 'state': 'OPEN'}, None
+
+        def cli(*args, stdin=None, timeout=60):
+            calls.append(args)
+            self.timeouts.append((clock[0], timeout))
+            if '-f' in args:
+                if isinstance(post, Exception):
+                    raise post
+                return post
+            found, err = left.pop(0) if left else ([], None)
+            if isinstance(found, Exception):
+                clock[0] += timeout
+                raise found
+            return (0, json.dumps(found), '') if err is None else (1, '', err)
+
+        def sleep(seconds):
+            clock[0] += seconds
+        a = argparse.Namespace(spec_action=mode, number=12, timeout=timeout, json=json_)
+        with mock.patch.object(magehand, 'gh_query', query), mock.patch.object(magehand, 'gh_cli', cli), \
+                mock.patch.object(magehand.time, 'sleep', sleep), \
+                mock.patch.object(magehand.time, 'monotonic', lambda: clock[0]), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as end:
+                magehand.cmd_spec(a)
+        return end.exception.code, out.getvalue(), calls
+
+    def answer(self, asked=9001, verdict='ready', mode='check', who=magehand.BOT):
+        head = f'**Spec {mode}: `{verdict}`** · summary' if verdict else f'**Spec {mode}: could not judge it.** no worker'
+        return {'user': {'login': who}, 'body': f'{magehand.SPEC_REPLY_MARK}{asked} -->\n{head}\n\n| R1 | `ok` |',
+                'html_url': self.URL + '#c'}
+
+    def test_check_posts_one_command_and_prints_the_answer_to_it(self):
+        code, out, calls = self.run_spec('check', [([], None), ([self.answer(asked=1), self.answer(who='someone'),
+                                                                self.answer()], None)])
+        self.assertEqual(code, 0)
+        posts = [c for c in calls if c[0] == 'api' and '-f' in c]
+        self.assertEqual(posts, [('api', 'repos/davidlarrimore/demo/issues/12/comments', '-f', 'body=/spec check', '--jq', '.id')])
+        self.assertIn('**Spec check: `ready`**', out)
+        self.assertNotIn(magehand.SPEC_REPLY_MARK, out)
+        self.assertIn('next: label #12 `autopilot`', out)
+        self.assertEqual(calls[0][:3], ('issue', 'view', '12'))
+
+    def test_exit_and_next_follow_the_verdict(self):
+        for mode, verdict, code_, step in (
+                ('verify', 'met', 0, '`magehand pr ready 12`'), ('verify', 'not_met', 1, '`magehand spec verify 12` again'),
+                ('check', 'fix_spec', 1, '`magehand spec check 12` again'), ('check', None, 1, 'could not judge')):
+            with self.subTest(mode=mode, verdict=verdict):
+                code, out, calls = self.run_spec(mode, [([self.answer(verdict=verdict, mode=mode)], None)], json_=True)
+                got = json.loads(out)
+                self.assertEqual((code, got['verdict'], got['mode']), (code_, verdict, mode))
+                self.assertIn(step, got['next'])
+                self.assertEqual(calls[0][0], 'issue' if mode == 'check' else 'pr')
+
+    def test_a_failed_read_is_retried_and_no_answer_ends_without_asking_again(self):
+        code, out, calls = self.run_spec('check', [(None, 'HTTP 502'), ([self.answer()], None)])
+        self.assertEqual(code, 0)
+        code, out, calls = self.run_spec('check', [], timeout=1)
+        self.assertEqual(code, 1)
+        self.assertIn('no answer yet after 1 minutes', out)
+        self.assertIn('asking again starts another run', out)
+        self.assertEqual(len([c for c in calls if '-f' in c]), 1)
+
+    def test_the_timeout_bounds_the_whole_wait_and_a_stalled_post_is_said(self):
+        # magehand#130's review: a sleep and a slow read could start with no time left.
+        stall = subprocess.TimeoutExpired('gh', 30)
+        code, out, calls = self.run_spec('check', [(stall, None)] * 10, timeout=1)
+        self.assertEqual(code, 1)
+        self.assertLessEqual(self.clock[0], 60)  # never past the minute asked for
+        self.assertTrue(all(at + t <= 60 for at, t in self.timeouts[1:]), self.timeouts)
+        code, _, _ = self.run_spec('check', [], post=stall)
+        self.assertIn('may or may not be there', str(code))
+
+    def test_a_command_that_could_not_be_posted_stops(self):
+        code, _, calls = self.run_spec('check', [], post=(1, '', 'HTTP 403'))
+        self.assertIn('could not post `/spec check`', str(code))  # die(): nothing is waited for
+        self.assertEqual([c for c in calls if c[0] == 'api' and '-f' not in c], [])
+
+    def test_help_and_parsing(self):
+        parser = magehand.build_parser()
+        got = parser.parse_args(['spec', 'verify', '7', '--timeout', '5', '--json'])
+        self.assertEqual((got.spec_action, got.number, got.timeout, got.json), ('verify', 7, 5, True))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(['spec', 'write', '7'])
+
+
 class PrWatch(unittest.TestCase):
     """`pr watch`: follows a readied PR and ends exactly when the agent has something to do, or it is done."""
 

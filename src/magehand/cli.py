@@ -2663,15 +2663,15 @@ def gh_without_gh(args):
     return None
 
 
-def gh_cli(*args, stdin=None):
+def gh_cli(*args, stdin=None, timeout=60):
     """`gh ARGS` as the signed-in user: (exit status, stdout, stderr). Without gh, a read goes to GitHub's
-    API with GITHUB_TOKEN (gh_without_gh)."""
+    API with GITHUB_TOKEN (gh_without_gh). A gh that doesn't answer in `timeout` seconds raises TimeoutExpired."""
     if not shutil.which('gh'):
         found = None if stdin is not None else gh_without_gh(args)
         if found is not None:
             return found
         die('needs the GitHub CLI: `brew install gh`, then `gh auth login`' + (TOKEN_ONLY if github_env_token() else ''))
-    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=60, input=stdin)  # nosec B603 B607  # noqa: PLW1510
+    out = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=timeout, input=stdin)  # nosec B603 B607  # noqa: PLW1510
     return out.returncode, out.stdout, out.stderr.strip()
 
 
@@ -8274,6 +8274,104 @@ def requested(pr):
     return any((r.get('login') or '').lower() == BOT.lower() for r in pr.get('reviewRequests') or [])
 
 
+# --- spec: the Requirements Owner's check and verify, asked for ----------------
+# The development model (homelab-apps docs/platform/development-model.md, `magehand guide development-model`): spec, check, plan, build, verify. `spec check`
+# and `spec verify` ask OpenClaw's Requirements Owner for the two judgements a person or agent waits on: one
+# comment as you (`/spec check` on an issue, `/spec verify` on a PR), and OpenClaw answers on the same issue or PR
+# with a line that names that comment. Reads only after that one write.
+
+SPEC_POLL = 20          # seconds between reads of the answer
+SPEC_READ_TIMEOUT = 30  # seconds one GitHub call may take
+SPEC_TIMEOUT = 45       # minutes, by default: a check takes 1-3, but it waits its turn behind reviews
+SPEC_REPLY_MARK = '<!-- spec-reply to='
+SPEC_VERDICT = re.compile(r'\*\*Spec (?:check|verify)(?::\s*`([a-z_]+)`)?')
+SPEC_PASS = {'check': 'ready', 'verify': 'met'}
+
+
+def spec_answer(comments, asked):
+    """The bot's answer to the command comment `asked` among these comments, or None."""
+    for c in comments:
+        if login_of(c.get('user')) == BOT.lower() and (c.get('body') or '').startswith(f'{SPEC_REPLY_MARK}{asked} -->'):
+            return c
+    return None
+
+
+def spec_next(mode, number, verdict):
+    """The step after an answer."""
+    if verdict == SPEC_PASS[mode]:
+        return (f'label #{number} `autopilot` for the builder, or build it yourself with each requirement mapped in the '
+                'PR description' if mode == 'check' else f'`magehand pr ready {number}`')
+    if verdict is None:
+        return f'the answer says why it could not judge; `magehand spec {mode} {number}` again later'
+    return (f'change the spec as the answer says, then `magehand spec check {number}` again' if mode == 'check' else
+            f'fix what the answer lists (the spec, for a spec_defect), push, then `magehand spec verify {number}` again')
+
+
+def cmd_spec(a):
+    mode, number = a.spec_action, a.number
+    if a.timeout is not None and a.timeout <= 0:
+        usage('spec', '--timeout is minutes, more than 0')
+    kind = 'issue' if mode == 'check' else 'pr'
+    item, err = gh_query(kind, 'view', str(number), '--json', 'number,url,state')
+    if err:
+        die(f'cannot read {kind} #{number}: {err}' + (' (`magehand spec check` is for an issue, `spec verify` for a PR)'
+                                                       if 'Could not resolve' in err or 'not found' in err else
+                                                       ' (`gh auth status`; is it in this repo?)'))
+    repo = '/'.join(item['url'].split('/')[3:5])
+    since = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 60))
+    try:
+        code, out, err = gh_cli('api', f'repos/{repo}/issues/{number}/comments', '-f', f'body=/spec {mode}', '--jq', '.id',
+                                timeout=SPEC_READ_TIMEOUT)
+    except subprocess.TimeoutExpired:  # GitHub may have taken it: asking again could start a second run
+        die(f'posting `/spec {mode}` on #{number} got no answer from GitHub, so it may or may not be there: look at '
+            f'{item["url"]} before asking again (its answer will appear there if it was posted)')
+    if code != 0 or not out.strip().isdigit():
+        die(f'could not post `/spec {mode}` on #{number}: {err or "gh failed"}')
+    asked = int(out.strip())
+    print(f'{time.strftime("%H:%M")} asked for the spec {mode} of #{number} ({repo}); waiting for its answer',
+          file=sys.stderr, flush=True)
+    deadline = time.monotonic() + 60 * (a.timeout or SPEC_TIMEOUT)
+    answer = None
+    # --timeout bounds the whole wait: each sleep and each read gets only the time left (magehand#130's review).
+    while answer is None and deadline - time.monotonic() > 1:
+        time.sleep(min(SPEC_POLL, max(0, deadline - time.monotonic() - 1)))
+        left = deadline - time.monotonic()
+        if left <= 1:
+            break
+        try:
+            code, out, err = gh_cli('api', f'repos/{repo}/issues/{number}/comments?since={since}&per_page=100',
+                                    timeout=max(1, min(SPEC_READ_TIMEOUT, left)))
+            comments = json.loads(out) if code == 0 else None
+        except (subprocess.TimeoutExpired, ValueError):
+            code, comments, err = 1, None, 'no answer, or not JSON'
+        if comments is None:
+            print(f'{time.strftime("%H:%M")} could not read the comments ({err or "gh failed"}); retrying', file=sys.stderr)
+            continue
+        answer = spec_answer(comments if isinstance(comments, list) else [], asked)
+    if answer is None:
+        step = (f'its answer will appear on #{number} ({item["url"]}); asking again starts another run, so wait for '
+                'it there')
+        if a.json:
+            print(json.dumps({'number': number, 'mode': mode, 'verdict': None, 'answer': None, 'url': item['url'],
+                              'next': step}))
+        else:
+            print(f'#{number}: no answer yet after {a.timeout or SPEC_TIMEOUT} minutes')
+            print(next_line(step))
+        sys.exit(1)
+    body = answer['body'].split('\n', 1)[1] if '\n' in answer['body'] else ''
+    match = SPEC_VERDICT.search(body)
+    verdict = match.group(1) if match else None
+    step = spec_next(mode, number, verdict)
+    if a.json:
+        print(json.dumps({'number': number, 'mode': mode, 'verdict': verdict, 'answer': body,
+                          'url': answer.get('html_url') or item['url'], 'next': step}))
+    else:
+        print(body.strip())
+        print('\n' + next_line(step))
+    sys.exit(0 if verdict == SPEC_PASS[mode] else 1)
+
+
+
 def cmd_pr(a):
     if not shutil.which('gh'):  # it reads and changes the PR through gh: no API reader stands in for that
         die(f'`magehand pr {a.pr_action}` needs the GitHub CLI: `brew install gh`, then `gh auth login`'
@@ -9178,7 +9276,7 @@ def cmd_job(a):
 # command's short help).
 GROUPS = (('start an app', ('new', 'icon')),
           ('learn the platform and check an app', ('guide', 'app', 'status', 'check', 'verify', 'api')),
-          ('ship an app', ('pr', 'release', 'job', 'fetch')),
+          ('ship an app', ('spec', 'pr', 'release', 'job', 'fetch')),
           ('run an app locally', ('run', 'dev', 'bucket', 'runtime', 'login')),
           ('this machine', ('setup', 'doctor', 'hooks', 'upgrade')))
 # Working, but not what a person needs to learn: -V and -h do version's and help's jobs, setup and upgrade
@@ -9326,6 +9424,25 @@ def build_parser():
     p.add_argument('--no-cluster', action='store_true', dest='no_cluster',
                    help="don't read the dev pods with kubectl (GitHub only)")
     json_option(p)
+    p = command('spec', cmd_spec, "ask OpenClaw whether a spec is buildable, or a PR meets it",
+                "ask OpenClaw's Requirements Owner to check an issue's spec, or to verify a PR against it, and wait",
+                'Two steps of the development model (spec, check, plan, build, verify; `magehand guide\n'
+                'development-model`). `spec check N` asks whether issue N\'s `## Spec` can be built as\n'
+                'written by one PR now: `ready`, or what is wrong with each requirement and the wording to fix\n'
+                'it. A ready spec is what verify later holds the work to. `spec verify N` asks whether PR N\n'
+                'meets every requirement of the issues it closes: `met`, or each one not met, with evidence.\n'
+                'It posts one comment as you (`/spec check` or `/spec verify`), and OpenClaw answers there\n'
+                'from a fresh run, usually in a few minutes; this waits for that answer (every 20 s, up to\n'
+                f'--timeout, default {SPEC_TIMEOUT} minutes), prints it, and exits 0 when it is `ready` or `met`\n'
+                'and 1 otherwise. Check before an issue gets `autopilot`; verify before `magehand pr ready`.\n\n'
+                'examples:\n  magehand spec check 183\n  magehand spec verify 189\n  magehand spec verify 189 --json')
+    ssub = p.add_subparsers(dest='spec_action', metavar='ACTION', required=True, parser_class=Parser)
+    for name, short, what in (('check', "check an issue's spec: can it be built as written?", 'the issue'),
+                              ('verify', 'verify a PR: does it meet every requirement of the issues it closes?', 'the PR')):
+        q = ssub.add_parser(name, help=short)
+        q.add_argument('number', type=int, metavar='N', help=what)
+        q.add_argument('--timeout', type=int, metavar='MIN', help=f'stop waiting after MIN minutes (default {SPEC_TIMEOUT})')
+        q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     p = command('pr', cmd_pr, "mark a green PR ready and request OpenClaw's review",
                 "mark a PR ready for review once its checks are green, request OpenClaw's review, and confirm it",
                 'The step of the review routine that can fail silently: `gh pr edit --add-reviewer` exits 0 even\n'
