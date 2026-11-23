@@ -6591,7 +6591,14 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    so): mock the LLM until then. Never use another app's key.
 5. If the guide doesn't answer, say so in the PR or issue (what you searched
    for) instead of inventing a mechanism; the owner adds it to the guide.
-6. Opening a PR: open it as a draft (`gh pr create --draft`); CI runs on
+6. Every change follows the development model (`magehand guide
+   development-model`): an issue with a `## Spec`, `magehand spec check N`
+   on it before you build (build only when it says `ready`; a changed spec is
+   checked again), a `## Requirements` table in the PR mapping every
+   requirement ID to its change and test, and `magehand spec verify N` on the
+   PR before `magehand pr ready` (it must say `met`; a miss is fixed in the
+   same PR, never moved to a new issue).
+7. Opening a PR: open it as a draft (`gh pr create --draft`); CI runs on
    drafts and OpenClaw ignores them. Push until `magehand check` and CI are
    green, then `magehand pr ready`: it refuses until the checks are green,
    marks the PR ready, requests OpenClaw's review and confirms the request
@@ -6605,14 +6612,14 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    a failed check or review, a timeout): do its `next:` step every time,
    which ends in watching again until it is done. Base every PR on `main` (the repo's ruleset only guards the
    default branch).
-7. After a change deploys to dev, test its API as the owner:
+8. After a change deploys to dev, test its API as the owner:
    `magehand api /path --json` (dev; it wakes a sleeping app; `-d` for a
    body). It needs the owner's `magehand login`: when it says you are not
    signed in, ask them to run it (you can't tap the passkey). `--prod`
    (real data) only when the user asks for that call. For your own HTTP
    client (curl, a test suite): `magehand api token` prints the 1-hour token;
    send it as `Authorization: Bearer`, and never write it to a file or log.
-8. When `magehand check` warns that AGENTS.md is behind the template, run
+9. When `magehand check` warns that AGENTS.md is behind the template, run
    `magehand update-agents`, review the diff and commit it. Never edit
    AGENTS.md above its `## This app` heading: that edit is lost.
 
