@@ -6594,13 +6594,15 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
 6. Every change follows the development model (`magehand guide
    development-model`): an issue with a `## Spec`, `magehand spec check N`
    on it before you build (build only when it says `ready`; a changed spec is
-   checked again), a `## Requirements` table in the PR mapping every
-   requirement ID to its change and test, and `magehand spec verify N` on the
-   PR before `magehand pr ready` (it must say `met`; a miss is fixed in the
-   same PR, never moved to a new issue).
+   checked again), a PR description with `Closes #N` for each issue it
+   delivers and a `## Requirements` table mapping every requirement ID to
+   its change and test, and `magehand spec verify N` on the PR before
+   `magehand pr ready` (it must say `met`; a miss is fixed in the same PR,
+   never moved to a new issue).
 7. Opening a PR: open it as a draft (`gh pr create --draft`); CI runs on
    drafts and OpenClaw ignores them. Push until `magehand check` and CI are
-   green, then `magehand pr ready`: it refuses until the checks are green,
+   green, run `magehand verify` on the final head (the push hook does it when
+   installed), then `magehand pr ready`: it refuses until the checks are green,
    marks the PR ready, requests OpenClaw's review and confirms the request
    stuck (or says why not). Each review costs a model run. A push starts no
    review and dismisses the approval: to change a reviewed PR,
