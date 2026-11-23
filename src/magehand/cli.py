@@ -8275,7 +8275,7 @@ def requested(pr):
 
 
 # --- spec: the Requirements Owner's check and verify, asked for ----------------
-# The development model (homelab-apps docs/development/README.md): spec, check, plan, build, verify. `spec check`
+# The development model (homelab-apps docs/platform/development-model.md, `magehand guide development-model`): spec, check, plan, build, verify. `spec check`
 # and `spec verify` ask OpenClaw's Requirements Owner for the two judgements a person or agent waits on: one
 # comment as you (`/spec check` on an issue, `/spec verify` on a PR), and OpenClaw answers on the same issue or PR
 # with a line that names that comment. Reads only after that one write.
@@ -9411,8 +9411,8 @@ def build_parser():
     json_option(p)
     p = command('spec', cmd_spec, "ask OpenClaw whether a spec is buildable, or a PR meets it",
                 "ask OpenClaw's Requirements Owner to check an issue's spec, or to verify a PR against it, and wait",
-                'Two steps of the development model (spec, check, plan, build, verify; homelab-apps\n'
-                'docs/development/README.md). `spec check N` asks whether issue N\'s `## Spec` can be built as\n'
+                'Two steps of the development model (spec, check, plan, build, verify; `magehand guide\n'
+                'development-model`). `spec check N` asks whether issue N\'s `## Spec` can be built as\n'
                 'written by one PR now: `ready`, or what is wrong with each requirement and the wording to fix\n'
                 'it. A ready spec is what verify later holds the work to. `spec verify N` asks whether PR N\n'
                 'meets every requirement of the issues it closes: `met`, or each one not met, with evidence.\n'
