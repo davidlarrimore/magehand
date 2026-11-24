@@ -2687,12 +2687,12 @@ RULESET = {
 }
 
 
-# The checks every app PR must pass before it merges, from the template's .github/workflows/build.yaml: its
-# `security` and `image` jobs call homelab-apps' shared workflows, and `image / result` passes only when every
-# job of the image build did; `checks / pre-commit` is the platform's static checks (homelab#611). The ruleset
-# requiring them has no bypass (as homelab's own "main: checks must pass"): the owner's bypass of the approval
-# never skips CI.
-REQUIRED_CHECKS = ('security / scan', 'image / result', 'checks / pre-commit')
+# The checks every app PR must pass before it merges. The template's .github/workflows/build.yaml is one job,
+# `platform`, calling homelab-apps' app.yaml (homelab#731), so each check is `platform / <its job> / <check>`:
+# the security scan, `image / result` (it passes only when every job of the image build did) and the static
+# checks (homelab#611). The ruleset requiring them has no bypass (as homelab's own "main: checks must pass"):
+# the owner's bypass of the approval never skips CI.
+REQUIRED_CHECKS = ('platform / security / scan', 'platform / image / result', 'platform / checks / pre-commit')
 REQUIRED_NAMES = ', '.join(REQUIRED_CHECKS[:-1]) + ' and ' + REQUIRED_CHECKS[-1]
 CHECKS_RULESET = {
     'name': 'main: checks must pass', 'target': 'branch', 'enforcement': 'active',
@@ -2882,85 +2882,46 @@ def ensure_ruleset(repo):
     return 'failed'
 
 
-PLATFORM_CHECK = 'checks / pre-commit'
+def platform_checks_call(text):
+    """The ref of homelab-apps' checks.yaml that a workflow's job calls (`jobs.<id>.uses`, parsed: a comment or a
+    string elsewhere doesn't count), or None; None for a workflow that isn't valid YAML."""
+    return workflow_call_ref(text, CHECKS_WORKFLOW)
 
 
-def platform_checks_call(text, on_pull_requests=False):
-    """The ref of homelab-apps' checks.yaml that a workflow's job calls (`jobs.<id>.uses`, parsed: a comment
-    or a string elsewhere doesn't count), or None; with `on_pull_requests`, only when the workflow runs on pull
-    requests (where the check reports). None for a workflow that isn't valid YAML."""
+def workflow_call_ref(text, workflow):
+    """The ref at which a workflow's job calls homelab-apps' `workflow` (a path under .github/workflows), or None."""
     try:
         flow = yaml.safe_load(text or '')
     except yaml.YAMLError:
         return None
-    if not isinstance(flow, dict):
-        return None
-    if on_pull_requests:
-        # Every pull request: a `paths`, `paths-ignore` or `branches` filter leaves some PRs without the check, and
-        # a required check that never reports blocks them (magehand#112's review).
-        on = flow.get('on', flow.get(True))  # YAML 1.1 reads a bare `on:` key as true
-        if not (on == 'pull_request' or (isinstance(on, (list, dict)) and 'pull_request' in on)):
-            return None
-        filters = on.get('pull_request') if isinstance(on, dict) else None
-        if isinstance(filters, dict) and set(filters) & {'paths', 'paths-ignore', 'branches', 'branches-ignore'}:
-            return None
-        # A `types` list must keep the default activities, or a later push to the PR doesn't run it.
-        types = filters.get('types') if isinstance(filters, dict) else None
-        listed = [types] if isinstance(types, str) else types if isinstance(types, list) else [None]
-        if types is not None and (not all(isinstance(t, str) for t in listed)
-                                  or not {'opened', 'synchronize', 'reopened'} <= set(listed)):
-            return None  # an invalid list (GitHub rejects the workflow) or one without the default activities
-    prefix = f'{APPS_REPO}/{CHECKS_WORKFLOW}@'
-    jobs = flow.get('jobs') if isinstance(flow.get('jobs'), dict) else {}
-    for job_id, job in jobs.items():
+    jobs = flow.get('jobs') if isinstance(flow, dict) and isinstance(flow.get('jobs'), dict) else {}
+    prefix = f'{APPS_REPO}/{workflow}@'
+    for job in jobs.values():
         uses = job.get('uses') if isinstance(job, dict) else None
-        if not (isinstance(uses, str) and uses.startswith(prefix) and len(uses) > len(prefix)):
-            continue
-        # The check's name is `<job> / pre-commit`: with on_pull_requests, the job must be the template's `checks`.
-        if on_pull_requests and (job_id != 'checks' or job.get('name', 'checks') != 'checks'):
-            continue
-        return uses[len(prefix):]
+        if isinstance(uses, str) and uses.startswith(prefix) and len(uses) > len(prefix):
+            return uses[len(prefix):]
     return None
 
 
-def ensure_checks(repo, created=False):
-    """Make sure a merge waits for the required checks: 'exists', 'created', 'partial', 'weak' or 'failed' (a
-    warning, as for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes
-    one. A repo made now, from the template, runs every required check. Repairing an existing repo requires
-    PLATFORM_CHECK only once you say its build.yaml runs it: an app made before the static checks doesn't report
-    it, and a required check that never reports leaves every PR waiting (magehand#112's review). So a repair adds
-    the others, and the step says when to add it ('partial')."""
+def ensure_checks(repo):
+    """Make sure a merge waits for the required checks: 'exists', 'created', 'weak' or 'failed' (a warning, as
+    for the approval ruleset). Adds the ruleset only when no rule requires any of them; never changes one."""
     state, detail = checks_status(repo)
     name = CHECKS_RULESET['name']
     if state == 'ok':
         print(f"{repo}: the checks {REQUIRED_NAMES} are already required", file=sys.stderr)
         return 'exists'
     if state == 'weak':
-        if detail.startswith(f'{PLATFORM_CHECK} not required on ') and ';' not in detail:
-            print(f"{repo}: {PLATFORM_CHECK} is not required yet: once {BUILD_WORKFLOW} runs the platform's "
-                  "`checks` job on pull requests, require it in Settings > Rules", file=sys.stderr)
-            return 'partial'
         print(f"{repo}: required checks are incomplete ({detail}); fix it in the repo's Settings > Rules "
               "(magehand leaves an existing ruleset alone)", file=sys.stderr)
         return 'weak'
     if state == 'missing':
-        ruleset, names = CHECKS_RULESET, REQUIRED_NAMES
-        if not created:
-            contexts = [check for check in REQUIRED_CHECKS if check != PLATFORM_CHECK]
-            names = ' and '.join(contexts)
-            ruleset = dict(CHECKS_RULESET, rules=[
-                rule if rule['type'] != 'required_status_checks' else dict(rule, parameters=dict(
-                    rule['parameters'], required_status_checks=[{'context': c} for c in contexts]))
-                for rule in CHECKS_RULESET['rules']])
         code, _, detail = gh_cli('api', '-X', 'POST', f'repos/{repo}/rulesets', '--input', '-',
-                                 stdin=json.dumps(ruleset))
+                                 stdin=json.dumps(CHECKS_RULESET))
         if code == 0:
-            print(f"{repo}: ruleset '{name}' added (a PR merges only when {names} pass; "
+            print(f"{repo}: ruleset '{name}' added (a PR merges only when {REQUIRED_NAMES} pass; "
                   'nobody can bypass it)', file=sys.stderr)
-            if not created:
-                print(f"{repo}: {PLATFORM_CHECK} is not required yet: once {BUILD_WORKFLOW} runs the platform's "
-                      "`checks` job on pull requests, require it in Settings > Rules", file=sys.stderr)
-            return 'created' if created else 'partial'
+            return 'created'
     print(f"{repo}: could not add the ruleset '{name}' ({detail or 'gh api failed'}); PRs can merge with failing "
           'checks until it exists', file=sys.stderr)
     return 'failed'
@@ -3410,7 +3371,7 @@ def cmd_new(a):
         print(f'{repo}: deploy/app.yaml names another app; make its first line `app: {app}` or run without '
               '--app-name', file=sys.stderr)
     ruleset = ensure_ruleset(repo)
-    checks = ensure_checks(repo, created)
+    checks = ensure_checks(repo)
     unnamed = named in ('failed', 'differs')  # the repo does not say `app: APP`: its app is still the repo's name
     here = not a.dir and current_repo() == repo  # repairing the checkout you are in: no second copy inside it
     cloned = None if a.no_clone or here else clone_repo(repo, dest)
@@ -3549,17 +3510,9 @@ def repair_steps(repo, private, bot, ruleset, cloned, dest, app=None, named=None
 
 def checks_steps(repo, checks):
     """What the required-checks ruleset leaves you, from ensure_checks' result."""
-    # The third check only once it reports on every PR: required and never reported, it blocks them all.
-    third = (f"require {PLATFORM_CHECK} only once a recent PR's checks list it: {BUILD_WORKFLOW} must run "
-             "homelab-app-template's `checks` job, under that name, on every pull request (no `paths` or `branches` "
-             "filter, and a `types` list, if any, keeping opened, synchronize and reopened, so every push to a PR runs it; "
-             "`magehand check` warns otherwise)")
     if checks == 'weak':
-        others = ' and '.join(c for c in REQUIRED_CHECKS if c != PLATFORM_CHECK)
-        return [f"do:    require {others} on main with no bypass in the repo's Settings > Rules (magehand leaves "
-                f"an existing ruleset alone); {third}"]
-    if checks == 'partial':
-        return [f'do:    {third}; then add it in Settings > Rules']
+        return [f"do:    require {REQUIRED_NAMES} on main with no bypass in the repo's Settings > Rules (magehand "
+                "leaves an existing ruleset alone)"]
     if checks == 'failed':
         return [f"do:    add the ruleset '{CHECKS_RULESET['name']}' (only an admin can): run `magehand new "
                 f"{repo.split('/', 1)[1]} --no-clone` again, or add it in Settings > Rules"]
@@ -5313,25 +5266,23 @@ def final_user(text):
 QUALITY_SEE = 'homelab-apps docs/development/quality.md "Quality check"'
 
 
-def check_quality_job(root):
-    """The Build workflow calls the platform's quality check (homelab-app-template's `quality` job). Workflows
-    are owner-maintained, so this is a warning naming who fixes it."""
-    path = root / BUILD_WORKFLOW
-    if not path.is_file() or 'workflows/quality.yaml@' in path.read_text(errors='replace'):
+def check_build_workflow(root):
+    """build.yaml is exactly the template's: one job calling homelab-apps' app.yaml, which runs every platform
+    check, so a check the platform adds reaches the app by itself (homelab#731). Any difference is an error (a
+    job left out, an edit that weakens a check); agents can't change workflows, so the owner copies the
+    template's. Skipped without a readable template (offline, or CI without access to it) and outside an app's
+    own repo, as for AGENTS.md."""
+    path = pathlib.Path(root) / BUILD_WORKFLOW
+    if not is_app_checkout(root) or not path.is_file():
         return []
-    return [finding('warning', BUILD_WORKFLOW, "doesn't call the platform's quality check: ask the owner to add "
-                    "homelab-app-template's `quality` job (agents can't change workflows)", QUALITY_SEE)]
-
-
-def check_checks_job(root):
-    """The Build workflow calls the platform's static checks (homelab-app-template's `checks` job, homelab#611).
-    A warning naming who fixes it, as for the quality job."""
-    path = root / BUILD_WORKFLOW
-    if not path.is_file() or platform_checks_call(path.read_text(errors='replace'), on_pull_requests=True):
+    try:
+        template = github_file(TEMPLATE_REPO, BUILD_WORKFLOW, required=False)
+    except SystemExit:  # no GitHub token: nothing to compare with
         return []
-    return [finding('warning', BUILD_WORKFLOW, "doesn't run the platform's static checks: ask the owner to add "
-                    "homelab-app-template's `checks` job (agents can't change workflows)",
-                    'homelab-apps docs/development/quality.md "Checks"')]
+    if not template or path.read_text(errors='replace') == template:
+        return []
+    return [finding('error', BUILD_WORKFLOW, f"differs from {TEMPLATE_REPO}'s: ask the owner to copy the "
+                    "template's file over it (agents can't change workflows)", 'rules "Apps with their own repo"')]
 
 
 # A Prometheus metric definition (Python prometheus_client, JS prom-client, Go client_golang) and the label names
@@ -5432,7 +5383,7 @@ def check_code(root, app, catalog=None):
         if not (root / name).is_file():
             found.append(finding('error', name, 'missing: the build needs it at the repo root',
                                  'rules "Apps with their own repo"'))
-    found += check_dockerfile(root) + check_quality_job(root) + check_checks_job(root) + check_dotenv(root, app)
+    found += check_dockerfile(root) + check_build_workflow(root) + check_dotenv(root, app)
     reported = set()
     for rel, path in code_files(root):
         try:
@@ -6029,6 +5980,7 @@ def agents_text(path):
 
 QUALITY_DIR = '.github/quality'
 CHECKS_WORKFLOW = '.github/workflows/checks.yaml'
+APP_WORKFLOW = '.github/workflows/app.yaml'  # every app check; an app's build.yaml calls it (homelab#731)
 TOOLS_PIN = re.compile(r'\b' + re.escape(APPS_REPO) + r'/\.github/actions/tools@([0-9a-f]{40})\b')
 PLATFORM_LINK = '.platform-quality'
 PRE_COMMIT_CONFIG = f'{PLATFORM_LINK}/pre-commit-config.yaml'
@@ -6065,12 +6017,17 @@ def lab_checkout(command, quiet=False):
 
 
 def checks_ref(top):
-    """The ref of homelab-apps' checks.yaml this checkout's own workflows call (what its CI runs), or None."""
+    """The ref of homelab-apps' checks.yaml this checkout's CI runs, or None: called by one of its own workflows,
+    or by homelab-apps' app.yaml, which an app repo's build.yaml calls (homelab#731)."""
     workflows = top / '.github' / 'workflows'
     for path in sorted(workflows.glob('*.y*ml')) if workflows.is_dir() else []:
-        ref = platform_checks_call(path.read_text(errors='replace'))
+        text = path.read_text(errors='replace')
+        ref = platform_checks_call(text)
         if ref:
             return ref
+        app = workflow_call_ref(text, APP_WORKFLOW)
+        if app:
+            return platform_checks_call(github_file(APPS_REPO, APP_WORKFLOW, ref=app))
     return None
 
 
@@ -9347,7 +9304,7 @@ def build_parser():
     p = command('new', cmd_new, "create an app's repo for the platform, or repair one",
                 "create an app's private repo from homelab-app-template, invite OpenClaw's bot (write) and add\n"
                 "the rulesets 'main: owner approves' (an approval) and 'main: checks must pass' (green\n"
-                "security / scan, image / result and checks / pre-commit, no bypass); on an existing repo, add whichever is missing",
+                f"{REQUIRED_NAMES}, no bypass); on an existing repo, add whichever is missing",
                 'Uses gh as you (only the owner can create the repo).\n\n'
                 'Repair: run it again on a repo made without it (`magehand doctor` says when one is). It\n'
                 'invites a missing bot, gives a read-only one write, renews a pending invitation and adds a\n'
@@ -9744,7 +9701,7 @@ def build_parser():
                 "check GitHub access, homelab reach, sign-in, the app repo's setup and the container runtime",
                 'In an app repo it also checks that OpenClaw\'s bot can write to it (a pending invitation is\n'
                 "a note), that it is private, that the ruleset 'main: owner approves' is active on the\n"
-                'default branch, and that merges wait for security / scan, image / result and checks / pre-commit with no bypass.\n'
+                f'default branch, and that merges wait for {REQUIRED_NAMES} with no bypass.\n'
                 'Each failure names its fix (`magehand new REPO` repairs the repo). What\n'
                 'needs admin to read (the ruleset, invitations) is a note when unreadable, not a failure;\n'
                 'an archived repo is not checked. Run it at the start of a session. Exit 1 on a failure.\n\n'
