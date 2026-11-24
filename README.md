@@ -132,7 +132,7 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 | `magehand guide [TOPIC ["SECTION"]] / guide search WORDS` | Read the platform guide (homelab-apps `docs/platform/`): a topic, one section, or the sections that best answer a question |
 | `magehand app [APP]` | The app's blocks, the env vars its pod gets and where each comes from, its URLs |
 | `magehand status [APP] [--watch]` | Where the app is: set up, registered, built, on dev and prod |
-| `magehand check [APP] [--ui]` | Check the app against the platform's rules (before every push; `--ui` runs CI's browser check) |
+| `magehand check [APP] [--ui]` | Check the app against the platform's rules, `build.yaml` exactly the template's included (before every push; `--ui` runs CI's browser check) |
 | `magehand verify` | Run the platform's static checks on what you'll push, as CI does |
 | `magehand api PATH [--prod]` | Call the app's API on dev or production, as you |
 

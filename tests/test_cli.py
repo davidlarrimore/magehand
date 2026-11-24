@@ -1840,7 +1840,9 @@ class CheckCode(unittest.TestCase):
             for name, text in files.items():
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text(text)
-            return magehand.check_code(root, check_app(list(env)))
+            # The workflow check reads the template from GitHub; test_build_workflow_is_exactly_the_templates has it.
+            with mock.patch.object(magehand, 'check_build_workflow', lambda root: []):
+                return magehand.check_code(root, check_app(list(env)))
 
     def test_dockerfile_rules_of_the_build(self):
         good = GOOD_DOCKERFILE
@@ -1882,19 +1884,44 @@ class CheckCode(unittest.TestCase):
             self.assertEqual(last[0][0], 'error')
             self.assertIn('coverage stage must come before the final', last[0][1])
 
-    def test_build_workflow_calls_the_quality_check(self):
-        flow = ('on:\n  pull_request:\njobs:\n  image:\n'
-                '    uses: davidlarrimore/homelab-apps/.github/workflows/build-app.yaml@main\n')
-        quality = '  quality:\n    uses: davidlarrimore/homelab-apps/.github/workflows/quality.yaml@main\n'
-        checks = '  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main\n'
-        texts = [f['text'] for f in self.run_check({'.github/workflows/build.yaml': flow}) if f['where'] ==
-                 '.github/workflows/build.yaml']
-        self.assertEqual(len(texts), 2, texts)
-        self.assertIn("doesn't call the platform's quality check", texts[0])
-        self.assertIn("doesn't run the platform's static checks", texts[1])  # homelab#611
-        self.assertFalse([f for f in self.run_check({'.github/workflows/build.yaml': flow + quality + checks})
-                          if f['where'] == '.github/workflows/build.yaml'])
-        self.assertFalse([f for f in self.run_check({}) if f['where'] == '.github/workflows/build.yaml'])
+    def test_build_workflow_is_exactly_the_templates(self):
+        # homelab#731: one job calling homelab-apps' app.yaml, so a platform check reaches every app by itself;
+        # anything else (a job left out, a weakened check) is an error the owner fixes by copying the template.
+        template = ('name: Build\non:\n  pull_request:\njobs:\n  platform:\n'
+                    '    uses: davidlarrimore/homelab-apps/.github/workflows/app.yaml@main\n')
+
+        def check(text, app_repo=True, served=template):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                if app_repo:
+                    (root / 'ui-check.yaml').write_text('web_ui: false\n')
+                if text is not None:
+                    (root / '.github/workflows').mkdir(parents=True)
+                    (root / magehand.BUILD_WORKFLOW).write_bytes(text.encode())
+                asked = []
+
+                def github_file(repo, path, required=True, ref='main'):
+                    asked.append((repo, path))
+                    return served
+                with mock.patch.object(magehand, 'github_file', github_file):
+                    found = magehand.check_build_workflow(root)
+                if found:
+                    self.assertEqual(asked, [(magehand.TEMPLATE_REPO, magehand.BUILD_WORKFLOW)])
+                return found
+        self.assertEqual(check(template), [])
+        for name, text in (('an old one, its jobs listed', template.replace('platform', 'security')),
+                           ('a check weakened', template + '    with:\n      enforce: false\n'),
+                           ('a comment changed', '# mine\n' + template),
+                           ('CRLF line endings', template.replace('\n', '\r\n'))):
+            with self.subTest(name):
+                found = check(text)
+                self.assertEqual([(f['level'], f['where']) for f in found], [('error', magehand.BUILD_WORKFLOW)])
+                self.assertIn("ask the owner to copy the template's file", found[0]['text'])
+        missing = check(None)  # no workflow: no platform check runs at all (#136's review)
+        self.assertEqual([f['level'] for f in missing], ['error'])
+        self.assertIn('is missing', missing[0]['text'])
+        self.assertEqual(check('x', app_repo=False), [])  # not an app's own repo
+        self.assertEqual(check('x', served=None), [])  # offline, or no access to the template
 
     def test_dependencies_only_from_a_lockfile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2764,7 +2791,8 @@ class ModelRule(unittest.TestCase):
             (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
             (root / 'ui-check.yaml').write_text('x')
             (root / 'app.py').write_text(code)
-            return magehand.check_code(root, check_app([{'name': 'M', 'value': 'x'}], services), CATALOG_MODELS)
+            with mock.patch.object(magehand, 'check_build_workflow', lambda root: []):  # reads GitHub; tested alone
+                return magehand.check_code(root, check_app([{'name': 'M', 'value': 'x'}], services), CATALOG_MODELS)
 
     def test_requested_model_is_fine_default_counts(self):
         self.assertEqual(self.run_check('MODEL = "paid/m2"\n', {'ai': {'type': 'llm', 'models': ['paid/m2']}}), [])
@@ -2957,94 +2985,78 @@ class New(unittest.TestCase):
         return [[c['context'] for r in json.loads(body)['rules'] if r['type'] == 'required_status_checks'
                  for c in r['parameters']['required_status_checks']] for body in self.posted]
 
-    def test_an_older_app_is_not_made_to_wait_for_a_check_it_doesnt_run(self):
-        # magehand#112's review: repairing an app made before homelab#611 must not require checks / pre-commit,
-        # which its build.yaml may not report: every PR would wait for it. The owner adds it once the job runs.
+    def test_a_repair_requires_all_three(self):
+        # homelab#731: every app runs every check through app.yaml, so a repair requires all three (no "partial"
+        # state for an app made before the static checks).
         import contextlib
         import io
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.run_new('elvis')
-        self.assertEqual(self.required_posted(), [['security / scan', 'image / result']])
-        self.assertIn('checks / pre-commit is not required yet', err.getvalue())
-        # The result carries the job as your next step, not "nothing left" (magehand#112's review).
-        self.posted = []
-        self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
-        out = io.StringIO()
-        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
-            magehand.cmd_new(magehand.build_parser().parse_args(['new', 'elvis', '--no-clone', '--json']))
-        self.assertEqual(json.loads(out.getvalue())['checks'], 'partial')
-        self.assertIn("`checks` job", json.loads(out.getvalue())['next'])
-
-    def test_an_older_app_with_the_two_checks_is_told_when_to_add_the_third(self):
-        import contextlib
-        import io
-        two = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
-            'required_status_checks': [{'context': 'security / scan'}, {'context': 'image / result'}]}}])
-        self.fake(exists='true', collaborator=True, ruleset=True, checks=two)
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), 'partial')
-        self.assertFalse([c for c in self.calls if '-X' in c])  # never changed
-        step = magehand.checks_steps('davidlarrimore/elvis', 'partial')[0]
-        self.assertIn("only once a recent PR's checks list it", step)
-        # Mixed defects (a bypass, or image / result missing too): the first two now, the third still conditional.
+            self.run_new('elvis')
+        self.assertEqual(self.required_posted(), [list(magehand.REQUIRED_CHECKS)])
         step = magehand.checks_steps('davidlarrimore/elvis', 'weak')[0]
-        self.assertIn('require security / scan and image / result on main', step)
-        self.assertIn("checks / pre-commit only once a recent PR's checks list it", step)
+        self.assertIn(f'require {magehand.REQUIRED_NAMES} on main with no bypass', step)
 
     def test_only_a_jobs_real_call_counts(self):
         call = 'davidlarrimore/homelab-apps/.github/workflows/checks.yaml@main'
-        self.assertEqual(magehand.platform_checks_call(f'on: [pull_request]\njobs:\n  checks:\n    uses: "{call}"\n',
-                                                       on_pull_requests=True), 'main')  # quoted: still a call
-        for text in (f'on: [pull_request]\njobs:\n  checks:\n    runs-on: x\n    # uses: {call}\n',  # a comment
-                     f'on: [push]\njobs:\n  c:\n    uses: {call}\n',  # never on a PR: never reports there
-                     f'on: [pull_request]\nenv:\n  X: "uses: {call}"\n', 'not: [valid', '',
-                     # magehand#112's review: not every PR, or another check name
-                     f'on:\n  pull_request:\n    paths: [src/**]\njobs:\n  checks:\n    uses: {call}\n',
-                     f'on:\n  pull_request:\n    branches: [main]\njobs:\n  checks:\n    uses: {call}\n',
-                     f'on: [pull_request]\njobs:\n  lint:\n    uses: {call}\n',
-                     f'on:\n  pull_request:\n    types: [opened]\njobs:\n  checks:\n    uses: {call}\n',
-                     f'on:\n  pull_request:\n    types: [opened, {{x: 1}}, [y]]\njobs:\n  checks:\n    uses: {call}\n',
-                     f'on:\n  pull_request:\n    types: [opened, synchronize, reopened, {{x: 1}}]\njobs:\n'
-                     f'  checks:\n    uses: {call}\n',
-                     f'on:\n  pull_request:\n    types: {{a: 1}}\njobs:\n  checks:\n    uses: {call}\n',
-                     f'on: [pull_request]\njobs:\n  checks:\n    name: Lint\n    uses: {call}\n'):
-            self.assertIsNone(magehand.platform_checks_call(text, on_pull_requests=True), text)
+        self.assertEqual(magehand.platform_checks_call(f'on: [pull_request]\njobs:\n  checks:\n    uses: "{call}"\n'),
+                         'main')  # quoted: still a call
         self.assertEqual(magehand.platform_checks_call(f'on: [push]\njobs:\n  c:\n    uses: {call}\n'), 'main')
-        # The template's own job: skipped only on workflow_dispatch, so every PR reports it.
-        template = (f"on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\njobs:\n  checks:\n"
-                    f"    if: github.event_name != 'workflow_dispatch'\n    uses: {call}\n")
-        self.assertEqual(magehand.platform_checks_call(template, on_pull_requests=True), 'main')
-        every = (f'on:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\njobs:\n  checks:\n'
-                 f'    uses: {call}\n')
-        self.assertEqual(magehand.platform_checks_call(every, on_pull_requests=True), 'main')
+        for text in (f'on: [pull_request]\njobs:\n  checks:\n    runs-on: x\n    # uses: {call}\n',  # a comment
+                     f'on: [pull_request]\nenv:\n  X: "uses: {call}"\n', 'not: [valid', '', '[1]',
+                     'on: [pull_request]\njobs:\n  c:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@\n'):
+            self.assertIsNone(magehand.platform_checks_call(text), text)
+
+    def test_verify_follows_app_yaml_to_the_checks_it_runs(self):
+        # homelab#731: an app's build.yaml calls app.yaml, whose checks job pins checks.yaml's ref.
+        app = 'jobs:\n  checks:\n    uses: davidlarrimore/homelab-apps/.github/workflows/checks.yaml@abc123\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            top = pathlib.Path(tmp)
+            (top / '.github/workflows').mkdir(parents=True)
+            (top / magehand.BUILD_WORKFLOW).write_text(
+                'jobs:\n  platform:\n    uses: davidlarrimore/homelab-apps/.github/workflows/app.yaml@main\n')
+            asked = []
+
+            def github_file(repo, path, required=True, ref='main'):
+                asked.append((repo, path, ref))
+                return app
+            with mock.patch.object(magehand, 'github_file', github_file):
+                self.assertEqual(magehand.checks_ref(top), 'abc123')
+            self.assertEqual(asked, [(magehand.APPS_REPO, magehand.APP_WORKFLOW, 'main')])
+            (top / magehand.BUILD_WORKFLOW).write_text('jobs:\n  x:\n    runs-on: y\n')
+            self.assertIsNone(magehand.checks_ref(top))
+
+    def test_verify_with_apps_dir_looks_up_no_ref(self):
+        # #136's review: --apps-dir names the config; an older checkout without app.yaml must not stop verify.
+        src = pathlib.Path(magehand.__file__).read_text()
+        self.assertIn('ref = None if APPS_DIR else checks_ref(work)', src)
 
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
         self.run_new('elvis')
         posted = [c for c in self.calls if c[:3] == ('api', '-X', 'POST')]
         self.assertEqual(posted, [('api', '-X', 'POST', 'repos/davidlarrimore/elvis/rulesets', '--input', '-')])
-        # A repo made now, from the template (which runs the checks job), requires all three.
+        # Every app runs all three (app.yaml), so a new ruleset requires all three.
         with mock.patch.object(magehand, 'checks_status', lambda repo: ('missing', '')):
             self.posted = []
             import contextlib
             import io
             with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis', created=True), 'created')
-        self.assertEqual(self.required_posted(), [['security / scan', 'image / result', 'checks / pre-commit']])
+                self.assertEqual(magehand.ensure_checks('davidlarrimore/elvis'), 'created')
+        self.assertEqual(self.required_posted(), [list(magehand.REQUIRED_CHECKS)])
         self.assertEqual(magehand.CHECKS_RULESET['bypass_actors'], [])
         rule = next(r for r in magehand.CHECKS_RULESET['rules'] if r['type'] == 'required_status_checks')
         self.assertEqual([c['context'] for c in rule['parameters']['required_status_checks']],
-                         ['security / scan', 'image / result', 'checks / pre-commit'])
+                         ['platform / security / scan', 'platform / image / result', 'platform / checks / pre-commit'])
 
     def test_checks_a_merge_could_skip_are_reported_not_changed(self):
         import contextlib
         import io
         bypass = dict(magehand.CHECKS_RULESET, id=8, bypass_actors=magehand.RULESET['bypass_actors'])
         one = dict(magehand.CHECKS_RULESET, id=8, rules=[{'type': 'required_status_checks', 'parameters': {
-            'required_status_checks': [{'context': 'security / scan'}]}}])
-        for weak, why in ((bypass, 'bypass'), (one, 'image / result, checks / pre-commit not required')):
+            'required_status_checks': [{'context': 'platform / security / scan'}]}}])
+        for weak, why in ((bypass, 'bypass'),
+                          (one, 'platform / image / result, platform / checks / pre-commit not required')):
             self.calls.clear()
             self.fake(exists='true', collaborator=True, ruleset=True, checks=weak)
             err = io.StringIO()
@@ -3679,26 +3691,21 @@ class RepoConformance(unittest.TestCase):
             return {'type': 'required_status_checks', 'ruleset_id': ruleset_id,
                     'parameters': {'required_status_checks': [{'context': c} for c in contexts]}}
         both = [{'type': 'pull_request', 'ruleset_id': 7},
-                required('security / scan', 'image / result', 'checks / pre-commit')]
+                required(*magehand.REQUIRED_CHECKS)]
         theirs = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8)), '')
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': theirs}))
         self.assertEqual((state['checks'], state['checks_detail']), ('ok', ''))
         # Any ruleset's rule counts, split over two rulesets too.
-        split = [required('security / scan', ruleset_id=8),
-                 required('image / result', 'checks / pre-commit', ruleset_id=9)]
+        split = [required('platform / security / scan', ruleset_id=8),
+                 required('platform / image / result', 'platform / checks / pre-commit', ruleset_id=9)]
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(split), '')),
                                   **{'/rulesets/8': theirs, '/rulesets/9': theirs}))
         self.assertEqual(state['checks'], 'ok')
         # One of the two: weak, saying which.
-        state = self.with_gh(dict(self.answers(applied=(0, json.dumps([required('security / scan')]), '')),
+        state = self.with_gh(dict(self.answers(applied=(0, json.dumps([required('platform / security / scan')]), '')),
                                   **{'/rulesets/8': theirs}))
         self.assertEqual(state['checks'], 'weak')
-        self.assertIn('image / result, checks / pre-commit not required on main', state['checks_detail'])
-        # An app set up before the static checks (homelab#611): weak until the owner adds checks / pre-commit.
-        older = [required('security / scan', 'image / result')]
-        state = self.with_gh(dict(self.answers(applied=(0, json.dumps(older), '')), **{'/rulesets/8': theirs}))
-        self.assertEqual(state['checks'], 'weak')
-        self.assertIn('checks / pre-commit not required on main', state['checks_detail'])
+        self.assertIn('platform / image / result, platform / checks / pre-commit not required on main', state['checks_detail'])
         # A bypass list lets the owner merge red: weak.
         bypass = (0, json.dumps(dict(magehand.CHECKS_RULESET, id=8, bypass_actors=[{'actor_id': 5}])), '')
         state = self.with_gh(dict(self.answers(applied=(0, json.dumps(both), '')), **{'/rulesets/8': bypass}))
