@@ -5270,16 +5270,22 @@ def check_build_workflow(root):
     """build.yaml is exactly the template's: one job calling homelab-apps' app.yaml, which runs every platform
     check, so a check the platform adds reaches the app by itself (homelab#731). Any difference is an error (a
     job left out, an edit that weakens a check); agents can't change workflows, so the owner copies the
-    template's. Skipped without a readable template (offline, or CI without access to it) and outside an app's
-    own repo, as for AGENTS.md."""
+    template's. A missing file runs no check at all: an error too. Compared as bytes, so line endings count.
+    Skipped without a readable template (offline, or CI without access to it) and outside an app's own repo, as
+    for AGENTS.md."""
     path = pathlib.Path(root) / BUILD_WORKFLOW
-    if not is_app_checkout(root) or not path.is_file():
+    if not is_app_checkout(root):
         return []
     try:
         template = github_file(TEMPLATE_REPO, BUILD_WORKFLOW, required=False)
     except SystemExit:  # no GitHub token: nothing to compare with
         return []
-    if not template or path.read_text(errors='replace') == template:
+    if not template:
+        return []
+    if not path.is_file():
+        return [finding('error', BUILD_WORKFLOW, f"is missing, so no platform check runs: ask the owner to restore "
+                        f"{TEMPLATE_REPO}'s file (agents can't change workflows)", 'rules "Apps with their own repo"')]
+    if path.read_bytes() == template.encode():
         return []
     return [finding('error', BUILD_WORKFLOW, f"differs from {TEMPLATE_REPO}'s: ask the owner to copy the "
                     "template's file over it (agents can't change workflows)", 'rules "Apps with their own repo"')]
@@ -6341,7 +6347,8 @@ def cmd_verify(a):
         with commit_checkout(top, sha) as work:
             # Everything about the checks comes from the commit itself: the checks.yaml ref its workflows call, and
             # whether it has JS/TS for ESLint (magehand#110's review), not from the checkout you are in.
-            ref = checks_ref(work)
+            # --apps-dir names the config itself: no ref to find (#136's review: an older checkout has no app.yaml).
+            ref = None if APPS_DIR else checks_ref(work)
             own = own_quality(work, ref)
             with setup_lock():
                 # --apps-dir names the config: no pin to look up (magehand#112's review).

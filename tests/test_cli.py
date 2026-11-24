@@ -1840,7 +1840,9 @@ class CheckCode(unittest.TestCase):
             for name, text in files.items():
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text(text)
-            return magehand.check_code(root, check_app(list(env)))
+            # The workflow check reads the template from GitHub; test_build_workflow_is_exactly_the_templates has it.
+            with mock.patch.object(magehand, 'check_build_workflow', lambda root: []):
+                return magehand.check_code(root, check_app(list(env)))
 
     def test_dockerfile_rules_of_the_build(self):
         good = GOOD_DOCKERFILE
@@ -1895,7 +1897,7 @@ class CheckCode(unittest.TestCase):
                     (root / 'ui-check.yaml').write_text('web_ui: false\n')
                 if text is not None:
                     (root / '.github/workflows').mkdir(parents=True)
-                    (root / magehand.BUILD_WORKFLOW).write_text(text)
+                    (root / magehand.BUILD_WORKFLOW).write_bytes(text.encode())
                 asked = []
 
                 def github_file(repo, path, required=True, ref='main'):
@@ -1909,12 +1911,15 @@ class CheckCode(unittest.TestCase):
         self.assertEqual(check(template), [])
         for name, text in (('an old one, its jobs listed', template.replace('platform', 'security')),
                            ('a check weakened', template + '    with:\n      enforce: false\n'),
-                           ('a comment changed', '# mine\n' + template)):
+                           ('a comment changed', '# mine\n' + template),
+                           ('CRLF line endings', template.replace('\n', '\r\n'))):
             with self.subTest(name):
                 found = check(text)
                 self.assertEqual([(f['level'], f['where']) for f in found], [('error', magehand.BUILD_WORKFLOW)])
                 self.assertIn("ask the owner to copy the template's file", found[0]['text'])
-        self.assertEqual(check(None), [])  # no workflow: nothing to compare
+        missing = check(None)  # no workflow: no platform check runs at all (#136's review)
+        self.assertEqual([f['level'] for f in missing], ['error'])
+        self.assertIn('is missing', missing[0]['text'])
         self.assertEqual(check('x', app_repo=False), [])  # not an app's own repo
         self.assertEqual(check('x', served=None), [])  # offline, or no access to the template
 
@@ -2786,7 +2791,8 @@ class ModelRule(unittest.TestCase):
             (root / 'Dockerfile').write_text(GOOD_DOCKERFILE)
             (root / 'ui-check.yaml').write_text('x')
             (root / 'app.py').write_text(code)
-            return magehand.check_code(root, check_app([{'name': 'M', 'value': 'x'}], services), CATALOG_MODELS)
+            with mock.patch.object(magehand, 'check_build_workflow', lambda root: []):  # reads GitHub; tested alone
+                return magehand.check_code(root, check_app([{'name': 'M', 'value': 'x'}], services), CATALOG_MODELS)
 
     def test_requested_model_is_fine_default_counts(self):
         self.assertEqual(self.run_check('MODEL = "paid/m2"\n', {'ai': {'type': 'llm', 'models': ['paid/m2']}}), [])
@@ -3019,6 +3025,11 @@ class New(unittest.TestCase):
             self.assertEqual(asked, [(magehand.APPS_REPO, magehand.APP_WORKFLOW, 'main')])
             (top / magehand.BUILD_WORKFLOW).write_text('jobs:\n  x:\n    runs-on: y\n')
             self.assertIsNone(magehand.checks_ref(top))
+
+    def test_verify_with_apps_dir_looks_up_no_ref(self):
+        # #136's review: --apps-dir names the config; an older checkout without app.yaml must not stop verify.
+        src = pathlib.Path(magehand.__file__).read_text()
+        self.assertIn('ref = None if APPS_DIR else checks_ref(work)', src)
 
     def test_adds_the_required_checks_ruleset_with_no_bypass(self):
         self.fake(exists='true', collaborator=True, existing=dict(magehand.RULESET, id=7), checks={})
