@@ -8574,7 +8574,7 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
         state = (verdict or {}).get('state')
         if state == 'CHANGES_REQUESTED' or (state == 'COMMENTED' and open_threads()):
             return 'findings', f"the owner's review of {head[:7]} asks for changes", \
-                (f'fix them, push until green, answer and resolve each thread (`magehand pr answer {n}`), '
+                (f'fix them, push until green, answer and resolve each thread (AGENTS.md, "Review comments"), '
                  f'then `magehand pr watch {n}`')
         return None, ("OpenClaw's own PR: approved, waiting for the owner to merge it" if state == 'APPROVED' else
                       "OpenClaw's own PR: waiting for the owner's review"), None
@@ -8661,7 +8661,8 @@ def open_threads_of(repo, number, by_bot):
 # and OpenClaw judges each one on a re-review of the same head, which `pr ready` requests (no push, so no CI run).
 FINDING = re.compile(r'^(\d+)\.\s+\*\*(blocker|should fix|nit|existing)\*\*\s*(?:`([^`]+)`)?\s*[:\u2014-]?\s*(.*)$',
                      re.MULTILINE | re.IGNORECASE)
-ANSWER_MARK = re.compile(r'<!-- answer review=([0-9a-f]{7,40}) finding=(\d+) -->')
+ANSWER_MARK = re.compile(r'<!-- answer review=(\S+) finding=(\d+) -->')  # review: its GitHub id (a re-review of
+# the same commit is another review, whose findings are new: #140's review)
 
 
 def review_findings(body):
@@ -8684,11 +8685,13 @@ def pr_answer(a, pr, repo, finish):
     review = reviews[-1]
     sha = ((review.get('commit') or {}).get('oid') or '')[:7]
     findings = review_findings(review.get('body'))
+    rid = review.get('id') or ''
     answered = {int(k) for c in full.get('comments') or [] for r, k in ANSWER_MARK.findall(c.get('body') or '')
-                if sha and r.startswith(sha)}
-    ready = (f'`magehand pr ready {number}`: OpenClaw judges your answers on this head (no push, so no CI run); '
-             'after a push it reviews the new head') if pr.get('state') == 'OPEN' else \
-        'nothing more: the PR is closed, and the answers stay on it for the record'
+                if rid and r == rid}
+    closed = pr.get('state') != 'OPEN'
+    ready = 'nothing more: the PR is closed, and answers stay on it for the record' if closed else \
+        (f'`magehand pr ready {number}`: OpenClaw judges your answers on this head (no push, so no CI run); '
+         'after a push it reviews the new head')
     open_ = [f['n'] for f in findings if f['severity'] in ('blocker', 'should fix') and f['n'] not in answered]
     if a.thread is None:
         if not a.json:
@@ -8697,26 +8700,34 @@ def pr_answer(a, pr, repo, finish):
                 print(f"{f['n']:>3}  {state:<10}  {f['where'] or '(the PR)'}  {f['text'][:120]}")
         why = (f"OpenClaw's review of {sha}: {len(findings)} finding(s), {len(open_)} blocker or should-fix "
                'not answered')
-        step = (f'for each: fix it, or answer it with `magehand pr answer {number} K -m "condition N fails: <the fact>"` '
+        step = ready if closed else (f'for each: fix it, or answer it with `magehand pr answer {number} K -m "condition N fails: <the fact>"` '
                 f'(or "parked as #N: <why it can wait>"); then {ready}' if open_ else ready)
         return finish(True, why, step, extra={'review': sha, 'findings': [{**f, 'answered': f['n'] in answered}
                                                                          for f in findings]})
     finding = next((f for f in findings if f['n'] == a.thread), None)
     if finding is None:
         usage('pr', f"OpenClaw's review of {sha} has findings {', '.join(str(f['n']) for f in findings) or '(none)'}")
-    text = pathlib.Path(a.body_file).read_text() if a.body_file else (a.message or '')
+    try:
+        text = pathlib.Path(a.body_file).read_text() if a.body_file else (a.message or '')
+    except (OSError, UnicodeDecodeError) as error:
+        usage('pr', f'cannot read --body-file {a.body_file}: {error.strerror if isinstance(error, OSError) else error}; '
+                    'give a readable file, or the answer with -m')
     if not text.strip():
         usage('pr', 'say the answer: -m TEXT or --body-file FILE')
     where = f" (`{finding['where']}`)" if finding['where'] else ''
-    body = (f'<!-- answer review={sha} finding={finding["n"]} -->\n'
+    body = (f'<!-- answer review={rid} finding={finding["n"]} -->\n'
             f"**Answer to finding {finding['n']}** of OpenClaw's review of `{sha}`{where}: {text.strip()}\n")
-    code, _, err = gh_cli('pr', 'comment', str(number), '--repo', repo, '--body-file', '-', stdin=body)
+    try:
+        code, _, err = gh_cli('pr', 'comment', str(number), '--repo', repo, '--body-file', '-', stdin=body)
+    except subprocess.TimeoutExpired:
+        return finish(False, f"posting the answer to finding {finding['n']} timed out: it may have been posted",
+                      f'`magehand pr answer {number}` shows it as answered if it was; answer again only if not')
     if code != 0:
         die(f"cannot answer finding {finding['n']} of PR #{number}: {err.strip() or 'gh failed'}")
     left = [k for k in open_ if k != finding['n']]
     print(f"PR #{number}: answered finding {finding['n']} of OpenClaw's review of {sha}", file=sys.stderr)
     return finish(True, None, (f"answer or fix finding{'s' if len(left) > 1 else ''} {', '.join(map(str, left))}, then "
-                               + ready) if left else ready, extra={'review': sha, 'answered': finding['n'], 'open': left})
+                               + ready) if left and not closed else ready, extra={'review': sha, 'answered': finding['n'], 'open': left})
 
 
 def pr_watch(a):
@@ -8760,7 +8771,7 @@ def pr_watch(a):
                if result in ('findings', 'merged', 'held', 'reviewed') else [])
     if result == 'merged':
         app = app_repo_here()
-        answer = f'answer and resolve each open thread (`magehand pr answer {n}`)' if threads else None
+        answer = 'answer and resolve each open thread (AGENTS.md, "Review comments")' if threads else None
         deploy = f'`magehand status {app} --watch` (the build and the dev deploy)' if app else None
         step = ', then '.join(s for s in (answer, deploy) if s) or None
     code = 0 if result in WATCH_DONE else 1

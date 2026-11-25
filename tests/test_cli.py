@@ -4098,13 +4098,13 @@ class PrAnswer(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def run_answer(self, *args, reviews=None, comments=(), state='OPEN', fail=None):
+    def run_answer(self, *args, reviews=None, comments=(), state='OPEN', fail=None, timeout=False):
         posted = []
         reviews = reviews if reviews is not None else [
-            {'author': {'login': magehand.BOT}, 'body': '**OpenClaw code review** · old\n1. **should fix** `x`: old',
-             'commit': {'oid': '9' * 40}},
-            {'author': {'login': 'davidlarrimore'}, 'body': 'looks good', 'commit': {'oid': 'a' * 40}},
-            {'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}}]
+            {'id': 'PRR_old', 'author': {'login': magehand.BOT},
+             'body': '**OpenClaw code review** · old\n1. **should fix** `x`: old', 'commit': {'oid': '9' * 40}},
+            {'id': 'PRR_own', 'author': {'login': 'davidlarrimore'}, 'body': 'looks good', 'commit': {'oid': 'a' * 40}},
+            {'id': 'PRR_new', 'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}}]
 
         def gh_query(*a):
             if 'reviews,comments' in a:
@@ -4114,6 +4114,8 @@ class PrAnswer(unittest.TestCase):
 
         def gh_cli(*a, stdin=None, **k):
             posted.append((a, stdin))
+            if timeout:
+                raise subprocess.TimeoutExpired('gh', 60)
             return (1, '', fail) if fail else (0, '', '')
 
         def die(msg):  # as magehand's, but the message reaches the captured stderr
@@ -4139,18 +4141,37 @@ class PrAnswer(unittest.TestCase):
         self.assertEqual(code, 0)
         (args, body), = posted
         self.assertEqual(args[:2], ('pr', 'comment'))
-        self.assertEqual(body, '<!-- answer review=aaaaaaa finding=1 -->\n**Answer to finding 1** of OpenClaw\'s '
+        self.assertEqual(body, '<!-- answer review=PRR_new finding=1 -->\n**Answer to finding 1** of OpenClaw\'s '
                                'review of `aaaaaaa` (`app/a.py:10`): condition 1 fails: one owner, one tab writes notes\n')
         self.assertIn('answered finding 1', err)
         self.assertIn('answer or fix finding 2, then `magehand pr ready 12`', out.splitlines()[-1])
 
     def test_answered_findings_are_marked_and_only_for_this_review(self):
-        comments = [{'body': '<!-- answer review=aaaaaaa finding=1 -->\nanswer'},
-                    {'body': '<!-- answer review=9999999 finding=2 -->\nan answer to the older review'}]
+        comments = [{'body': '<!-- answer review=PRR_new finding=1 -->\nanswer'},
+                    {'body': '<!-- answer review=PRR_old finding=2 -->\nan answer to the older review'}]
         code, out, _, _ = self.run_answer(comments=comments)
         self.assertIn('1  answered', out.splitlines()[0])
         self.assertIn('2  blocker', out.splitlines()[1])
         self.assertIn('1 blocker or should-fix not answered', out)
+
+    def test_a_second_review_of_the_same_commit_starts_clean(self):
+        # #140's review: a same-head re-review shares the commit, so answers bind to the review's id.
+        reviews = [{'id': 'PRR_first', 'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}},
+                   {'id': 'PRR_second', 'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}}]
+        code, out, _, _ = self.run_answer(reviews=reviews, comments=[{'body': '<!-- answer review=PRR_first finding=1 -->'}])
+        self.assertIn('1  should fix', out.splitlines()[0])
+        self.assertIn('2 blocker or should-fix not answered', out)
+
+    def test_a_timed_out_post_is_uncertain_not_a_crash(self):
+        code, out, _, posted = self.run_answer('1', '-m', 'x', timeout=True)
+        self.assertEqual((code, len(posted)), (1, 1))
+        self.assertIn('timed out: it may have been posted', out)
+        self.assertIn('answer again only if not', out.splitlines()[-1])
+
+    def test_an_unreadable_body_file_is_a_usage_error(self):
+        code, _, err, posted = self.run_answer('1', '--body-file', '/nonexistent/answer.md')
+        self.assertEqual((code, posted), (2, []))
+        self.assertIn('cannot read --body-file /nonexistent/answer.md', err)
 
     def test_refuses_a_missing_finding_and_an_empty_answer_and_reports_a_failed_post(self):
         code, _, err, posted = self.run_answer('9', '-m', 'x')
@@ -4167,7 +4188,9 @@ class PrAnswer(unittest.TestCase):
         code, out, _, _ = self.run_answer(reviews=[])
         self.assertEqual(code, 1)
         self.assertIn('OpenClaw has not reviewed it yet', out)
-        code, out, _, _ = self.run_answer(state='MERGED')
+        code, out, _, _ = self.run_answer(state='MERGED')  # unanswered findings, but closed: nothing more to do
+        self.assertIn('nothing more: the PR is closed', out.splitlines()[-1])
+        code, out, _, _ = self.run_answer('1', '-m', 'x', state='MERGED')
         self.assertIn('nothing more: the PR is closed', out.splitlines()[-1])
 
 
