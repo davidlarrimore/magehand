@@ -8235,7 +8235,7 @@ def job_ls(a, app):
 # isn't a collaborator: #44; `gh pr edit --add-reviewer` even exits 0 then). The request goes through REST:
 # `gh pr edit`'s GraphQL query fails now and then ("Something went wrong while executing your query").
 
-PR_FIELDS = 'number,url,state,isDraft,headRefOid,author,statusCheckRollup,reviewRequests'
+PR_FIELDS = 'number,url,state,isDraft,headRefOid,author,statusCheckRollup,reviewRequests,body'
 
 
 def requested(pr):
@@ -8456,10 +8456,16 @@ WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels,files,comments'
 # The Requirements Owner's verdict on a head (homelab#742): OpenClaw's comment carries this mark, and a PR that closes
 # an issue merges only once its head's latest verdict is `met`.
 VERDICT_MARK = re.compile(r'<!-- spec-verdict sha=([0-9a-f]{40}) decision=([a-z_]+) -->')
+GATED_AUTHORS = (OWNER.lower(), 'homelab-builder')  # whose PRs the gate holds: the owner's and the builder's
+CLOSING = re.compile(r'\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?[ \t]+#(\d+)\b', re.IGNORECASE)  # homelab's CLOSES
 
 
 def head_verdict(pr, head):
-    """The latest verify decision OpenClaw's comments give for `head`, or None."""
+    """The latest verify decision OpenClaw's comments give for `head`, or None; None too where the gate doesn't apply
+    (homelab's verify_gate): a PR that closes no issue, or someone else's (#138's review: a description edited to
+    drop its `Closes #N` leaves the old verdict behind, and the queue no longer waits for it)."""
+    if login_of(pr.get('author')) not in GATED_AUTHORS or not CLOSING.search(pr.get('body') or ''):
+        return None
     found = None
     for c in pr.get('comments') or []:
         if login_of(c.get('author')) == BOT.lower():

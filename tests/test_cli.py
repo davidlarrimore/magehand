@@ -4131,8 +4131,8 @@ class PrWatch(unittest.TestCase):
         # homelab#742: OpenClaw merges a PR that closes an issue only once its head's latest verdict is `met`.
         H = self.HEAD
 
-        def said(*verdicts, who=magehand.BOT):
-            return {**self.pr(review=[('APPROVED', H)]), 'comments': [
+        def said(*verdicts, who=magehand.BOT, author='davidlarrimore', body='Closes #5'):
+            return {**self.pr(review=[('APPROVED', H)], author=author), 'body': body, 'comments': [
                 {'author': {'login': who}, 'body': f'<!-- spec-verdict sha={sha} decision={d} -->\n**Spec verify**'}
                 for sha, d in verdicts]}
         got, what, step = self.step(said((H, 'not_met')))
@@ -4140,9 +4140,13 @@ class PrWatch(unittest.TestCase):
         self.assertIn('`not_met`', what)
         self.assertIn('magehand spec verify 12', step)
         self.assertEqual(self.step(said((H, 'spec_defect')))[0], 'findings')
+        self.assertEqual(self.step(said((H, 'not_met'), author='homelab-builder', body='Fixes #9'))[0], 'findings')
         for name, pr in (('met', said((H, 'met'))), ('met after a not_met', said((H, 'not_met'), (H, 'met'))),
                          ('an older head', said(('b' * 40, 'not_met'))), ('not OpenClaw', said((H, 'not_met'), who='x')),
-                         ('no verdict', self.pr(review=[('APPROVED', H)]))):
+                         ('no verdict', self.pr(review=[('APPROVED', H)])),
+                         # #138's review: the gate's own conditions (homelab verify_gate)
+                         ('closes no issue now', said((H, 'not_met'), body='Part of #5 (no longer closes it)')),
+                         ('not the owner or the builder', said((H, 'not_met'), author='someone'))):
             with self.subTest(name):
                 got, what, _ = self.step(pr)
                 self.assertIsNone(got, what)
