@@ -8363,7 +8363,9 @@ def cmd_pr(a):
         """The result: what changed, why it stopped (if it did) and the next step; exit 1 unless ok."""
         if a.json:
             print(json.dumps({'pr': number, 'url': pr['url'], 'ok': ok, 'changed': changed,
-                              'requested': requested(pr) if recorded is None else recorded, 'why': why, 'next': step,
+                              # null when the review requests weren't read (`pr answer`: ANSWER_FIELDS), never false
+                              'requested': recorded if recorded is not None else
+                              requested(pr) if 'reviewRequests' in pr else None, 'why': why, 'next': step,
                               **(extra or {})}))
         else:
             print(f'PR #{number}: ' + '; '.join(changed + ([why] if why else [])) if changed or why else
@@ -8693,8 +8695,9 @@ def pr_answer(a, pr, repo, finish):
                 if rid and r == rid}
     closed = pr.get('state') != 'OPEN'
     ready = 'nothing more: the PR is closed, and answers stay on it for the record' if closed else \
-        (f'`magehand pr ready {number}`: OpenClaw judges your answers on this head (no push, so no CI run); '
-         'after a push it reviews the new head')
+        (f'request OpenClaw\'s review again: `magehand pr ready {number}`, or with a token without read:org (the '
+         f'builder\'s) `gh pr edit {number} --add-reviewer {BOT}`. On this head it judges your answers (no push, '
+         'so no CI run); after a push it reviews the new head')
     open_ = [f['n'] for f in findings if f['severity'] in ('blocker', 'should fix') and f['n'] not in answered]
     if a.thread is None:
         if not a.json:
