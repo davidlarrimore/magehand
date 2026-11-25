@@ -4107,6 +4107,8 @@ class PrAnswer(unittest.TestCase):
             {'id': 'PRR_new', 'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}}]
 
         def gh_query(*a):
+            # The builder's and OpenClaw's tokens can't read reviewRequests (read:org): pr answer never asks for it.
+            self.assertFalse(any('reviewRequests' in x for x in a), a)
             if 'reviews,comments' in a:
                 return {'reviews': reviews, 'comments': list(comments)}, None
             return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': state,

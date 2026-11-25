@@ -8236,6 +8236,7 @@ def job_ls(a, app):
 # `gh pr edit`'s GraphQL query fails now and then ("Something went wrong while executing your query").
 
 PR_FIELDS = 'number,url,state,isDraft,headRefOid,author,statusCheckRollup,reviewRequests,body'
+ANSWER_FIELDS = 'number,url,state,headRefOid,author'  # no reviewRequests: it needs read:org (see cmd_pr)
 
 
 def requested(pr):
@@ -8348,7 +8349,9 @@ def cmd_pr(a):
     if a.pr_action == 'watch':
         return pr_watch(a)
     target = [str(a.number)] if a.number else []
-    pr, err = gh_query('pr', 'view', *target, '--json', PR_FIELDS)
+    # `pr answer` reads only what it uses: PR_FIELDS' reviewRequests needs read:org, which the agents' repo-scoped
+    # tokens (the builder's, OpenClaw's) don't have, and it isn't needed to answer a finding.
+    pr, err = gh_query('pr', 'view', *target, '--json', ANSWER_FIELDS if a.pr_action == 'answer' else PR_FIELDS)
     if err:
         die(f'cannot read {"PR #" + str(a.number) if a.number else "the PR for this branch"}: {err}'
             + (' (open one with `gh pr create --draft`, or pass its number)' if 'no pull requests found' in err
