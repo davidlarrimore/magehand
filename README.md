@@ -142,6 +142,7 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 | --- | --- |
 | `magehand spec check N / spec verify N` | Ask OpenClaw whether an issue's spec is buildable, or whether a PR meets it |
 | `magehand pr ready [N] / pr watch [N]` | Mark a green PR ready and request OpenClaw's review, then follow it until it needs you or is done (findings, a failed check, or a verify verdict for its head that isn't `met`) |
+| `magehand pr answer [N] [K]` | List the findings of OpenClaw's latest review (answered ones marked), or answer finding K with a PR comment (`-m TEXT`, `--body-file FILE`): the condition of the review's bar it fails and the fact that shows it, or the issue it's parked in. Then `pr ready` again: OpenClaw judges the answers on the same head, with no push and no CI run |
 | `magehand release [APP]` | Cut the app's production release (the next `vX.Y.Z`), only when the owner asks |
 | `magehand job add / rm / ls` | Add, remove and list the app's scheduled jobs (CronJobs) |
 | `magehand fetch init / fetch rm` | Scaffold the app's fetch zone (fetching URLs nobody vouches for) |

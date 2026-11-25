@@ -4082,6 +4082,95 @@ class SpecCommand(unittest.TestCase):
             parser.parse_args(['spec', 'write', '7'])
 
 
+class PrAnswer(unittest.TestCase):
+    """`pr answer` (homelab#743): lists the numbered findings of OpenClaw's latest code review, marks the answered
+    ones, answers one with a PR comment that names the finding and the review, then points at `pr ready`."""
+
+    REVIEW = ('**OpenClaw code review** · risk: medium · `aaaaaaa`\nWhat changes: x.\n\n**Findings**\n'
+              '1. **should fix** `app/a.py:10`: A race between two writers pairs the wrong note.\n'
+              '2. **blocker** `app/b.py:20`: "Eleven or more years" reads as **no minimum**.\n'
+              '3. **nit** `web/d.ts:5`: naming.\nRecommendation: approve after fixing 1 and 2\n')
+
+    def setUp(self):
+        which = shutil.which
+        patch = mock.patch.object(magehand.shutil, 'which',
+                                  lambda name, *a, **k: '/usr/bin/gh' if name == 'gh' else which(name, *a, **k))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_answer(self, *args, reviews=None, comments=(), state='OPEN', fail=None):
+        posted = []
+        reviews = reviews if reviews is not None else [
+            {'author': {'login': magehand.BOT}, 'body': '**OpenClaw code review** · old\n1. **should fix** `x`: old',
+             'commit': {'oid': '9' * 40}},
+            {'author': {'login': 'davidlarrimore'}, 'body': 'looks good', 'commit': {'oid': 'a' * 40}},
+            {'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}}]
+
+        def gh_query(*a):
+            if 'reviews,comments' in a:
+                return {'reviews': reviews, 'comments': list(comments)}, None
+            return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': state,
+                    'headRefOid': 'a' * 40, 'author': {'login': 'davidlarrimore'}}, None
+
+        def gh_cli(*a, stdin=None, **k):
+            posted.append((a, stdin))
+            return (1, '', fail) if fail else (0, '', '')
+
+        def die(msg):  # as magehand's, but the message reaches the captured stderr
+            print(f'magehand: {msg}', file=sys.stderr)
+            sys.exit(1)
+        with mock.patch.object(magehand, 'gh_query', gh_query), mock.patch.object(magehand, 'gh_cli', gh_cli), \
+                mock.patch.object(magehand, 'die', die):
+            code, out, err = CommandLine.run_main(self, 'pr', 'answer', '12', *args)
+        return code, out, err, posted
+
+    def test_lists_the_latest_reviews_findings(self):
+        code, out, _, posted = self.run_answer()
+        self.assertEqual((code, posted), (0, []))
+        lines = out.splitlines()
+        self.assertIn('1  should fix  app/a.py:10  A race between two writers', lines[0])
+        self.assertIn('2  blocker     app/b.py:20  "Eleven or more years" reads as no minimum.', lines[1])
+        self.assertIn('3  nit         web/d.ts:5  naming.', lines[2])
+        self.assertIn("OpenClaw's review of aaaaaaa: 3 finding(s), 2 blocker or should-fix not answered", out)
+        self.assertIn('magehand pr answer 12 K -m', lines[-1])
+
+    def test_answers_a_finding_with_a_comment_naming_it(self):
+        code, out, err, posted = self.run_answer('1', '-m', 'condition 1 fails: one owner, one tab writes notes')
+        self.assertEqual(code, 0)
+        (args, body), = posted
+        self.assertEqual(args[:2], ('pr', 'comment'))
+        self.assertEqual(body, '<!-- answer review=aaaaaaa finding=1 -->\n**Answer to finding 1** of OpenClaw\'s '
+                               'review of `aaaaaaa` (`app/a.py:10`): condition 1 fails: one owner, one tab writes notes\n')
+        self.assertIn('answered finding 1', err)
+        self.assertIn('answer or fix finding 2, then `magehand pr ready 12`', out.splitlines()[-1])
+
+    def test_answered_findings_are_marked_and_only_for_this_review(self):
+        comments = [{'body': '<!-- answer review=aaaaaaa finding=1 -->\nanswer'},
+                    {'body': '<!-- answer review=9999999 finding=2 -->\nan answer to the older review'}]
+        code, out, _, _ = self.run_answer(comments=comments)
+        self.assertIn('1  answered', out.splitlines()[0])
+        self.assertIn('2  blocker', out.splitlines()[1])
+        self.assertIn('1 blocker or should-fix not answered', out)
+
+    def test_refuses_a_missing_finding_and_an_empty_answer_and_reports_a_failed_post(self):
+        code, _, err, posted = self.run_answer('9', '-m', 'x')
+        self.assertEqual((code, posted), (2, []))
+        self.assertIn('has findings 1, 2, 3', err)
+        code, _, err, posted = self.run_answer('1', '-m', '  ')
+        self.assertEqual((code, posted), (2, []))
+        self.assertIn('-m TEXT or --body-file FILE', err)
+        code, _, err, _ = self.run_answer('1', '-m', 'x', fail='HTTP 403')
+        self.assertEqual(code, 1)
+        self.assertIn('cannot answer finding 1 of PR #12: HTTP 403', err)
+
+    def test_no_review_yet_and_a_closed_pr(self):
+        code, out, _, _ = self.run_answer(reviews=[])
+        self.assertEqual(code, 1)
+        self.assertIn('OpenClaw has not reviewed it yet', out)
+        code, out, _, _ = self.run_answer(state='MERGED')
+        self.assertIn('nothing more: the PR is closed', out.splitlines()[-1])
+
+
 class PrWatch(unittest.TestCase):
     """`pr watch`: follows a readied PR and ends exactly when the agent has something to do, or it is done."""
 
