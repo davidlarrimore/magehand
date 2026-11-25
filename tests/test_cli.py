@@ -4107,6 +4107,8 @@ class PrAnswer(unittest.TestCase):
             {'id': 'PRR_new', 'author': {'login': magehand.BOT}, 'body': self.REVIEW, 'commit': {'oid': 'a' * 40}}]
 
         def gh_query(*a):
+            # The builder's and OpenClaw's tokens can't read reviewRequests (read:org): pr answer never asks for it.
+            self.assertFalse(any('reviewRequests' in x for x in a), a)
             if 'reviews,comments' in a:
                 return {'reviews': reviews, 'comments': list(comments)}, None
             return {'number': 12, 'url': 'https://github.com/davidlarrimore/demo/pull/12', 'state': state,
@@ -4135,6 +4137,9 @@ class PrAnswer(unittest.TestCase):
         self.assertIn('3  nit         web/d.ts:5  naming.', lines[2])
         self.assertIn("OpenClaw's review of aaaaaaa: 3 finding(s), 2 blocker or should-fix not answered", out)
         self.assertIn('magehand pr answer 12 K -m', lines[-1])
+        # #141's review: review requests aren't read here, so --json says null, never false.
+        code, out, _, _ = self.run_answer('--json')
+        self.assertIsNone(json.loads(out)['requested'])
 
     def test_answers_a_finding_with_a_comment_naming_it(self):
         code, out, err, posted = self.run_answer('1', '-m', 'condition 1 fails: one owner, one tab writes notes')
@@ -4144,7 +4149,11 @@ class PrAnswer(unittest.TestCase):
         self.assertEqual(body, '<!-- answer review=PRR_new finding=1 -->\n**Answer to finding 1** of OpenClaw\'s '
                                'review of `aaaaaaa` (`app/a.py:10`): condition 1 fails: one owner, one tab writes notes\n')
         self.assertIn('answered finding 1', err)
-        self.assertIn('answer or fix finding 2, then `magehand pr ready 12`', out.splitlines()[-1])
+        last = out.splitlines()[-1]
+        self.assertIn("answer or fix finding 2, then request OpenClaw's review again: `magehand pr ready 12`", last)
+        # #141's review: the builder's repo-only token can't run pr ready; gh can re-request the review.
+        self.assertIn('with a token without read:org (the builder\'s; REST needs only repo) `gh api -X POST '
+                      f'repos/davidlarrimore/demo/pulls/12/requested_reviewers -f reviewers[]={magehand.BOT}`', last)
 
     def test_answered_findings_are_marked_and_only_for_this_review(self):
         comments = [{'body': '<!-- answer review=PRR_new finding=1 -->\nanswer'},
