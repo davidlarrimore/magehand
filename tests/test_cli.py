@@ -4152,7 +4152,8 @@ class PrAnswer(unittest.TestCase):
         last = out.splitlines()[-1]
         self.assertIn("answer or fix finding 2, then request OpenClaw's review again: `magehand pr ready 12`", last)
         # #141's review: the builder's repo-only token can't run pr ready; gh can re-request the review.
-        self.assertIn(f'with a token without read:org (the builder\'s) `gh pr edit 12 --add-reviewer {magehand.BOT}`', last)
+        self.assertIn('with a token without read:org (the builder\'s; REST needs only repo) `gh api -X POST '
+                      f'repos/davidlarrimore/demo/pulls/12/requested_reviewers -f reviewers[]={magehand.BOT}`', last)
 
     def test_answered_findings_are_marked_and_only_for_this_review(self):
         comments = [{'body': '<!-- answer review=PRR_new finding=1 -->\nanswer'},

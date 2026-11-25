@@ -8696,8 +8696,9 @@ def pr_answer(a, pr, repo, finish):
     closed = pr.get('state') != 'OPEN'
     ready = 'nothing more: the PR is closed, and answers stay on it for the record' if closed else \
         (f'request OpenClaw\'s review again: `magehand pr ready {number}`, or with a token without read:org (the '
-         f'builder\'s) `gh pr edit {number} --add-reviewer {BOT}`. On this head it judges your answers (no push, '
-         'so no CI run); after a push it reviews the new head')
+         f'builder\'s; REST needs only repo) `gh api -X POST repos/{repo}/pulls/{number}/requested_reviewers -f '
+         f'reviewers[]={BOT}`. On this head it judges your answers (no push, so no CI run); after a push it reviews '
+         'the new head')
     open_ = [f['n'] for f in findings if f['severity'] in ('blocker', 'should fix') and f['n'] not in answered]
     if a.thread is None:
         if not a.json:
