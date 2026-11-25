@@ -4127,6 +4127,27 @@ class PrWatch(unittest.TestCase):
         self.assertIn('--undo', self.step(self.pr(checks=self.FAILED))[2])
         self.assertNotIn('--undo', self.step(self.pr(checks=self.FAILED, draft=True))[2])
 
+    def test_a_verify_verdict_that_isnt_met_is_findings(self):
+        # homelab#742: OpenClaw merges a PR that closes an issue only once its head's latest verdict is `met`.
+        H = self.HEAD
+
+        def said(*verdicts, who=magehand.BOT):
+            return {**self.pr(review=[('APPROVED', H)]), 'comments': [
+                {'author': {'login': who}, 'body': f'<!-- spec-verdict sha={sha} decision={d} -->\n**Spec verify**'}
+                for sha, d in verdicts]}
+        got, what, step = self.step(said((H, 'not_met')))
+        self.assertEqual(got, 'findings')
+        self.assertIn('`not_met`', what)
+        self.assertIn('magehand spec verify 12', step)
+        self.assertEqual(self.step(said((H, 'spec_defect')))[0], 'findings')
+        for name, pr in (('met', said((H, 'met'))), ('met after a not_met', said((H, 'not_met'), (H, 'met'))),
+                         ('an older head', said(('b' * 40, 'not_met'))), ('not OpenClaw', said((H, 'not_met'), who='x')),
+                         ('no verdict', self.pr(review=[('APPROVED', H)]))):
+            with self.subTest(name):
+                got, what, _ = self.step(pr)
+                self.assertIsNone(got, what)
+                self.assertIn('waiting for the queue', what)
+
     def test_live_test_holds_the_owners_homelab_pr_that_changes_openclaws_runtime(self):
         H, url = self.HEAD, 'https://github.com/davidlarrimore/homelab/pull/12'
         said = lambda sha, who='davidlarrimore': {'author': {'login': who}, 'body': f'ran it\n\nlive-tested: {sha}'}

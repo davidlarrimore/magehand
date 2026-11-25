@@ -8453,6 +8453,20 @@ def cmd_pr(a):
 # failed, closed, stalled, unrequested, live-test, timeout). Usage errors exit 2, as everywhere.
 
 WATCH_FIELDS = PR_FIELDS + ',reviews,assignees,labels,files,comments'
+# The Requirements Owner's verdict on a head (homelab#742): OpenClaw's comment carries this mark, and a PR that closes
+# an issue merges only once its head's latest verdict is `met`.
+VERDICT_MARK = re.compile(r'<!-- spec-verdict sha=([0-9a-f]{40}) decision=([a-z_]+) -->')
+
+
+def head_verdict(pr, head):
+    """The latest verify decision OpenClaw's comments give for `head`, or None."""
+    found = None
+    for c in pr.get('comments') or []:
+        if login_of(c.get('author')) == BOT.lower():
+            for sha, decision in VERDICT_MARK.findall(c.get('body') or ''):
+                if sha == head:
+                    found = decision
+    return found
 WATCH_POLL = 30           # seconds between reads
 WATCH_TIMEOUT = 60        # minutes, by default
 WATCH_UNPICKED = 15 * 60  # seconds a requested review may wait unqueued before it is reported
@@ -8589,6 +8603,11 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
                  f'`magehand pr watch {n}`: the queue merges it')
         if running:
             return None, 'approved; checks still running', None
+        verdict = head_verdict(pr, head)
+        if verdict and verdict != 'met':  # homelab#742: the merge waits for `met`; this verdict holds it
+            return 'findings', f"the Requirements Owner's verify of {head[:7]}: `{verdict}`; the merge waits for `met`", \
+                (f'`gh pr ready {n} --undo`, fix what its answer on the PR lists (the spec, for a spec_defect), push '
+                 f'until green, `magehand spec verify {n}`, then `magehand pr ready {n}` and `magehand pr watch {n}`')
         memory.setdefault('approved', now)
         if now - memory['approved'] > WATCH_UNMERGED:
             return 'stalled', f'approved and green, not merged after {WATCH_UNMERGED // 60} minutes', \
