@@ -141,7 +141,7 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 | Command | What it does |
 | --- | --- |
 | `magehand spec check N / spec verify N` | Ask OpenClaw whether an issue's spec is buildable, or whether a PR meets it |
-| `magehand pr ready [N] / pr watch [N]` | Mark a green PR ready and request OpenClaw's review, then follow it until it needs you or is done |
+| `magehand pr ready [N] / pr watch [N]` | Mark a green PR ready and request OpenClaw's review, then follow it until it needs you or is done (findings, a failed check, or a verify verdict for its head that isn't `met`) |
 | `magehand release [APP]` | Cut the app's production release (the next `vX.Y.Z`), only when the owner asks |
 | `magehand job add / rm / ls` | Add, remove and list the app's scheduled jobs (CronJobs) |
 | `magehand fetch init / fetch rm` | Scaffold the app's fetch zone (fetching URLs nobody vouches for) |
