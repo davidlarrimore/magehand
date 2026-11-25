@@ -4133,14 +4133,16 @@ class PrWatch(unittest.TestCase):
 
         def said(*verdicts, who=magehand.BOT, author='davidlarrimore', body='Closes #5'):
             return {**self.pr(review=[('APPROVED', H)], author=author), 'body': body, 'comments': [
-                {'author': {'login': who}, 'body': f'<!-- spec-verdict sha={sha} decision={d} -->\n**Spec verify**'}
+                {'author': {'login': who}, 'body': f'<!-- spec-verdict sha={sha} issues=5 decision={d} -->\n**Spec verify**'}
                 for sha, d in verdicts]}
         got, what, step = self.step(said((H, 'not_met')))
         self.assertEqual(got, 'findings')
         self.assertIn('`not_met`', what)
         self.assertIn('magehand spec verify 12', step)
         self.assertEqual(self.step(said((H, 'spec_defect')))[0], 'findings')
-        self.assertEqual(self.step(said((H, 'not_met'), author='homelab-builder', body='Fixes #9'))[0], 'findings')
+        self.assertEqual(self.step(said((H, 'not_met'), author='homelab-builder', body='Fixes #5'))[0], 'findings')
+        # homelab#742's review: a verdict names the issues it judged; a description closing another one needs a new one.
+        self.assertIsNone(self.step(said((H, 'not_met'), body='Closes #5, closes #6'))[0])
         for name, pr in (('met', said((H, 'met'))), ('met after a not_met', said((H, 'not_met'), (H, 'met'))),
                          ('an older head', said(('b' * 40, 'not_met'))), ('not OpenClaw', said((H, 'not_met'), who='x')),
                          ('no verdict', self.pr(review=[('APPROVED', H)])),
