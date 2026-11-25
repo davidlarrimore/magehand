@@ -8356,17 +8356,20 @@ def cmd_pr(a):
     number, repo, head = pr['number'], '/'.join(pr['url'].split('/')[3:5]), pr.get('headRefOid')
     changed = []
 
-    def finish(ok, why, step, recorded=None):
+    def finish(ok, why, step, recorded=None, extra=None):
         """The result: what changed, why it stopped (if it did) and the next step; exit 1 unless ok."""
         if a.json:
             print(json.dumps({'pr': number, 'url': pr['url'], 'ok': ok, 'changed': changed,
-                              'requested': requested(pr) if recorded is None else recorded, 'why': why, 'next': step}))
+                              'requested': requested(pr) if recorded is None else recorded, 'why': why, 'next': step,
+                              **(extra or {})}))
         else:
             print(f'PR #{number}: ' + '; '.join(changed + ([why] if why else [])) if changed or why else
                   f'PR #{number}: nothing to do')
             print(next_line(step))
         sys.exit(0 if ok else 1)
 
+    if a.pr_action == 'answer':
+        return pr_answer(a, pr, repo, finish)
     if pr['state'] != 'OPEN':
         die(f'PR #{number} is {pr["state"].lower()}: only an open PR can be readied')
     rollup = pr.get('statusCheckRollup')
@@ -8625,8 +8628,9 @@ def watch_step(pr, memory, now, open_threads=lambda: []):
             "read its review; the owner decides the merge"
     if review:
         return 'findings', f"OpenClaw's review of {head[:7]} has findings", \
-            (f'fix each finding: `gh pr ready {n} --undo`{relabel}, push until green, answer and resolve each '
-             f'thread (AGENTS.md, "Review comments"), then {again}')
+            (f'sort each finding (`magehand pr answer {n}` lists them): answer the ones that fail one of the review\'s '
+             f'conditions (`magehand pr answer {n} K -m ...`); for the rest, `gh pr ready {n} --undo`{relabel}, fix, push '
+             f'until green and answer them too; then {again}')
     older = any(login_of(r.get('author')) == BOT.lower() for r in pr.get('reviews') or [])
     return 'unrequested', ('pushed after the review: the new head has no review' if older else 'no review requested'), \
         f'{relabel.lstrip(", ").capitalize() + ", then " if relabel else ""}{again} (it requests the review)'
@@ -8649,6 +8653,81 @@ def open_threads_of(repo, number, by_bot):
             out.append({'id': t.get('id'), 'path': t.get('path'), 'line': t.get('line'), 'body': first.get('body') or '',
                         'url': first.get('url')})
     return out
+
+
+# Answering a finding instead of fixing it (homelab#743): the review's bar lets the author answer a should-fix with
+# the condition it fails and the fact that shows it, or the issue it is parked in. OpenClaw's findings are the
+# numbered items of its review (not line comments); an answer is a PR comment that names the finding and the review,
+# and OpenClaw judges each one on a re-review of the same head, which `pr ready` requests (no push, so no CI run).
+FINDING = re.compile(r'^(\d+)\.\s+\*\*(blocker|should fix|nit|existing)\*\*\s*(?:`([^`]+)`)?\s*[:\u2014-]?\s*(.*)$',
+                     re.MULTILINE | re.IGNORECASE)
+ANSWER_MARK = re.compile(r'<!-- answer review=(\S+) finding=(\d+) -->')  # review: its GitHub id (a re-review of
+# the same commit is another review, whose findings are new: #140's review)
+
+
+def review_findings(body):
+    """[{n, severity, where, text}] of the numbered findings in an OpenClaw code review's text."""
+    return [{'n': int(m.group(1)), 'severity': m.group(2).lower(), 'where': m.group(3) or '',
+             'text': re.sub(r'\s+', ' ', m.group(4).replace('**', '')).strip()} for m in FINDING.finditer(body or '')]
+
+
+def pr_answer(a, pr, repo, finish):
+    """List the findings of OpenClaw's latest code review on the PR, marking the ones answered, or answer finding K
+    with a PR comment."""
+    number = pr['number']
+    full, err = gh_query('pr', 'view', str(number), '--repo', repo, '--json', 'reviews,comments')
+    if err:
+        die(f"cannot read PR #{number}'s reviews: {err}")
+    reviews = [r for r in full.get('reviews') or [] if login_of(r.get('author')) == BOT.lower()
+               and 'OpenClaw code review' in (r.get('body') or '')]
+    if not reviews:
+        return finish(False, 'OpenClaw has not reviewed it yet', f'`magehand pr ready {number}` requests the review')
+    review = reviews[-1]
+    sha = ((review.get('commit') or {}).get('oid') or '')[:7]
+    findings = review_findings(review.get('body'))
+    rid = review.get('id') or ''
+    answered = {int(k) for c in full.get('comments') or [] for r, k in ANSWER_MARK.findall(c.get('body') or '')
+                if rid and r == rid}
+    closed = pr.get('state') != 'OPEN'
+    ready = 'nothing more: the PR is closed, and answers stay on it for the record' if closed else \
+        (f'`magehand pr ready {number}`: OpenClaw judges your answers on this head (no push, so no CI run); '
+         'after a push it reviews the new head')
+    open_ = [f['n'] for f in findings if f['severity'] in ('blocker', 'should fix') and f['n'] not in answered]
+    if a.thread is None:
+        if not a.json:
+            for f in findings:
+                state = 'answered' if f['n'] in answered else f['severity']
+                print(f"{f['n']:>3}  {state:<10}  {f['where'] or '(the PR)'}  {f['text'][:120]}")
+        why = (f"OpenClaw's review of {sha}: {len(findings)} finding(s), {len(open_)} blocker or should-fix "
+               'not answered')
+        step = ready if closed else (f'for each: fix it, or answer it with `magehand pr answer {number} K -m "condition N fails: <the fact>"` '
+                f'(or "parked as #N: <why it can wait>"); then {ready}' if open_ else ready)
+        return finish(True, why, step, extra={'review': sha, 'findings': [{**f, 'answered': f['n'] in answered}
+                                                                         for f in findings]})
+    finding = next((f for f in findings if f['n'] == a.thread), None)
+    if finding is None:
+        usage('pr', f"OpenClaw's review of {sha} has findings {', '.join(str(f['n']) for f in findings) or '(none)'}")
+    try:
+        text = pathlib.Path(a.body_file).read_text() if a.body_file else (a.message or '')
+    except (OSError, UnicodeDecodeError) as error:
+        usage('pr', f'cannot read --body-file {a.body_file}: {error.strerror if isinstance(error, OSError) else error}; '
+                    'give a readable file, or the answer with -m')
+    if not text.strip():
+        usage('pr', 'say the answer: -m TEXT or --body-file FILE')
+    where = f" (`{finding['where']}`)" if finding['where'] else ''
+    body = (f'<!-- answer review={rid} finding={finding["n"]} -->\n'
+            f"**Answer to finding {finding['n']}** of OpenClaw's review of `{sha}`{where}: {text.strip()}\n")
+    try:
+        code, _, err = gh_cli('pr', 'comment', str(number), '--repo', repo, '--body-file', '-', stdin=body)
+    except subprocess.TimeoutExpired:
+        return finish(False, f"posting the answer to finding {finding['n']} timed out: it may have been posted",
+                      f'`magehand pr answer {number}` shows it as answered if it was; answer again only if not')
+    if code != 0:
+        die(f"cannot answer finding {finding['n']} of PR #{number}: {err.strip() or 'gh failed'}")
+    left = [k for k in open_ if k != finding['n']]
+    print(f"PR #{number}: answered finding {finding['n']} of OpenClaw's review of {sha}", file=sys.stderr)
+    return finish(True, None, (f"answer or fix finding{'s' if len(left) > 1 else ''} {', '.join(map(str, left))}, then "
+                               + ready) if left and not closed else ready, extra={'review': sha, 'answered': finding['n'], 'open': left})
 
 
 def pr_watch(a):
@@ -9446,6 +9525,10 @@ def build_parser():
                 'says why (the bot is not a collaborator, can only read, or has not accepted yet) and exits 1.\n'
                 "On OpenClaw's own PRs it requests nobody: the owner reviews those. Open the PR with\n"
                 '`gh pr create --draft`; after a push to a reviewed PR, run it again.\n\n'
+                '`pr answer` lists the findings of OpenClaw\'s latest review, or answers finding K with a PR comment:\n'
+                'fix a finding, or answer it (which of the review\'s conditions it fails and the fact that shows it,\n'
+                'or the issue it is parked in). Then `pr ready` again: OpenClaw judges the answers on the same head,\n'
+                'with no push and no CI run.\n\n'
                 '`pr watch` then follows the PR (reads only, every 30 s) until something needs you or it is done,\n'
                 'and exits 0 when it is done (merged, approved and held, a draft gone green, or another\n'
                 "author's PR reviewed) and 1 when there is something to do: the review has findings (printed with\n"
@@ -9454,12 +9537,20 @@ def build_parser():
                 'says what to do; --json adds `result`. Progress goes to stderr. A coding agent runs it in the\n'
                 'background right after `pr ready` and works on what it reports.\n\n'
                 'examples:\n  magehand pr ready          # the PR of this branch\n  magehand pr ready 12\n'
-                '  magehand pr ready 12 --json\n  magehand pr watch 12\n  magehand pr watch 12 --timeout 10 --json')
+                '  magehand pr ready 12 --json\n  magehand pr answer 12\n'
+                '  magehand pr answer 12 2 -m "condition 1 fails: the vendor sends digits only (fixtures/x.json)"\n'
+                '  magehand pr watch 12\n  magehand pr watch 12 --timeout 10 --json')
     psub = p.add_subparsers(dest='pr_action', metavar='ACTION', required=True, parser_class=Parser)
     q = psub.add_parser('ready', help='ready a green PR and request the review, confirmed')
     q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
     q.add_argument('--force', action='store_true',
                    help="ready it though its head hasn't passed `magehand verify` here (says so on the PR)")
+    q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
+    q = psub.add_parser('answer', help="list the findings of OpenClaw's review, or answer one")
+    q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
+    q.add_argument('thread', nargs='?', type=int, metavar='K', help="the finding to answer (its number in OpenClaw's review)")
+    q.add_argument('-m', '--message', metavar='TEXT', help='the answer')
+    q.add_argument('--body-file', metavar='FILE', help='the answer, from a file (quotes and newlines survive)')
     q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     q = psub.add_parser('watch', help='follow the PR until its review, a failure or the merge, then say what to do')
     q.add_argument('number', nargs='?', type=int, metavar='N', help='the PR (default: the PR of this branch)')
