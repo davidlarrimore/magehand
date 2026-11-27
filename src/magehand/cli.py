@@ -6114,7 +6114,7 @@ def exclude_workflow(top):
     if not found:
         raise OSError('not a git checkout')
     path = pathlib.Path(found) if os.path.isabs(found) else pathlib.Path(top) / found
-    text = path.read_text() if path.is_file() else ''
+    text = path.read_text(errors='replace') if path.is_file() else ''
     if any(line.strip().strip('/') == '.magehand' for line in text.splitlines()):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6139,7 +6139,8 @@ def sync_workflow(top, write=True):
     if git_out(['ls-files', '--', WORKFLOW_FILE], top):
         return None, f'{WORKFLOW_FILE} is committed to this repo; `git rm --cached {WORKFLOW_FILE}` and commit'
     try:
-        current = path.read_text() if path.is_file() else None
+        # Undecodable bytes read as replacement characters: a corrupt file differs from the page and is rewritten.
+        current = path.read_text(errors='replace') if path.is_file() else None
         if current == page:
             if write:
                 exclude_workflow(top)
@@ -6157,7 +6158,7 @@ def sync_workflow(top, write=True):
         except OSError:
             pathlib.Path(draft).unlink(missing_ok=True)
             raise
-    except OSError as error:
+    except (OSError, ValueError) as error:
         return None, f'cannot write {path}: {error}'
     return ('written' if current is None else 'updated'), None
 
@@ -6165,7 +6166,7 @@ def sync_workflow(top, write=True):
 def claude_imports_workflow(top):
     """Whether the checkout's CLAUDE.md imports .magehand/workflow.md."""
     try:
-        return WORKFLOW_IMPORT in (pathlib.Path(top) / 'CLAUDE.md').read_text()
+        return WORKFLOW_IMPORT in (pathlib.Path(top) / 'CLAUDE.md').read_text(errors='replace')
     except OSError:
         return False
 

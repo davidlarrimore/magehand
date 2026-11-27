@@ -3905,6 +3905,29 @@ class WorkflowRules(unittest.TestCase):
             REFRESH_WORKFLOW()  # not an app checkout: untouched
         self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), self.PAGE)
 
+    def test_undecodable_files_are_rewritten_or_read_never_raised(self):
+        # magehand#148's review: a UnicodeDecodeError (a ValueError) escaped `except OSError`.
+        (self.top / '.magehand').mkdir()
+        (self.top / magehand.WORKFLOW_FILE).write_bytes(b'\xff\xfe broken')
+        exclude = self.top / '.git/info/exclude'
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_bytes(b'\xff old\n')
+        (self.top / 'CLAUDE.md').write_bytes(b'\xff\n@.magehand/workflow.md\n')
+        self.assertEqual(magehand.sync_workflow(self.top), ('updated', None))
+        self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), self.PAGE)
+        self.assertTrue(exclude.read_bytes().endswith(b'/.magehand/\n'))
+        self.assertTrue(magehand.claude_imports_workflow(self.top))
+        with mock.patch.object(magehand, 'checkout_top', lambda root=None: self.top), \
+                contextlib.redirect_stderr(io.StringIO()):
+            (self.top / magehand.WORKFLOW_FILE).write_bytes(b'\xff')
+            REFRESH_WORKFLOW()  # the quiet refresh never raises
+
+    def test_the_commands_agents_run_call_the_refresh(self):
+        # The suite stubs refresh_workflow (no network), so this guards the wiring itself (magehand#148's review).
+        import inspect
+        for command in (magehand.cmd_status, magehand.cmd_check, magehand.cmd_verify, magehand.cmd_new):
+            self.assertIn('refresh_workflow(', inspect.getsource(command), command.__name__)
+
     def session(self, rules_json):
         """The session hook's output in this checkout when `magehand rules --json` prints `rules_json` and magehand
         is current."""
