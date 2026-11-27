@@ -2071,11 +2071,14 @@ class CheckCode(unittest.TestCase):
             self.assertEqual(last[0][0], 'error')
             self.assertIn('coverage stage must come before the final', last[0][1])
 
-    def test_build_workflow_is_exactly_the_templates(self):
+    def test_build_workflow_means_the_same_as_the_templates(self):
         # homelab#731: one job calling homelab-apps' app.yaml, so a platform check reaches every app by itself;
         # anything else (a job left out, a weakened check) is an error the owner fixes by copying the template.
-        template = ('name: Build\non:\n  pull_request:\njobs:\n  platform:\n'
-                    '    uses: davidlarrimore/homelab-apps/.github/workflows/app.yaml@main\n')
+        # homelab#743: compared by meaning, so the template's comments and layout reach no app repo.
+        template = ('# the template\nname: Build\non:\n  pull_request:\n    types: [opened, ready_for_review]\n'
+                    'permissions:\n  contents: read\njobs:\n  platform:\n'
+                    '    uses: davidlarrimore/homelab-apps/.github/workflows/app.yaml@main\n'
+                    '    permissions:\n      contents: read\n      id-token: write\n')
 
         def check(text, app_repo=True, served=template):
             with tempfile.TemporaryDirectory() as tmp:
@@ -2096,14 +2099,32 @@ class CheckCode(unittest.TestCase):
                     self.assertEqual(asked, [(magehand.TEMPLATE_REPO, magehand.BUILD_WORKFLOW)])
                 return found
         self.assertEqual(check(template), [])
+        for name, text in (('a comment changed', '# mine\n' + template.replace('# the template\n', '')),
+                           ('CRLF line endings', template.replace('\n', '\r\n')),
+                           ('keys moved, flow style', template.replace('permissions:\n  contents: read\n', '').replace(
+                               'name: Build\n', 'permissions: {contents: read}\nname: Build\n')),
+                           ('a list reordered and quoted', template.replace('[opened, ready_for_review]',
+                                                                             '["ready_for_review", "opened"]'))):
+            with self.subTest(name):
+                self.assertEqual(check(text), [])
         for name, text in (('an old one, its jobs listed', template.replace('platform', 'security')),
                            ('a check weakened', template + '    with:\n      enforce: false\n'),
-                           ('a comment changed', '# mine\n' + template),
-                           ('CRLF line endings', template.replace('\n', '\r\n'))):
+                           ('another ref of app.yaml', template.replace('app.yaml@main', 'app.yaml@v1')),
+                           ('a permission dropped', template.replace('      id-token: write\n', '')),
+                           ('an event left out', template.replace('[opened, ready_for_review]', '[opened]')),
+                           ('a second job', template + '  extra:\n    runs-on: ubuntu-latest\n    steps: []\n'),
+                           ('renamed', template.replace('name: Build', 'name: Mine')),
+                           ('a job of its own', template + '  local:\n    steps:\n      - run: a\n'),
+                           ('not YAML', 'jobs: [\n')):
             with self.subTest(name):
                 found = check(text)
                 self.assertEqual([(f['level'], f['where']) for f in found], [('error', magehand.BUILD_WORKFLOW)])
                 self.assertIn("ask the owner to copy the template's file", found[0]['text'])
+        # Steps keep their order (only lists of plain values are unordered).
+        steps = lambda *order: ('name: x\njobs:\n  a:\n    steps:\n' + ''.join(f'      - run: {s}\n' for s in order))
+        self.assertNotEqual(magehand.workflow_meaning(steps('a', 'b')), magehand.workflow_meaning(steps('b', 'a')))
+        self.assertEqual(magehand.workflow_meaning('on:\n  push:\n    branches: [b, a]\n'),
+                         magehand.workflow_meaning('on: {push: {branches: [a, b]}}\n'))
         missing = check(None)  # no workflow: no platform check runs at all (#136's review)
         self.assertEqual([f['level'] for f in missing], ['error'])
         self.assertIn('is missing', missing[0]['text'])
@@ -3774,6 +3795,49 @@ class Agents(unittest.TestCase):
     def test_a_repo_without_the_file_gets_the_template(self):
         self.assertEqual(self.run_agents(None), (0, self.TEMPLATE))
 
+    def test_with_the_marker_claude_md_gets_the_import(self):
+        # homelab#743: update-agents brings the header and the CLAUDE.md line that loads the rules.
+        import contextlib
+        import io
+        template = f'# Rules\n\nheader\n{magehand.AGENTS_MARKER}\n\n## This app\n\n(describe it)\n'
+        for claude, expected in ((None, '@AGENTS.md\n@.magehand/workflow.md\n'),
+                                 ('@AGENTS.md\n', '@AGENTS.md\n@.magehand/workflow.md\n'),
+                                 ('@AGENTS.md\nmy notes', '@AGENTS.md\nmy notes\n@.magehand/workflow.md\n'),
+                                 ('@AGENTS.md\n@.magehand/workflow.md\n', '@AGENTS.md\n@.magehand/workflow.md\n')):
+            for check in (False, True):
+                with self.subTest(claude=claude, check=check), tempfile.TemporaryDirectory() as tmp:
+                    root = pathlib.Path(tmp)
+                    (root / 'AGENTS.md').write_text('# Rules\n\nold\n\n## This app\n\nrun pytest\n')
+                    if claude is not None:
+                        (root / 'CLAUDE.md').write_text(claude)
+                    out, code = io.StringIO(), 0
+                    with mock.patch.object(magehand, 'github_file', lambda repo, name, required=True: template), \
+                            contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                        try:
+                            magehand.main(['update-agents', '--code', tmp, '--json'] + (['--check'] if check else []))
+                        except SystemExit as exit_:
+                            code = exit_.code
+                    report = json.loads(out.getvalue())
+                    needed = claude != expected
+                    self.assertEqual(report['claude']['changed'], needed)
+                    self.assertEqual(report['claude']['written'], needed and not check)
+                    self.assertEqual(code, 1 if check else 0)  # AGENTS.md is behind in every case
+                    got = (root / 'CLAUDE.md').read_text() if (root / 'CLAUDE.md').exists() else None
+                    self.assertEqual(got, claude if check else expected)
+                    if not check:
+                        self.assertEqual((root / 'AGENTS.md').read_text(),
+                                         f'# Rules\n\nheader\n{magehand.AGENTS_MARKER}\n\n## This app\n\nrun pytest\n')
+        # Without the marker in the template (today's), CLAUDE.md is never touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'CLAUDE.md').write_text('@AGENTS.md\n')
+            (pathlib.Path(tmp) / 'AGENTS.md').write_text(self.TEMPLATE)
+            with mock.patch.object(magehand, 'github_file', lambda repo, name, required=True: self.TEMPLATE), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    magehand.main(['update-agents', '--code', tmp])
+            self.assertEqual(caught.exception.code, 0)
+            self.assertEqual((pathlib.Path(tmp) / 'CLAUDE.md').read_text(), '@AGENTS.md\n')
+
 
 class WorkflowRules(unittest.TestCase):
     """`magehand rules`: the guide's workflow page as .magehand/workflow.md in an app checkout, kept out of Git
@@ -3995,6 +4059,27 @@ class RepoConformance(unittest.TestCase):
 
     def test_no_heading_warns(self):
         self.assertIn('no "## This app"', self.drift(self.repo('# Rules\n\nold\n'))[0]['text'])
+
+    def test_a_header_with_the_marker_is_current_whatever_its_words_and_needs_the_import(self):
+        # homelab#743: the rules are .magehand/workflow.md; AGENTS.md keeps a header, checked by its marker.
+        marked = f'# Rules\n\nany words\n{magehand.AGENTS_MARKER}\n\n## This app\n\nx\n'
+        root = self.repo(marked)
+        (root / 'CLAUDE.md').write_text('@AGENTS.md\n@.magehand/workflow.md\n')
+        self.assertEqual(self.drift(root), [])
+        self.assertIsNone(magehand.agents_behind(marked, 'the template says something else\n'))
+        (root / 'CLAUDE.md').write_text('@AGENTS.md\n')
+        found = self.drift(root)
+        self.assertEqual([(f['level'], f['where']) for f in found], [('warning', 'CLAUDE.md')])
+        self.assertIn('magehand update-agents', found[0]['text'])
+        (root / 'CLAUDE.md').unlink()
+        self.assertEqual([f['where'] for f in self.drift(root)], ['CLAUDE.md'])
+        # The marker below "## This app" (the app's own notes) doesn't count.
+        below = f'# Rules\n\nold\n\n## This app\n\n{magehand.AGENTS_MARKER}\n'
+        self.assertEqual([f['where'] for f in self.drift(self.repo(below))], ['AGENTS.md'])
+        # The old full text, once the template has the marker: behind, so the last agents-sync wave fixes it.
+        template = f'# Rules\n\nheader\n{magehand.AGENTS_MARKER}\n\n## This app\n\n(describe it)\n'
+        found = self.drift(self.repo('# Rules\n\nthe old rules\n\n## This app\n\nx\n'), template=template)
+        self.assertEqual([f['where'] for f in found], ['AGENTS.md'])
 
     def test_skipped_outside_an_app_repo_without_the_file_or_without_the_template(self):
         self.assertEqual(self.drift(self.repo('old', app_repo=False)), [])
