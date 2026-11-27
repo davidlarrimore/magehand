@@ -183,7 +183,7 @@ on"); `--json` prints JSON for scripts and agents; exit status 0 is success,
 | `MAGEHAND_APPS_DIR` | Read this homelab-apps checkout instead of GitHub (`check --apps-dir` sets it) |
 | `MAGEHAND_PROXY_PORT` | The identity proxy's port (default 8080) |
 | `MAGEHAND_AGENT_TOKEN` | A lab agent's token file (the homelab's builder or Assistant): `api` calls dev apps as that agent; `--prod`, `release` and `login` are refused (a developer's access to dev only) |
-| `MAGEHAND_AGENT_LLM_KEY` | A lab agent's own model key file: `run` and `dev` give the app that key and the gateway in place of the app's own key |
+| `MAGEHAND_AGENT_LLM_KEY` | A lab agent's own model key file: `run` gives the app that key and the gateway in place of the app's own key |
 | `MAGEHAND_LAB_ADDRESS` | Connect `*.lab` names to this address (an agent's VM, where they resolve to 127.0.0.1 publicly); the host name and TLS check stay the real ones |
 | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub access (else `gh auth token`). Without `gh` installed, magehand reads GitHub's API with it directly; `new`, `pr ready`, `pr watch` and `release` still need `gh` |
 

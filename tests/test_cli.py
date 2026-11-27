@@ -1691,6 +1691,48 @@ class AgentIdentity(unittest.TestCase):
             env = magehand.resolve_env(app)
         self.assertEqual((env['LLM_KEY'], env['LLM_URL']), ('sk-agent', 'https://llm.lab.davidlarrimore.com/v1'))
 
+    def test_a_container_reaches_lab_names_at_the_lab_address_without_resolving_them(self):
+        with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \
+                mock.patch.object(magehand.socket, 'gethostbyname', lambda h: self.fail('resolved ' + h)):
+            hosts = magehand.lab_hosts({'U': 'https://llm.lab.davidlarrimore.com/v1', 'X': 'https://example.com'})
+        self.assertEqual(hosts, ['llm.lab.davidlarrimore.com:192.0.2.10'])
+
+    def test_a_host_run_stops_when_the_apps_own_lookup_would_give_loopback(self):
+        parser = magehand.build_parser()
+        env = {'LLM_URL': 'https://llm.lab.davidlarrimore.com/v1'}
+        started = []
+        for resolved, stops in (('127.0.0.1', True), ('192.0.2.10', False)):
+            with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \
+                    mock.patch.object(magehand, 'app_here', lambda name: {'name': 'demo'}), \
+                    mock.patch.object(magehand, 'scoped_app', lambda *a, **k: 'demo'), \
+                    mock.patch.object(magehand, 'resolve_env', lambda app, container=False: dict(env)), \
+                    mock.patch.object(magehand.socket, 'gethostbyname', lambda h, r=resolved: r), \
+                    mock.patch.object(magehand.subprocess, 'Popen',
+                                      lambda *a, **k: started.append(a) or mock.Mock(wait=lambda: 0)), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                magehand.cmd_run(parser.parse_args(['run', '--no-proxy', '--', 'true']))
+            if stops:
+                self.assertIn('--container', str(caught.exception.code))
+                self.assertEqual(started, [])
+            else:
+                self.assertEqual((caught.exception.code, len(started)), (0, 1))
+
+    def test_no_models_anywhere_is_told_not_started_with_an_empty_list(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent')
+        with mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: None), self.assertRaises(SystemExit) as caught:
+            magehand.agent_llm_connection({'services': {'ai': {'type': 'llm'}}}, 'ai')
+        self.assertIn('no models', str(caught.exception))
+
+    def test_models_and_search_are_read_as_the_key_broker_reads_them(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent')
+        with mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)):
+            got = magehand.agent_llm_connection(
+                {'services': {'ai': {'type': 'llm', 'models': ['b', 'a', 'b'], 'search': 'true'}}}, 'ai')
+        self.assertEqual((got['models'], 'search_url' in got), ('a,b', True))
+
     def test_an_agent_without_a_model_key_is_told_and_nothing_is_read(self):
         empty = pathlib.Path(self.dir.name, 'empty')
         empty.write_text('')
