@@ -2125,6 +2125,9 @@ class CheckCode(unittest.TestCase):
         self.assertNotEqual(magehand.workflow_meaning(steps('a', 'b')), magehand.workflow_meaning(steps('b', 'a')))
         self.assertEqual(magehand.workflow_meaning('on:\n  push:\n    branches: [b, a]\n'),
                          magehand.workflow_meaning('on: {push: {branches: [a, b]}}\n'))
+        # A filter with `!` patterns is read in order (magehand#150's review).
+        self.assertNotEqual(magehand.workflow_meaning("on:\n  push:\n    branches: ['r/*', '!r/x']\n"),
+                            magehand.workflow_meaning("on:\n  push:\n    branches: ['!r/x', 'r/*']\n"))
         missing = check(None)  # no workflow: no platform check runs at all (#136's review)
         self.assertEqual([f['level'] for f in missing], ['error'])
         self.assertIn('is missing', missing[0]['text'])
@@ -3794,6 +3797,17 @@ class Agents(unittest.TestCase):
 
     def test_a_repo_without_the_file_gets_the_template(self):
         self.assertEqual(self.run_agents(None), (0, self.TEMPLATE))
+
+    def test_check_and_update_agents_agree_on_what_an_import_is(self):
+        # magehand#150's review: a mention in backticks isn't an import, for every caller.
+        mention = '@AGENTS.md\nRules: see `@.magehand/workflow.md`.\n'
+        self.assertFalse(magehand.imports_workflow(mention))
+        self.assertEqual(magehand.claude_with_import(mention), mention + '@.magehand/workflow.md\n')
+        self.assertTrue(magehand.imports_workflow('@AGENTS.md\nThe rules: @.magehand/workflow.md\n'))
+        import tempfile as tf
+        with tf.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'CLAUDE.md').write_text(mention)
+            self.assertFalse(magehand.claude_imports_workflow(tmp))
 
     def test_with_the_marker_claude_md_gets_the_import(self):
         # homelab#743: update-agents brings the header and the CLAUDE.md line that loads the rules.
