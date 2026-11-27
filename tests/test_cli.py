@@ -33,6 +33,10 @@ from magehand import cli as magehand
 APP_BUILD = '.github/workflows/build.yaml'  # the template's Build workflow, as GitHub reports its runs
 
 os.environ['MAGEHAND_NO_UPDATE_CHECK'] = '1'  # tests never ask GitHub for the latest version
+# Nor for the agents' rules page, which status, check, verify and new refresh in an app checkout; WorkflowRules
+# tests the real one.
+REFRESH_WORKFLOW = magehand.refresh_workflow
+magehand.refresh_workflow = lambda root=None: None
 
 APP = {
     'name': 'demo',
@@ -3769,6 +3773,160 @@ class Agents(unittest.TestCase):
 
     def test_a_repo_without_the_file_gets_the_template(self):
         self.assertEqual(self.run_agents(None), (0, self.TEMPLATE))
+
+
+class WorkflowRules(unittest.TestCase):
+    """`magehand rules`: the guide's workflow page as .magehand/workflow.md in an app checkout, kept out of Git
+    (homelab#743)."""
+    PAGE = '# How agents work in an app repo\n\n- rule one\n'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.top = pathlib.Path(tmp.name).resolve() / 'app'
+        self.top.mkdir()
+        self.git('init', '-q')
+        (self.top / 'ui-check.yaml').write_text('pages: []\n')
+        (self.top / 'CLAUDE.md').write_text('@AGENTS.md\n@.magehand/workflow.md\n')
+        self.git('add', '-A')
+        self.git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'x')
+        self.page = self.PAGE
+        patcher = mock.patch.object(magehand, 'github_file', self.fake_github)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake_github(self, repo, path, required=True, ref='main'):
+        if (repo, path) != (magehand.APPS_REPO, magehand.WORKFLOW_PAGE):
+            raise AssertionError(f'read {repo} {path}')
+        if isinstance(self.page, BaseException):
+            raise self.page
+        return self.page
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(['git', *args], cwd=cwd or self.top, check=True, capture_output=True,
+                              text=True).stdout
+
+    def test_writes_the_page_and_keeps_it_out_of_git(self):
+        self.assertEqual(magehand.sync_workflow(self.top), ('written', None))
+        self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), self.PAGE)
+        self.assertEqual(self.git('status', '--porcelain'), '')  # nothing untracked, nothing to commit
+        self.assertEqual(magehand.sync_workflow(self.top), ('current', None))
+        self.page = self.PAGE + '- rule two\n'
+        self.assertEqual(magehand.sync_workflow(self.top, write=False), ('stale', None))
+        self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), self.PAGE)  # --check writes nothing
+        self.assertEqual(magehand.sync_workflow(self.top), ('updated', None))
+        self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), self.page)
+        exclude = (self.top / '.git/info/exclude').read_text()
+        self.assertEqual(exclude.count(magehand.WORKFLOW_EXCLUDE), 1)  # added once, never again
+        self.assertEqual(sorted(p.name for p in (self.top / '.magehand').iterdir()), ['workflow.md'])  # no draft left
+
+    def test_an_exclude_file_without_a_final_newline_and_an_existing_entry(self):
+        path = self.top / '.git/info/exclude'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('*.log')
+        magehand.sync_workflow(self.top)
+        self.assertEqual(path.read_text(), '*.log\n/.magehand/\n')
+        path.write_text('.magehand\n')  # already named, in another spelling: left alone
+        (self.top / magehand.WORKFLOW_FILE).unlink()
+        magehand.sync_workflow(self.top)
+        self.assertEqual(path.read_text(), '.magehand\n')
+
+    def test_a_linked_worktree_gets_the_file_and_the_main_checkout_the_exclude(self):
+        wt = self.top.parent / 'wt'
+        self.git('worktree', 'add', '-q', '--detach', str(wt))
+        self.assertEqual(magehand.sync_workflow(wt), ('written', None))
+        self.assertEqual((wt / magehand.WORKFLOW_FILE).read_text(), self.PAGE)
+        self.assertFalse((self.top / magehand.WORKFLOW_FILE).exists())
+        self.assertIn(magehand.WORKFLOW_EXCLUDE, (self.top / '.git/info/exclude').read_text())
+        self.assertEqual(self.git('status', '--porcelain', cwd=wt), '')
+
+    def test_missing_without_write_and_unreadable_page(self):
+        self.assertEqual(magehand.sync_workflow(self.top, write=False), ('missing', None))
+        self.assertFalse((self.top / '.magehand').exists())
+        self.page = None  # not in homelab-apps yet
+        state, problem = magehand.sync_workflow(self.top)
+        self.assertIsNone(state)
+        self.assertIn('has no docs/platform/workflow.md yet', problem)
+        self.page = SystemExit('magehand: no GitHub access')
+        state, problem = magehand.sync_workflow(self.top)
+        self.assertIsNone(state)
+        self.assertIn('magehand doctor', problem)
+        self.assertFalse((self.top / '.magehand').exists())
+
+    def test_never_writes_through_a_symlink_or_over_a_committed_file(self):
+        outside = self.top.parent / 'outside'
+        outside.mkdir()
+        (self.top / '.magehand').symlink_to(outside)
+        state, problem = magehand.sync_workflow(self.top)
+        self.assertIsNone(state)
+        self.assertIn('not a plain directory', problem)
+        self.assertEqual(list(outside.iterdir()), [])
+        (self.top / '.magehand').unlink()
+        (self.top / '.magehand').mkdir()
+        (self.top / magehand.WORKFLOW_FILE).write_text('old\n')
+        self.git('add', '-f', magehand.WORKFLOW_FILE)
+        state, problem = magehand.sync_workflow(self.top)
+        self.assertIsNone(state)
+        self.assertIn('git rm --cached', problem)
+        self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), 'old\n')
+
+    def test_the_command(self):
+        run = lambda *argv: CommandLine.run_main(self, 'rules', '--code', str(self.top), *argv)
+        code, out, _ = run('--check', '--json')
+        self.assertEqual((code, json.loads(out)['state'], json.loads(out)['next']), (1, 'missing', '`magehand rules`'))
+        code, out, _ = run('--json')
+        self.assertEqual((code, json.loads(out)), (0, {'path': str(self.top / magehand.WORKFLOW_FILE), 'state': 'written',
+                                                       'imported': True, 'problem': None, 'next': None}))
+        code, _, err = run()
+        self.assertEqual(code, 0)
+        self.assertIn('up to date', err)
+        self.page = None
+        code, out, _ = run('--json')
+        self.assertEqual((code, json.loads(out)['state']), (1, None))
+        (self.top / 'ui-check.yaml').unlink()  # not an app's checkout
+        with self.assertRaises(SystemExit) as caught:
+            magehand.main(['rules', '--code', str(self.top)])
+        self.assertIn("is not an app's checkout", str(caught.exception.code))
+
+    def test_the_commands_agents_run_refresh_it_quietly_and_never_fail(self):
+        with mock.patch.object(magehand, 'checkout_top', lambda root=None: self.top):
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                REFRESH_WORKFLOW()
+            self.assertIn('.magehand/workflow.md written', buf.getvalue())
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                REFRESH_WORKFLOW()  # current: says nothing
+                self.page = SystemExit('offline')
+                REFRESH_WORKFLOW()  # unreadable: says nothing, doesn't raise
+            self.assertEqual(buf.getvalue(), '')
+            (self.top / 'ui-check.yaml').unlink()
+            self.page = self.PAGE + 'x\n'
+            REFRESH_WORKFLOW()  # not an app checkout: untouched
+        self.assertEqual((self.top / magehand.WORKFLOW_FILE).read_text(), self.PAGE)
+
+    def session(self, rules_json):
+        """The session hook's output in this checkout when `magehand rules --json` prints `rules_json` and magehand
+        is current."""
+        fake = self.top.parent / 'fake-magehand'
+        fake.write_text('import json, sys\n'
+                        f'print({rules_json!r} if sys.argv[1] == "rules" else json.dumps({{"newer": False}}))\n')
+        script = magehand.SESSION_HOOK.format(generated='x', magehand=json.dumps([sys.executable, str(fake)]))
+        (self.top / 'AGENTS.md').write_text('Use magehand.\n')
+        run = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True, timeout=30,  # noqa: PLW1510
+                             input=json.dumps({'hook_event_name': 'SessionStart', 'cwd': str(self.top)}))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout
+
+    def test_a_session_that_loaded_stale_rules_is_told_to_read_them(self):
+        for state, word in (('written', 'missing'), ('updated', 'out of date')):
+            out = json.loads(self.session(json.dumps({'state': state, 'imported': True})))['hookSpecificOutput']
+            self.assertIn(f'were {word} when this session started', out['additionalContext'])
+            self.assertIn('`magehand guide workflow`', out['additionalContext'])
+        for quiet in ({'state': 'current', 'imported': True}, {'state': 'written', 'imported': False},
+                      {'state': None, 'problem': 'offline', 'imported': True}):
+            self.assertEqual(self.session(json.dumps(quiet)), '', quiet)
+        self.assertEqual(self.session('not json'), '')
 
 
 BOT_PATH = f"/collaborators/{magehand.BOT}"

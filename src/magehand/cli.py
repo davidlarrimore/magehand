@@ -2153,6 +2153,7 @@ def status_target(name=None):
 
 def cmd_status(a):
     name, repo = status_target(scoped_app('status', a.app_flag or a.app))
+    refresh_workflow()
     deadline = time.monotonic() + a.timeout * 60
     last = None
     lifecycle, polls, seen = lifecycle_stages(repo, name), 0, None
@@ -3477,6 +3478,7 @@ def cmd_new(a):
             wrote.append('.git/hooks/pre-push')
         elif before in ('other', 'shared'):
             print(f'{work}: {what}', file=sys.stderr)
+        refresh_workflow(work)  # the agents' rules, kept out of Git: never in `wrote`, nothing to commit
         if wrote:
             print(f'{work}: wrote {", ".join(wrote)} (nothing existing was changed but AGENTS.md\'s platform rules)'
                   if 'AGENTS.md' in wrote else f'{work}: wrote {", ".join(wrote)}', file=sys.stderr)
@@ -5998,6 +6000,7 @@ def cmd_check(a):
         APPS_DIR = a.apps_dir
     root = pathlib.Path(a.code)
     name = scoped_app('check', a.app_flag or a.app, root, repo_name=True)
+    refresh_workflow(root)
     catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
     # The deployment is the checkout's deploy/ when it has one (else homelab-apps'), with or without the code rules.
     pinned_here = []  # a pinned app checked with --apps-dir from a checkout without deploy/app.yaml
@@ -6088,6 +6091,115 @@ def agents_text(path):
                                f'from this app\'s notes. Put the heading above the app\'s own notes (see '
                                f'{TEMPLATE_REPO}), then run it again')
     return current, platform + own, None
+
+
+# --- rules: the platform's working rules in each app checkout (homelab#743) ------------------------------------
+# The rules every coding agent follows in an app repo are one guide page, homelab-apps docs/platform/workflow.md.
+# magehand writes it into the checkout as .magehand/workflow.md, kept out of Git through .git/info/exclude, and the
+# app's CLAUDE.md imports it. It has to be inside the checkout: a headless Claude Code run skips an import from
+# outside its working directory without a word (homelab#743, tested 2026-11-27).
+
+WORKFLOW_PAGE = 'docs/platform/workflow.md'
+WORKFLOW_FILE = '.magehand/workflow.md'
+WORKFLOW_IMPORT = '@' + WORKFLOW_FILE
+WORKFLOW_EXCLUDE = '/.magehand/'
+WORKFLOW_STATES = {'current': 'up to date', 'written': 'written from the guide', 'updated': 'updated from the guide',
+                   'missing': 'missing', 'stale': 'out of date'}
+
+
+def exclude_workflow(top):
+    """Adds /.magehand/ to the checkout's info/exclude (a linked worktree's is its main checkout's) unless a line
+    already names the directory. Local to this clone: no app-repo change."""
+    found = git_out(['rev-parse', '--git-path', 'info/exclude'], top)
+    if not found:
+        raise OSError('not a git checkout')
+    path = pathlib.Path(found) if os.path.isabs(found) else pathlib.Path(top) / found
+    text = path.read_text() if path.is_file() else ''
+    if any(line.strip().strip('/') == '.magehand' for line in text.splitlines()):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a') as out:
+        out.write(('\n' if text and not text.endswith('\n') else '') + WORKFLOW_EXCLUDE + '\n')
+
+
+def sync_workflow(top, write=True):
+    """(state, problem) of the checkout's .magehand/workflow.md against the guide page. state: 'current', 'written'
+    (it was missing), 'updated' (it was out of date), or with write=False 'missing' or 'stale'; None with the
+    problem when the page can't be read or the file can't be written safely."""
+    try:
+        page = github_file(APPS_REPO, WORKFLOW_PAGE, required=False)
+    except SystemExit:  # no GitHub access and nothing cached
+        return None, f'cannot read {APPS_REPO} {WORKFLOW_PAGE} (`magehand doctor` checks GitHub access)'
+    if not page:
+        return None, f'{APPS_REPO} has no {WORKFLOW_PAGE} yet'
+    top = pathlib.Path(top)
+    folder, path = top / '.magehand', top / WORKFLOW_FILE
+    if folder.is_symlink() or path.is_symlink() or (folder.exists() and not folder.is_dir()):
+        return None, f'{folder} is not a plain directory; remove it and run `magehand rules` again'
+    if git_out(['ls-files', '--', WORKFLOW_FILE], top):
+        return None, f'{WORKFLOW_FILE} is committed to this repo; `git rm --cached {WORKFLOW_FILE}` and commit'
+    try:
+        current = path.read_text() if path.is_file() else None
+        if current == page:
+            if write:
+                exclude_workflow(top)
+            return 'current', None
+        if not write:
+            return ('missing' if current is None else 'stale'), None
+        exclude_workflow(top)  # first, so the file never shows as untracked
+        folder.mkdir(exist_ok=True)
+        # A draft of its own, then a rename: two magehand runs at once never mix their writes.
+        fd, draft = tempfile.mkstemp(dir=folder, prefix='.workflow.', suffix='.new')
+        try:
+            with os.fdopen(fd, 'w') as out:
+                out.write(page)
+            os.replace(draft, path)
+        except OSError:
+            pathlib.Path(draft).unlink(missing_ok=True)
+            raise
+    except OSError as error:
+        return None, f'cannot write {path}: {error}'
+    return ('written' if current is None else 'updated'), None
+
+
+def claude_imports_workflow(top):
+    """Whether the checkout's CLAUDE.md imports .magehand/workflow.md."""
+    try:
+        return WORKFLOW_IMPORT in (pathlib.Path(top) / 'CLAUDE.md').read_text()
+    except OSError:
+        return False
+
+
+def refresh_workflow(root=None):
+    """For the commands agents run anyway (status, check, verify, new): in an app's checkout, brings
+    .magehand/workflow.md up to date, with one line on stderr when it changed. Never fails the command."""
+    top = checkout_top(root)
+    if not top or not is_app_checkout(top):
+        return
+    state, _ = sync_workflow(top)
+    if state in ('written', 'updated'):
+        print(f'magehand: {WORKFLOW_FILE} {WORKFLOW_STATES[state]} (the platform\'s working rules: '
+              '`magehand guide workflow`)', file=sys.stderr)
+
+
+def cmd_rules(a):
+    top = checkout_top(a.code)
+    if not top or not is_app_checkout(top):
+        die(f"{pathlib.Path(a.code).resolve()} is not an app's checkout (no deploy/app.yaml or ui-check.yaml)")
+    state, problem = sync_workflow(top, write=not a.check)
+    path = top / WORKFLOW_FILE
+    behind = state in ('missing', 'stale')
+    step = '`magehand rules`' if behind else None  # a problem's message names its own fix
+    if a.json:
+        print(json.dumps({'path': str(path), 'state': state, 'imported': claude_imports_workflow(top),
+                          'problem': problem, 'next': step}))
+    elif problem:
+        print(f'magehand: {problem}', file=sys.stderr)
+    else:
+        print(f'{path}: {WORKFLOW_STATES[state]}', file=sys.stderr)
+    if not a.json:
+        print(next_line(step))
+    sys.exit(1 if problem or behind else 0)
 
 
 # --- verify and hooks: the platform's checks before a push (homelab#611) --------------------------------------
@@ -6456,6 +6568,7 @@ def cmd_verify(a):
     if a.apps_dir:
         APPS_DIR = a.apps_dir
     top = lab_checkout('verify', quiet=a.pre_push)
+    refresh_workflow(top)
     targets = verify_targets(top, sys.stdin.read().splitlines() if a.pre_push else None, a.all)
     if not targets:
         if a.pre_push:
@@ -6793,30 +6906,53 @@ import subprocess
 import sys
 
 
-def uses_magehand(cwd):
-    """True in a checkout whose AGENTS.md or CLAUDE.md names magehand (app repos and the platform's)."""
+def checkout(cwd):
+    """The top of the git checkout holding `cwd`, or None."""
     for d in [cwd, *cwd.parents]:
         if (d / '.git').exists():
-            return any('magehand' in (d / n).read_text(errors='replace') for n in ('AGENTS.md', 'CLAUDE.md')
-                       if (d / n).is_file())
-    return False
+            return d
+    return None
+
+
+def uses_magehand(top):
+    """True in a checkout whose AGENTS.md or CLAUDE.md names magehand (app repos and the platform's)."""
+    return any('magehand' in (top / n).read_text(errors='replace') for n in ('AGENTS.md', 'CLAUDE.md')
+               if (top / n).is_file())
+
+
+def ask(args):
+    """magehand's --json answer to `args` (a dict), or {{}} on any failure."""
+    try:
+        out = subprocess.run({magehand} + args, capture_output=True, text=True, timeout=8)
+        found = json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {{}}
+    return found if isinstance(found, dict) else {{}}
 
 
 try:
-    if not uses_magehand(pathlib.Path(json.load(sys.stdin).get('cwd') or '.')):
+    top = checkout(pathlib.Path(json.load(sys.stdin).get('cwd') or '.'))
+    if not top or not uses_magehand(top):
         sys.exit(0)
 except (OSError, ValueError, AttributeError):
     sys.exit(0)
-try:
-    out = subprocess.run({magehand} + ['version', '--json'], capture_output=True, text=True, timeout=8)
-    found = json.loads(out.stdout)
-except (OSError, ValueError, subprocess.SubprocessError):
-    found = {{}}
-if isinstance(found, dict) and found.get('newer'):
-    print(json.dumps({{'hookSpecificOutput': {{'hookEventName': 'SessionStart', 'additionalContext': (
-        'magehand ' + str(found.get('latest')) + ' is out; this machine has ' + str(found.get('version')) + '. Tell '
-        'the user before any platform work: `magehand upgrade` updates it, and with it the homelab-app skill and '
-        'the pre-approved commands.')}}}}))
+said = []
+found = ask(['version', '--json'])
+if found.get('newer'):
+    said.append('magehand ' + str(found.get('latest')) + ' is out; this machine has ' + str(found.get('version')) +
+                '. Tell the user before any platform work: `magehand upgrade` updates it, and with it the '
+                'homelab-app skill and the pre-approved commands.')
+# An app's checkout: the agents' rules (.magehand/workflow.md), which CLAUDE.md imports. This session has already
+# loaded whatever was there, so a refresh reaches the next session; this one is told to read the page now.
+if (top / 'ui-check.yaml').is_file() or (top / 'deploy' / 'app.yaml').is_file():
+    rules = ask(['rules', '--json', '--code', str(top)])
+    if rules.get('imported') and rules.get('state') in ('written', 'updated'):
+        said.append("The platform's working rules for agents (.magehand/workflow.md) were " +
+                    ('missing' if rules.get('state') == 'written' else 'out of date') + ' when this session '
+                    'started, so what you loaded from CLAUDE.md lacks them. magehand has now refreshed the file. '
+                    'Read them now with `magehand guide workflow`, before any work in this repo.')
+if said:
+    print(json.dumps({{'hookSpecificOutput': {{'hookEventName': 'SessionStart', 'additionalContext': ' '.join(said)}}}}))
 '''
 
 # The Claude Code hook: stdlib only (it runs before every Bash call), the list baked in as JSON.
@@ -6957,7 +7093,7 @@ def install_approvals():
     session = f'{python} -I "${{CLAUDE_PLUGIN_ROOT}}/hooks/session.py"'
     (plugin / 'hooks' / 'hooks.json').write_text(json.dumps({'hooks': {
         'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}],
-        'SessionStart': [{'matcher': 'startup', 'hooks': [{'type': 'command', 'command': session, 'timeout': 10}]}]}},
+        'SessionStart': [{'matcher': 'startup', 'hooks': [{'type': 'command', 'command': session, 'timeout': 20}]}]}},
         indent=2) + '\n')
     results.append((plugin, None))
     if codex_dir().is_dir():
@@ -9481,7 +9617,7 @@ GROUPS = (('start an app', ('new', 'icon')),
           ('this machine', ('setup', 'doctor', 'hooks', 'upgrade')))
 # Working, but not what a person needs to learn: -V and -h do version's and help's jobs, setup and upgrade
 # install the skill (OpenClaw's provisioning runs `skill --install`), and check says when to update-agents.
-PLUMBING = ('update-agents', 'skill', 'version', 'help')
+PLUMBING = ('update-agents', 'rules', 'skill', 'version', 'help')
 # Commands whose output is the result itself (data, or your own command's output): no `next:` line. Every
 # other command ends its human output with next_line() and puts "next" in its --json.
 NO_NEXT = ('guide', 'run', 'bucket', 'runtime', 'login', 'api', 'skill', 'version', 'help')
@@ -9816,6 +9952,16 @@ def build_parser():
                 'examples:\n  magehand update-agents\n  magehand update-agents --check          exit 1 if out of date, writes nothing')
     p.add_argument('--code', default='.', metavar='DIR', help="the app's repo (default: .)")
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')
+    json_option(p)
+    p = command('rules', cmd_rules, "write the platform's working rules into this checkout", "write the platform's working rules for agents into this app checkout (.magehand/workflow.md)",
+                'Writes the guide page `magehand guide workflow` to .magehand/workflow.md, which the app\'s CLAUDE.md\n'
+                'imports, and keeps it out of Git through .git/info/exclude (this clone only; nothing to commit).\n'
+                '`status`, `check`, `verify` and `new` do the same quietly, and a new Claude Code session refreshes\n'
+                'it; run it yourself before a headless agent run on a fresh clone.\n\n'
+                'examples:\n  magehand rules\n  magehand rules --check          exit 1 if missing or out of date, writes nothing\n'
+                '  magehand rules --json')
+    p.add_argument('--code', default='.', metavar='DIR', help="the app's checkout (default: .)")
+    p.add_argument('--check', action='store_true', help='only report whether it is missing or out of date (exit 1 if so)')
     json_option(p)
     # run it locally
     p = command('login', cmd_login, 'sign in to OpenBao and app APIs with your passkey', 'sign in through authentik with your passkey: OpenBao (keys for `run`) and app APIs (`api`); up to a week',
