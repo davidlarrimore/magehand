@@ -44,6 +44,11 @@
   `.git/magehand/verified` (the commits that passed), and `magehand hooks install` (and `new`), which writes
   `.git/hooks/pre-push` and never replaces a hook it didn't write; `pr ready
   --force` also comments on the PR that it skipped `verify`; and
+  `.magehand/workflow.md` in an app's checkout, with a `/.magehand/` line in
+  that clone's `.git/info/exclude` (`magehand rules`, and quietly `status`,
+  `check`, `verify`, `new` and the Claude Code session hook: the guide's
+  workflow page, never written through a symlink or over a committed file;
+  homelab#743), and
   `magehand bucket cp` / `sync`, which put objects into that app's own
   bucket only (the app of the checkout you are in; `--app` may only name it), on an explicit command, with the keys of the environment
   asked for (`--env prod` writes production data), and never delete.
