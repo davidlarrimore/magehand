@@ -5389,7 +5389,7 @@ QUALITY_SEE = 'homelab-apps docs/development/quality.md "Quality check"'
 
 def workflow_meaning(text):
     """A workflow's parsed YAML for comparing by meaning: comments, layout, quoting, key order and the order of a
-    list of plain values (event types, branches) don't count; everything else does (the name, triggers,
+    list of plain values (event types, branches; not a filter with `!` patterns) don't count; everything else does (the name, triggers,
     permissions, jobs and what they call, and the order of steps). None if it isn't a YAML mapping. PyYAML reads
     the key `on` as True: named back."""
     def norm(value):
@@ -5398,7 +5398,9 @@ def workflow_meaning(text):
         if isinstance(value, list):
             items = [norm(v) for v in value]
             plain = all(not isinstance(v, (dict, list)) for v in items)
-            return sorted(items, key=lambda v: json.dumps(v, default=str)) if plain else items
+            # GitHub reads `branches`/`paths` filters with `!` patterns in order (magehand#150's review).
+            negated = any(isinstance(v, str) and v.startswith('!') for v in items)
+            return sorted(items, key=lambda v: json.dumps(v, default=str)) if plain and not negated else items
         return value
     try:
         doc = yaml.safe_load(text)
@@ -6199,10 +6201,17 @@ def sync_workflow(top, write=True):
     return ('written' if current is None else 'updated'), None
 
 
+def imports_workflow(text):
+    """Whether a CLAUDE.md's text imports .magehand/workflow.md: the import as a word of its own, as Claude Code
+    reads one (a mention in backticks, `@.magehand/workflow.md`, is not an import). check, update-agents and the
+    session hook all ask this (magehand#150's review); OpenClaw's review rules ask the same (homelab tools)."""
+    return WORKFLOW_IMPORT in (text or '').split()
+
+
 def claude_imports_workflow(top):
     """Whether the checkout's CLAUDE.md imports .magehand/workflow.md."""
     try:
-        return WORKFLOW_IMPORT in (pathlib.Path(top) / 'CLAUDE.md').read_text(errors='replace')
+        return imports_workflow((pathlib.Path(top) / 'CLAUDE.md').read_text(errors='replace'))
     except OSError:
         return False
 
@@ -6762,7 +6771,7 @@ def cmd_hooks(a):
 def claude_with_import(text):
     """CLAUDE.md's text with the platform rules' import added, or None when it already has it. A missing or
     empty file gets the template's two pointers."""
-    if text is not None and WORKFLOW_IMPORT in text.split():
+    if imports_workflow(text):
         return None
     if not (text or '').strip():
         return f'@AGENTS.md\n{WORKFLOW_IMPORT}\n'
