@@ -65,6 +65,9 @@ AGENT_TOKEN = os.environ.get('MAGEHAND_AGENT_TOKEN')
 # Where *.lab names connect when public DNS can't help (they resolve to 127.0.0.1 publicly): the lab's ingress
 # address as seen from an agent's VM. TLS still checks the real host name.
 LAB_ADDRESS = os.environ.get('MAGEHAND_LAB_ADDRESS')
+# A lab agent's own model key (a file's path, never the key): `run`/`dev` give the app that key and the gateway
+# address in place of the app's own key, which an agent can't read. The key has its own budget.
+AGENT_LLM_KEY = os.environ.get('MAGEHAND_AGENT_LLM_KEY')
 HOME = pathlib.Path.home()
 STATE = pathlib.Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'magehand'
 CACHE = pathlib.Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'magehand'
@@ -1039,8 +1042,8 @@ def api_session_token(below=API_RENEW_BELOW, need=0, failed=None):
             die(f"the agent's dev token ({AGENT_TOKEN}) is missing or expired: the lab replaces it every 5 minutes "
                 '(homelab-agent-token.timer in its VM); if it stays missing, tell the owner')
         if left < need:
-            die(f"the agent's dev token has only {minutes(left)} left: the lab replaces it within 5 minutes "
-                '(homelab-agent-token.timer); try again then')
+            die(f"the agent's dev token has only {minutes(left)} left: the lab replaces it (homelab-agent-token.timer); "
+                'try again shortly, and if it stays short, tell the owner')
         return token, left
     problem = []
     token, left = api_token(below=below, problem=problem)
@@ -4036,6 +4039,30 @@ def dotenv(path):
     return values
 
 
+def agent_llm_connection(app, block):
+    """An llm block's connection for a lab agent: its own key (MAGEHAND_AGENT_LLM_KEY) and the gateway, with the
+    models the block requests (the catalog's default when it names none), shaped like the app's Secret."""
+    if not AGENT_LLM_KEY:
+        die(f"llm block {block}: a lab agent runs the app with its own model key (MAGEHAND_AGENT_LLM_KEY), which "
+            "isn't set; the app's own key is the owner's (tell the owner)")
+    try:
+        key = pathlib.Path(AGENT_LLM_KEY).read_text().strip()
+    except OSError as error:
+        die(f"llm block {block}: can't read the agent's model key ({type(error).__name__}); tell the owner")
+    if not key:
+        die(f'llm block {block}: the agent\'s model key file is empty; tell the owner')
+    svc = (app.get('services') or {}).get(block) or {}
+    models = svc.get('models')
+    if not models:
+        catalog = yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {}
+        models = [m.get('id') for m in catalog.get('models') or [] if isinstance(m, dict) and m.get('default')]
+    base = f'https://llm.{LAB}/v1'
+    connection = {'api_key': key, 'base_url': base, 'models': ','.join(models)}
+    if svc.get('search') is True:  # as the key broker: the key exists only when the block asks for search
+        connection['search_url'] = f'{base}/search/exa'
+    return connection
+
+
 def resolve_env(app, container=False):
     """The pod's env, resolved for this machine. On the host, precedence is:
     manifest values < .magehand.env < the caller's environment < secrets
@@ -4065,7 +4092,9 @@ def resolve_env(app, container=False):
                       '(or set the value in .magehand.env or your shell)', file=sys.stderr)
             continue
         if block not in fetched:
-            if kind == 'llm':
+            if kind == 'llm' and AGENT_TOKEN:
+                fetched[block] = agent_llm_connection(app, block)
+            elif kind == 'llm':
                 token = token or valid_token()
                 path = f'apps/data/{app["name"]}-dev/llm-{block}'
                 status, body = bao('GET', path, token)
