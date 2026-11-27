@@ -1035,9 +1035,12 @@ def api_session_token(below=API_RENEW_BELOW, need=0, failed=None):
     a renewal that failed for now is appended there and (None, 0) returned, for a caller that reports it itself."""
     if AGENT_TOKEN:
         token, left = agent_token()
-        if not token or left < need:
+        if not token:
             die(f"the agent's dev token ({AGENT_TOKEN}) is missing or expired: the lab replaces it every 5 minutes "
                 '(homelab-agent-token.timer in its VM); if it stays missing, tell the owner')
+        if left < need:
+            die(f"the agent's dev token has only {minutes(left)} left: the lab replaces it within 5 minutes "
+                '(homelab-agent-token.timer); try again then')
         return token, left
     problem = []
     token, left = api_token(below=below, problem=problem)
@@ -1084,7 +1087,8 @@ def api_print_token(a):
         print(json.dumps({'token': token, 'expires_at': expires, 'seconds_left': left}))
     else:
         print(token)
-    print(f'magehand: app-API token, {minutes(left)} left: works on every app (dev and production) as you; '
+    reach = 'dev apps only, as the agent' if AGENT_TOKEN else 'every app (dev and production) as you'
+    print(f'magehand: app-API token, {minutes(left)} left: works on {reach}; '
           "keep it out of files, logs and commits", file=sys.stderr)
 
 

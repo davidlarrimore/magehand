@@ -1645,6 +1645,18 @@ class AgentIdentity(unittest.TestCase):
         self.assertIn('homelab-agents', err)
         self.assertNotIn('magehand login', err)
 
+    def test_api_token_names_a_short_token_and_says_it_is_dev_only(self):
+        self.token('agent-tok', left=540)  # under api token's 10 minutes: the timer replaces it within 5
+        code, out, err = self.run_main('api', 'token')
+        self.assertEqual(code, 1)
+        self.assertIn('left', err)
+        self.assertNotIn('missing or expired', err)
+        self.token('agent-tok', left=840)
+        code, out, err = self.run_main('api', 'token')
+        self.assertEqual((code, out.strip()), (0, 'agent-tok'))
+        self.assertIn('dev apps only, as the agent', err)
+        self.assertNotIn('production', err)
+
     def test_lab_names_connect_to_the_lab_address_and_nothing_else_does(self):
         seen = []
         with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \
