@@ -49,7 +49,9 @@
   asked for (`--env prod` writes production data), and never delete.
   `magehand api` sends the one request it is given to the app's dev URL, or
   with `--prod` its production URL, as the owner (a non-GET changes the
-  app's data; it says so for production).
+  app's data; it says so for production). Under a lab agent's token
+  (`MAGEHAND_AGENT_TOKEN`) it sends it as that agent, to dev only:
+  `--prod`, `release` and `login` stop before anything is sent.
 - Secrets never touch argv (`-e NAME` for docker; the token goes to the
   Keychain on stdin, `security -i`) and never touch disk, except the token's
   0600 file off macOS, where the standard library has no credential store.

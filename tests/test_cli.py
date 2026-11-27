@@ -1576,6 +1576,93 @@ class ProxyHeaders(unittest.TestCase):
         self.assertEqual(seen['x-authentik-groups'], 'homelab-admins')
 
 
+class AgentIdentity(unittest.TestCase):
+    """A lab agent (MAGEHAND_AGENT_TOKEN): its own dev token from a file the lab renews, dev only, and *.lab names
+    sent to MAGEHAND_LAB_ADDRESS."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = pathlib.Path(self.dir.name, 'builder.json')
+        for name, value in (('AGENT_TOKEN', str(self.path)), ('app_checkout', lambda root=None: None),
+                            ('current_app', lambda root=None: 'demo')):
+            patch = mock.patch.object(magehand, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def token(self, value='agent-tok', left=600):
+        self.path.write_text(json.dumps({'username': 'homelab-builder', 'access_token': value,
+                                         'expires_at': int(time.time()) + left}))
+
+    def run_main(self, *argv):
+        return AppApi.run_main(self, *argv)
+
+    def test_the_token_comes_from_the_file_each_time(self):
+        self.token('first')
+        self.assertEqual(magehand.api_session_token()[0], 'first')
+        self.token('second')  # the lab's timer replaced it
+        self.assertEqual(magehand.api_token()[0], 'second')
+        self.assertFalse(magehand.api_rejected('second'))  # never asks authentik's userinfo
+
+    def test_a_missing_or_expired_token_says_the_lab_renews_it_and_never_offers_a_sign_in(self):
+        for prepare in (lambda: None, lambda: self.token(left=-5), lambda: self.path.write_text('not json')):
+            self.path.unlink(missing_ok=True)
+            prepare()
+            with mock.patch.object(magehand, 'cmd_login', lambda a: self.fail('offered a sign-in')), \
+                    mock.patch.object(sys.stdin, 'isatty', lambda: True), \
+                    self.assertRaises(SystemExit) as caught:
+                magehand.api_session_token()
+            self.assertIn('homelab-agent-token', str(caught.exception))
+
+    def test_dev_requests_carry_the_agents_token(self):
+        self.token('agent-tok')
+        calls = []
+        with mock.patch.object(magehand, 'api_call',
+                               lambda url, method, headers, body: calls.append((url, headers)) or (200, {}, b'ok')):
+            code, out, _ = self.run_main('api', '-a', 'demo', '/api/health')
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [('https://demo-dev.lab.davidlarrimore.com/api/health',
+                                  {'User-Agent': 'magehand', 'Authorization': 'Bearer agent-tok'})])
+
+    def test_production_release_and_sign_in_are_refused_before_anything_is_sent(self):
+        self.token()
+        sent = []
+        with mock.patch.object(magehand, 'api_call', lambda *a: sent.append(a) or (200, {}, b'')), \
+                mock.patch.object(magehand, 'bao', lambda *a, **k: sent.append(a) or (200, {})), \
+                mock.patch.object(magehand, 'plan_release', lambda *a, **k: sent.append(a) or {}):
+            for argv in (('api', '-a', 'demo', '/', '--prod'), ('release', '--dry-run'), ('login',)):
+                code, _, err = self.run_main(*argv)
+                self.assertEqual(code, 1, argv)
+                self.assertIn("is the owner's", err, argv)
+        self.assertEqual(sent, [])
+
+    def test_a_refused_token_names_the_agents_group_not_magehand_login(self):
+        self.token()
+        signin = (302, {'Location': 'https://auth.davidlarrimore.com/application/o/authorize/?x=1'}, b'')
+        with mock.patch.object(magehand, 'api_call', lambda *a: signin):
+            code, _, err = self.run_main('api', '-a', 'demo', '/')
+        self.assertEqual(code, 1)
+        self.assertIn('homelab-agents', err)
+        self.assertNotIn('magehand login', err)
+
+    def test_lab_names_connect_to_the_lab_address_and_nothing_else_does(self):
+        seen = []
+        with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \
+                mock.patch.object(magehand.socket, 'getaddrinfo', lambda host, *a, **k: seen.append(host) or []):
+            magehand.use_lab_address()
+            for host in ('demo-dev.lab.davidlarrimore.com', 'lab.davidlarrimore.com', 'github.com',
+                         'notlab.davidlarrimore.com.example.com', 'evil-lab.davidlarrimore.com.example.com'):
+                magehand.socket.getaddrinfo(host, 443)
+        self.assertEqual(seen, ['192.0.2.10', '192.0.2.10', 'github.com', 'notlab.davidlarrimore.com.example.com',
+                                'evil-lab.davidlarrimore.com.example.com'])
+
+    def test_without_the_setting_resolution_is_untouched(self):
+        before = magehand.socket.getaddrinfo
+        with mock.patch.object(magehand, 'LAB_ADDRESS', None):
+            magehand.use_lab_address()
+        self.assertIs(magehand.socket.getaddrinfo, before)
+
+
 if __name__ == '__main__':
     unittest.main()
 
