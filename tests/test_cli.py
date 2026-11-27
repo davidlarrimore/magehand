@@ -1657,6 +1657,90 @@ class AgentIdentity(unittest.TestCase):
         self.assertIn('dev apps only, as the agent', err)
         self.assertNotIn('production', err)
 
+    def test_an_agents_run_gets_its_own_model_key_and_never_reads_openbao(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent\n')
+        app = {'name': 'demo', 'services': {'ai': {'type': 'llm', 'models': ['m1', 'm2'], 'search': True}}}
+        with mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)), \
+                mock.patch.object(magehand, 'bao', lambda *a, **k: self.fail('read OpenBao')):
+            self.assertEqual(magehand.agent_llm_connection(app, 'ai'),
+                             {'api_key': 'sk-agent', 'base_url': 'https://llm.lab.davidlarrimore.com/v1',
+                              'models': 'm1,m2', 'search_url': 'https://llm.lab.davidlarrimore.com/v1/search/exa'})
+
+    def test_an_agents_block_without_models_gets_the_catalog_default_and_no_search(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent')
+        catalog = 'models:\n  - {id: small}\n  - {id: big, default: true}\n'
+        with mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: catalog):
+            got = magehand.agent_llm_connection({'services': {'ai': {'type': 'llm'}}}, 'ai')
+        self.assertEqual((got['models'], 'search_url' in got), ('big', False))
+
+    def test_resolve_env_under_an_agent_puts_its_key_in_the_apps_variable(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent')
+        app = {**APP, 'services': {'ai': {'type': 'llm', 'models': ['m1']}},
+               'container': {**APP['container'], 'env': [
+                   {'name': 'LLM_KEY', 'valueFrom': {'secretKeyRef': {'name': 'ai-connection', 'key': 'api_key'}}},
+                   {'name': 'LLM_URL', 'valueFrom': {'secretKeyRef': {'name': 'ai-connection', 'key': 'base_url'}}}]}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(magehand, 'STATE', pathlib.Path(tmp)), \
+                mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)), \
+                mock.patch.object(magehand, 'valid_token', lambda: self.fail('signed in')), \
+                mock.patch.dict('os.environ', {}, clear=False):
+            os.environ.pop('LLM_KEY', None)
+            env = magehand.resolve_env(app)
+        self.assertEqual((env['LLM_KEY'], env['LLM_URL']), ('sk-agent', 'https://llm.lab.davidlarrimore.com/v1'))
+
+    def test_a_container_reaches_lab_names_at_the_lab_address_without_resolving_them(self):
+        with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \
+                mock.patch.object(magehand.socket, 'gethostbyname', lambda h: self.fail('resolved ' + h)):
+            hosts = magehand.lab_hosts({'U': 'https://llm.lab.davidlarrimore.com/v1', 'X': 'https://example.com'})
+        self.assertEqual(hosts, ['llm.lab.davidlarrimore.com:192.0.2.10'])
+
+    def test_a_host_run_stops_when_the_apps_own_lookup_would_give_loopback(self):
+        parser = magehand.build_parser()
+        env = {'LLM_URL': 'https://llm.lab.davidlarrimore.com/v1'}
+        started = []
+        for resolved, stops in (('127.0.0.1', True), ('192.0.2.10', False)):
+            with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \
+                    mock.patch.object(magehand, 'app_here', lambda name: {'name': 'demo'}), \
+                    mock.patch.object(magehand, 'scoped_app', lambda *a, **k: 'demo'), \
+                    mock.patch.object(magehand, 'resolve_env', lambda app, container=False: dict(env)), \
+                    mock.patch.object(magehand.socket, 'gethostbyname', lambda h, r=resolved: r), \
+                    mock.patch.object(magehand.subprocess, 'Popen',
+                                      lambda *a, **k: started.append(a) or mock.Mock(wait=lambda: 0)), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                magehand.cmd_run(parser.parse_args(['run', '--no-proxy', '--', 'true']))
+            if stops:
+                self.assertIn('--container', str(caught.exception.code))
+                self.assertEqual(started, [])
+            else:
+                self.assertEqual((caught.exception.code, len(started)), (0, 1))
+
+    def test_no_models_anywhere_is_told_not_started_with_an_empty_list(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent')
+        with mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)), \
+                mock.patch.object(magehand, 'github_file', lambda *a, **k: None), self.assertRaises(SystemExit) as caught:
+            magehand.agent_llm_connection({'services': {'ai': {'type': 'llm'}}}, 'ai')
+        self.assertIn('no models', str(caught.exception))
+
+    def test_models_and_search_are_read_as_the_key_broker_reads_them(self):
+        key = pathlib.Path(self.dir.name, 'llm-key')
+        key.write_text('sk-agent')
+        with mock.patch.object(magehand, 'AGENT_LLM_KEY', str(key)):
+            got = magehand.agent_llm_connection(
+                {'services': {'ai': {'type': 'llm', 'models': ['b', 'a', 'b'], 'search': 'true'}}}, 'ai')
+        self.assertEqual((got['models'], 'search_url' in got), ('a,b', True))
+
+    def test_an_agent_without_a_model_key_is_told_and_nothing_is_read(self):
+        empty = pathlib.Path(self.dir.name, 'empty')
+        empty.write_text('')
+        for setting in (None, str(pathlib.Path(self.dir.name, 'missing')), str(empty)):
+            with mock.patch.object(magehand, 'AGENT_LLM_KEY', setting), self.assertRaises(SystemExit) as caught:
+                magehand.agent_llm_connection({'services': {'ai': {'type': 'llm', 'models': ['m']}}}, 'ai')
+            self.assertIn('tell the owner', str(caught.exception))
+
     def test_lab_names_connect_to_the_lab_address_and_nothing_else_does(self):
         seen = []
         with mock.patch.object(magehand, 'LAB_ADDRESS', '192.0.2.10'), \

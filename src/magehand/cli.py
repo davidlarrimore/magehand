@@ -65,6 +65,9 @@ AGENT_TOKEN = os.environ.get('MAGEHAND_AGENT_TOKEN')
 # Where *.lab names connect when public DNS can't help (they resolve to 127.0.0.1 publicly): the lab's ingress
 # address as seen from an agent's VM. TLS still checks the real host name.
 LAB_ADDRESS = os.environ.get('MAGEHAND_LAB_ADDRESS')
+# A lab agent's own model key (a file's path, never the key): `run`/`dev` give the app that key and the gateway
+# address in place of the app's own key, which an agent can't read. The key has its own budget.
+AGENT_LLM_KEY = os.environ.get('MAGEHAND_AGENT_LLM_KEY')
 HOME = pathlib.Path.home()
 STATE = pathlib.Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'magehand'
 CACHE = pathlib.Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'magehand'
@@ -1039,8 +1042,8 @@ def api_session_token(below=API_RENEW_BELOW, need=0, failed=None):
             die(f"the agent's dev token ({AGENT_TOKEN}) is missing or expired: the lab replaces it every 5 minutes "
                 '(homelab-agent-token.timer in its VM); if it stays missing, tell the owner')
         if left < need:
-            die(f"the agent's dev token has only {minutes(left)} left: the lab replaces it within 5 minutes "
-                '(homelab-agent-token.timer); try again then')
+            die(f"the agent's dev token has only {minutes(left)} left: the lab replaces it (homelab-agent-token.timer); "
+                'try again shortly, and if it stays short, tell the owner')
         return token, left
     problem = []
     token, left = api_token(below=below, problem=problem)
@@ -3911,7 +3914,8 @@ def cmd_dev(a):
         print(f'{block} ({kind}): 127.0.0.1:{port}')
     if not contained and action in ('up', 'status'):
         print(f"{app['name']} has no postgres/redis/bucket blocks: nothing runs locally "
-              '(llm keys come from OpenBao when the app runs)')
+              + ("(llm keys: the agent's own, when the app runs)" if AGENT_TOKEN else
+                 '(llm keys come from OpenBao when the app runs)'))
     if action == 'up':
         save_local_state(app['name'], state)
     elif action == 'down':
@@ -4036,6 +4040,31 @@ def dotenv(path):
     return values
 
 
+def agent_llm_connection(app, block):
+    """An llm block's connection for a lab agent: its own key (MAGEHAND_AGENT_LLM_KEY) and the gateway, with the
+    models the block requests (the catalog's default when it names none), shaped like the app's Secret."""
+    if not AGENT_LLM_KEY:
+        die(f"llm block {block}: a lab agent runs the app with its own model key (MAGEHAND_AGENT_LLM_KEY), which "
+            "isn't set; the app's own key is the owner's (tell the owner)")
+    try:
+        key = pathlib.Path(AGENT_LLM_KEY).read_text().strip()
+    except OSError as error:
+        die(f"llm block {block}: can't read the agent's model key ({type(error).__name__}); tell the owner")
+    if not key:
+        die(f'llm block {block}: the agent\'s model key file is empty; tell the owner')
+    svc = (app.get('services') or {}).get(block) or {}
+    catalog = None if svc.get('models') else (
+        yaml.safe_load(github_file(APPS_REPO, 'catalog.yaml', required=False) or '') or {})
+    models = block_models(svc, catalog)
+    if not models:
+        die(f'llm block {block}: no models (it names none and the catalog has no default); tell the owner')
+    base = f'https://llm.{LAB}/v1'
+    connection = {'api_key': key, 'base_url': base, 'models': ','.join(models)}
+    if svc.get('search') in (True, 'true'):  # as the key broker: search_url exists only when the block asks
+        connection['search_url'] = f'{base}/search/exa'
+    return connection
+
+
 def resolve_env(app, container=False):
     """The pod's env, resolved for this machine. On the host, precedence is:
     manifest values < .magehand.env < the caller's environment < secrets
@@ -4065,7 +4094,9 @@ def resolve_env(app, container=False):
                       '(or set the value in .magehand.env or your shell)', file=sys.stderr)
             continue
         if block not in fetched:
-            if kind == 'llm':
+            if kind == 'llm' and AGENT_TOKEN:
+                fetched[block] = agent_llm_connection(app, block)
+            elif kind == 'llm':
                 token = token or valid_token()
                 path = f'apps/data/{app["name"]}-dev/llm-{block}'
                 status, body = bao('GET', path, token)
@@ -4129,17 +4160,25 @@ def start_proxy(app_port_, who):
 LAB_SUFFIX = '.' + LAB
 
 
-def lab_hosts(env):
-    """--add-host entries for the *.lab names in env values. Inside a container,
-    public DNS's 127.0.0.1 would be the container: use what the host resolves
-    (the Studio's LAN address on the MacBook) or, on the Studio, the host itself."""
+def lab_env_hosts(env):
+    """The *.lab host names in env values (URLs), sorted."""
     hosts = set()
     for value in env.values():
         host = urllib.parse.urlparse(value).hostname if '://' in value else None
         if host and host.endswith(LAB_SUFFIX):
             hosts.add(host)
+    return sorted(hosts)
+
+
+def lab_hosts(env):
+    """--add-host entries for the *.lab names in env values. Inside a container,
+    public DNS's 127.0.0.1 would be the container: use MAGEHAND_LAB_ADDRESS when it is set (an agent's VM), else
+    what the host resolves (the Studio's LAN address on the MacBook) or, on the Studio, the host itself."""
     out = []
-    for host in sorted(hosts):
+    for host in lab_env_hosts(env):
+        if LAB_ADDRESS:
+            out.append(f'{host}:{LAB_ADDRESS}')
+            continue
         try:
             address = socket.gethostbyname(host)
         except OSError:
@@ -4178,6 +4217,18 @@ def cmd_run(a):
         usage('run', 'give the command after --, e.g. magehand run -- python app.py (or --container)')
     app = app_here(scoped_app('run', a.app_flag, why=f"this code would run on {a.app_flag}'s keys and budget"))
     env = resolve_env(app, container=container)
+    if LAB_ADDRESS and not container:
+        # MAGEHAND_LAB_ADDRESS reaches magehand's own lookups only: the app, a child process, resolves *.lab
+        # names itself, so they must resolve to the lab here already (an agent VM's /etc/hosts), not 127.0.0.1.
+        for host in lab_env_hosts(env):
+            try:
+                address = socket.gethostbyname(host)
+            except OSError:
+                address = ''
+            if not address or address.startswith('127.'):
+                die(f"the app would call {host}, which resolves to {address or 'nothing'} here and MAGEHAND_LAB_ADDRESS "
+                    "can't change the app's own lookups: use `magehand run --container`, or tell the owner to map "
+                    'it in this machine\'s /etc/hosts')
     print(f'magehand: {app["name"]} env: {", ".join(sorted(env))}', file=sys.stderr)
     if proxy:
         port = int(env.get('PORT') or app_port(app))
@@ -5188,13 +5239,19 @@ def check_fetch_zone(local, name):
     return found
 
 
+def block_models(svc, catalog):
+    """The models one llm block requests, as the key broker reads them: its `models`, or the catalog's default."""
+    default = [m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict) and m.get('default')]
+    models = (svc or {}).get('models') or default
+    return sorted({models} if isinstance(models, str) else set(models))
+
+
 def requested_models(app, catalog):
     """Models the app's llm blocks request (a block without `models` gets the catalog's default)."""
-    default = [m.get('id') for m in (catalog or {}).get('models') or [] if isinstance(m, dict) and m.get('default')]
     out = set()
     for svc in app['services'].values():
         if (svc or {}).get('type') == 'llm':
-            out.update((svc or {}).get('models') or default)
+            out.update(block_models(svc, catalog))
     return out
 
 
