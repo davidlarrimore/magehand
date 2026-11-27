@@ -5387,13 +5387,34 @@ def final_user(text):
 QUALITY_SEE = 'homelab-apps docs/development/quality.md "Quality check"'
 
 
+def workflow_meaning(text):
+    """A workflow's parsed YAML for comparing by meaning: comments, layout, quoting, key order and the order of a
+    list of plain values (event types, branches) don't count; everything else does (the name, triggers,
+    permissions, jobs and what they call, and the order of steps). None if it isn't a YAML mapping. PyYAML reads
+    the key `on` as True: named back."""
+    def norm(value):
+        if isinstance(value, dict):
+            return {('on' if k is True else str(k)): norm(v) for k, v in value.items()}
+        if isinstance(value, list):
+            items = [norm(v) for v in value]
+            plain = all(not isinstance(v, (dict, list)) for v in items)
+            return sorted(items, key=lambda v: json.dumps(v, default=str)) if plain else items
+        return value
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    return norm(doc) if isinstance(doc, dict) else None
+
+
 def check_build_workflow(root):
-    """build.yaml is exactly the template's: one job calling homelab-apps' app.yaml, which runs every platform
-    check, so a check the platform adds reaches the app by itself (homelab#731). Any difference is an error (a
-    job left out, an edit that weakens a check); agents can't change workflows, so the owner copies the
-    template's. A missing file runs no check at all: an error too. Compared as bytes, so line endings count.
-    Skipped without a readable template (offline, or CI without access to it) and outside an app's own repo, as
-    for AGENTS.md."""
+    """build.yaml means the same as the template's: one job calling homelab-apps' app.yaml, which runs every
+    platform check, so a check the platform adds reaches the app by itself (homelab#731). Any difference in
+    meaning is an error (a job left out, an edit that weakens a check); agents can't change workflows, so the
+    owner copies the template's. Compared by meaning (workflow_meaning), not bytes, so a change to the template's
+    comments or layout reaches no app repo (homelab#743). A missing file runs no check at all: an error too.
+    Which jobs run for which event is app.yaml's decision (its `if:`), never the caller's. Skipped without a
+    readable template (offline, or CI without access to it) and outside an app's own repo, as for AGENTS.md."""
     path = pathlib.Path(root) / BUILD_WORKFLOW
     if not is_app_checkout(root):
         return []
@@ -5406,7 +5427,8 @@ def check_build_workflow(root):
     if not path.is_file():
         return [finding('error', BUILD_WORKFLOW, f"is missing, so no platform check runs: ask the owner to restore "
                         f"{TEMPLATE_REPO}'s file (agents can't change workflows)", 'rules "Apps with their own repo"')]
-    if path.read_bytes() == template.encode():
+    expected = workflow_meaning(template)
+    if expected is not None and workflow_meaning(path.read_text(errors='replace')) == expected:
         return []
     return [finding('error', BUILD_WORKFLOW, f"differs from {TEMPLATE_REPO}'s: ask the owner to copy the "
                     "template's file over it (agents can't change workflows)", 'rules "Apps with their own repo"')]
@@ -5663,12 +5685,20 @@ def is_app_checkout(root):
 
 
 def check_agents_drift(root):
-    """A warning when the repo's AGENTS.md platform rules (above "## This app") differ from the template's:
-    the platform moved on and `magehand update-agents` brings them in. Skipped without a readable template
-    (offline, or CI without access to it) and outside an app's own repo."""
+    """A warning when the repo's AGENTS.md platform part (above "## This app") is behind the template's: the
+    platform moved on and `magehand update-agents` brings it in. A platform part with the marker is current,
+    whatever its words: the rules themselves are .magehand/workflow.md (homelab#743), so only its CLAUDE.md
+    import is checked then. Skipped without a readable template (offline, or CI without access to it) and
+    outside an app's own repo."""
     path = pathlib.Path(root) / 'AGENTS.md'
     if not is_app_checkout(root) or not path.is_file():
         return []
+    if AGENTS_MARKER in split_agents(path.read_text(errors='replace'))[0]:
+        if claude_imports_workflow(root):
+            return []
+        return [finding('warning', 'CLAUDE.md', f"doesn't import {WORKFLOW_FILE} (`{WORKFLOW_IMPORT}`), so Claude "
+                        'Code sessions here load none of the platform\'s working rules: run `magehand update-agents` '
+                        'and commit the diff', 'recipes "Keep this repo\'s rules current"')]
     try:
         template = github_file(TEMPLATE_REPO, 'AGENTS.md', required=False)
     except SystemExit:  # no GitHub token: nothing to compare with
@@ -5684,13 +5714,16 @@ def check_agents_drift(root):
 
 
 def agents_behind(text, platform):
-    """Why an AGENTS.md (None: there is none) isn't up to date with the template's platform rules, or None."""
+    """Why an AGENTS.md (None: there is none) isn't up to date with the template's platform rules, or None. A
+    platform part with the marker is up to date whatever its words (the rules are .magehand/workflow.md)."""
     if text is None:
         return 'no AGENTS.md'
     current, own = split_agents(text)
     if own is None:
         return f'has no "{APP_HEADING}" heading'
-    return None if current == platform else f'the platform rules above "{APP_HEADING}" are out of date'
+    if AGENTS_MARKER in current or current == platform:
+        return None
+    return f'the platform rules above "{APP_HEADING}" are out of date'
 
 
 # Every repo the owner owns, with its template and its AGENTS.md on the default branch, and the template's own
@@ -6067,6 +6100,9 @@ def cmd_check(a):
 # --- agents: keep a repo's AGENTS.md current -----------------------------------------
 
 APP_HEADING = '## This app'  # the template's AGENTS.md: platform rules above it, the app's own notes from it down
+# In the template's AGENTS.md header since the rules moved to .magehand/workflow.md (homelab#743): a platform part
+# with it is current whatever its words, so a change to the header's wording reaches no app repo by itself.
+AGENTS_MARKER = '<!-- magehand: the platform rules are .magehand/workflow.md -->'
 
 
 def split_agents(text):
@@ -6723,27 +6759,53 @@ def cmd_hooks(a):
         print(next_line(step))
     sys.exit(0 if ok or a.hooks_action == 'status' else 1)  # status reports; --json carries ok
 
+def claude_with_import(text):
+    """CLAUDE.md's text with the platform rules' import added, or None when it already has it. A missing or
+    empty file gets the template's two pointers."""
+    if text is not None and WORKFLOW_IMPORT in text.split():
+        return None
+    if not (text or '').strip():
+        return f'@AGENTS.md\n{WORKFLOW_IMPORT}\n'
+    return text + ('' if text.endswith('\n') else '\n') + WORKFLOW_IMPORT + '\n'
+
+
 def cmd_agents(a):
     path = pathlib.Path(a.code) / 'AGENTS.md'
     current, new, problem = agents_text(path)
     if problem:
         die(problem)
     changed = new != current
-    step = (('`magehand update-agents`' if a.check else f'review the diff (`git diff {path}`) and commit it')
-            if changed else None)
+    # With the marker, the rules are .magehand/workflow.md: CLAUDE.md must import it (homelab#743).
+    claude = pathlib.Path(a.code) / 'CLAUDE.md'
+    claude_new = None
+    if AGENTS_MARKER in split_agents(new)[0]:
+        try:
+            claude_new = claude_with_import(claude.read_text(errors='replace') if claude.is_file() else None)
+        except OSError as error:
+            die(f'cannot read {claude}: {error}')
+    paths = [str(p) for p, c in ((path, changed), (claude, claude_new is not None)) if c]
+    step = (('`magehand update-agents`' if a.check else f'review the diff (`git diff {" ".join(paths)}`) and commit it')
+            if paths else None)
     if a.json:
-        print(json.dumps({'path': str(path), 'changed': changed, 'written': changed and not a.check, 'next': step}))
-    elif not changed:
+        print(json.dumps({'path': str(path), 'changed': changed, 'written': changed and not a.check,
+                          'claude': {'path': str(claude), 'changed': claude_new is not None,
+                                     'written': claude_new is not None and not a.check}, 'next': step}))
+    elif not paths:
         print(f'{path}: up to date', file=sys.stderr)
     elif a.check:
-        print(f'{path}: the platform rules are out of date; run `magehand update-agents`', file=sys.stderr)
-    if changed and not a.check:
-        path.write_text(new)
-        if not a.json:
-            print(f'{path}: updated from {TEMPLATE_REPO}', file=sys.stderr)
+        print(f'{", ".join(paths)}: the platform rules are out of date; run `magehand update-agents`', file=sys.stderr)
+    if not a.check:
+        if changed:
+            path.write_text(new)
+            if not a.json:
+                print(f'{path}: updated from {TEMPLATE_REPO}', file=sys.stderr)
+        if claude_new is not None:
+            claude.write_text(claude_new)
+            if not a.json:
+                print(f'{claude}: imports {WORKFLOW_FILE} now', file=sys.stderr)
     if not a.json:
         print(next_line(step))
-    sys.exit(1 if changed and a.check else 0)
+    sys.exit(1 if paths and a.check else 0)
 
 
 # --- the skill: when coding agents should ask the platform ------------------------
@@ -6814,7 +6876,8 @@ says a newer magehand is available, tell the user (`magehand upgrade`).
    (real data) only when the user asks for that call. For your own HTTP
    client (curl, a test suite): `magehand api token` prints the 1-hour token;
    send it as `Authorization: Bearer`, and never write it to a file or log.
-9. When `magehand check` warns that AGENTS.md is behind the template, run
+9. When `magehand check` warns that AGENTS.md is behind the template, or
+   that CLAUDE.md doesn't import `.magehand/workflow.md`, run
    `magehand update-agents`, review the diff and commit it. Never edit
    AGENTS.md above its `## This app` heading: that edit is lost.
 
@@ -9949,7 +10012,9 @@ def build_parser():
         q.add_argument('--json', action='store_true', help='print a JSON object (for scripts and agents)')
     p = command('update-agents', cmd_agents, "update this repo's AGENTS.md from the template", "update the platform rules in this repo's AGENTS.md from homelab-app-template",
                 'Replaces everything above the "## This app" heading with the template\'s current text and keeps\n'
-                "the heading and everything below it (the app's own notes). Writes only AGENTS.md; commit it yourself.\n\n"
+                "the heading and everything below it (the app's own notes). When the template's header has the marker\n"
+                "(the rules are .magehand/workflow.md), it also adds `@.magehand/workflow.md` to CLAUDE.md. Writes only\n"
+                "those two files; commit them yourself.\n\n"
                 'examples:\n  magehand update-agents\n  magehand update-agents --check          exit 1 if out of date, writes nothing')
     p.add_argument('--code', default='.', metavar='DIR', help="the app's repo (default: .)")
     p.add_argument('--check', action='store_true', help='only report whether it is out of date (exit 1 if so)')

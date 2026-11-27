@@ -166,7 +166,7 @@ has it as `"next"`. Only commands whose output is the result itself (`guide`,
 | `magehand hooks install / status / remove` | The pre-push hook that runs `verify` |
 | `magehand upgrade` | Upgrade magehand, its skill and approvals |
 | `magehand rules` | Write the platform's working rules for agents (`magehand guide workflow`) into this app checkout as `.magehand/workflow.md`, which its CLAUDE.md imports; kept out of Git. `status`, `check`, `verify`, `new` and a new Claude Code session do it too; run it before a headless agent run on a fresh clone |
-| `magehand update-agents, skill, version, help` | Rarely needed: refresh AGENTS.md from the template, print the skill, the version, help |
+| `magehand update-agents, skill, version, help` | Rarely needed: refresh AGENTS.md from the template (and CLAUDE.md's import of the rules), print the skill, the version, help |
 
 **Everywhere:** `-a/--app APP` names the app (default: the app repo you're
 in; in an app's repo it can only name that app, see "Which app a command acts
