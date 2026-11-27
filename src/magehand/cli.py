@@ -57,6 +57,14 @@ HOMELAB_REPO = 'davidlarrimore/homelab'
 APPS_REPO = 'davidlarrimore/homelab-apps'
 OPENBAO = os.environ.get('MAGEHAND_OPENBAO', 'https://openbao.lab.davidlarrimore.com')
 LAB = 'lab.davidlarrimore.com'
+# A lab agent (the homelab's builder or Assistant) has a developer's access to dev apps as itself: a file of its own
+# 15-minute dev-only token, which a timer outside the agent replaces (homelab docs/builder-testing-plan.md phase 7).
+# The path, never the token, is in the environment. Production, releases and sign-in stay the owner's: magehand
+# refuses them early, and authentik and the apps refuse them anyway.
+AGENT_TOKEN = os.environ.get('MAGEHAND_AGENT_TOKEN')
+# Where *.lab names connect when public DNS can't help (they resolve to 127.0.0.1 publicly): the lab's ingress
+# address as seen from an agent's VM. TLS still checks the real host name.
+LAB_ADDRESS = os.environ.get('MAGEHAND_LAB_ADDRESS')
 HOME = pathlib.Path.home()
 STATE = pathlib.Path(os.environ.get('XDG_STATE_HOME', HOME / '.local/state')) / 'magehand'
 CACHE = pathlib.Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'magehand'
@@ -735,6 +743,7 @@ def browser_code(url, path, wait=300):
 
 def cmd_login(args):
     """Sign in through authentik; returns the new token (kept in the Keychain, never printed)."""
+    agent_refuses('login', 'signing in')
     if getattr(args, 'check', False):
         login_check(args)
     as_json = getattr(args, 'json', False)
@@ -913,12 +922,46 @@ def api_lock():
         yield held
 
 
+def agent_token():
+    """(token, seconds left) from a lab agent's token file (MAGEHAND_AGENT_TOKEN), read on every call because
+    the lab's timer replaces it; (None, 0) when it is missing, unreadable or expired."""
+    try:
+        doc = json.loads(pathlib.Path(AGENT_TOKEN).read_text())
+        token, left = doc['access_token'], int(doc['expires_at']) - int(time.time())
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, 0
+    return (token, left) if isinstance(token, str) and token and left > 0 else (None, 0)
+
+
+def agent_refuses(command, what):
+    """An agent's command that is the owner's alone: exit before anything is sent."""
+    if AGENT_TOKEN:
+        die(f"{command}: {what} is the owner's; a lab agent has a developer's access to dev apps only")
+
+
+def use_lab_address():
+    """With MAGEHAND_LAB_ADDRESS, connect *.lab names to that address (an agent's VM, where they resolve to
+    127.0.0.1 publicly). Only the address changes: the request's host name and TLS check stay the real ones."""
+    if not LAB_ADDRESS:
+        return
+    resolve = socket.getaddrinfo
+
+    def lab_getaddrinfo(host, *args, **kwargs):
+        if isinstance(host, str) and (host == LAB or host.endswith('.' + LAB)):
+            host = LAB_ADDRESS
+        return resolve(host, *args, **kwargs)
+    socket.getaddrinfo = lab_getaddrinfo
+
+
 def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
     """(access token, seconds left) for app APIs, renewed when under `below` seconds are left, or when the saved
     token is `rejected` (authentik deletes access tokens with the browser session they came from, which ends
     within the week), and the week isn't up; (None, 0) when signed out or expired. One process renews at a
     time: a refresh token works once, so a second one waiting for the lock takes the first one's result.
-    A renewal that failed for now, while the sign-in itself may be fine, appends why to `problem` (a list)."""
+    A renewal that failed for now, while the sign-in itself may be fine, appends why to `problem` (a list).
+    A lab agent's token comes from its file, which the lab renews."""
+    if AGENT_TOKEN:
+        return agent_token()
     def saved():
         session, now = api_session(), int(time.time())
         expires, started = session.get('expires_at') or 0, session.get('signed_in_at') or 0
@@ -964,7 +1007,9 @@ def api_token(renew=True, below=API_RENEW_BELOW, rejected=None, problem=None):
 
 def api_rejected(token):
     """Whether authentik says it no longer knows this access token (it can be gone before its hour is up). False
-    when authentik can't be asked."""
+    when authentik can't be asked, and for a lab agent's token (the lab replaces it; the dev host decides)."""
+    if AGENT_TOKEN:
+        return False
     req = urllib.request.Request(f'{AUTHENTIK}/application/o/userinfo/',
                                  headers={'Authorization': f'Bearer {token}', 'User-Agent': 'magehand'})
     try:
@@ -988,6 +1033,12 @@ def api_session_token(below=API_RENEW_BELOW, need=0, failed=None):
     a terminal it offers to sign in now; that dialogue and the login's output go to stderr, so stdout stays the
     command's result (a token captured by `$(magehand api token)`, a response body, JSON). With `failed` (a list),
     a renewal that failed for now is appended there and (None, 0) returned, for a caller that reports it itself."""
+    if AGENT_TOKEN:
+        token, left = agent_token()
+        if not token or left < need:
+            die(f"the agent's dev token ({AGENT_TOKEN}) is missing or expired: the lab replaces it every 5 minutes "
+                '(homelab-agent-token.timer in its VM); if it stays missing, tell the owner')
+        return token, left
     problem = []
     token, left = api_token(below=below, problem=problem)
     if (not token or left < need) and problem:  # for now only: a passkey tap would fix nothing
@@ -1112,6 +1163,8 @@ def cmd_api(a):
         return
     if not a.path.startswith('/'):
         usage('api', f'PATH starts with /: did you mean /{a.path}?')
+    if a.prod:
+        agent_refuses('api', 'production (--prod)')
     name = scoped_app('api', a.app_flag, why='it would call that app as you')
     if not APP_NAME.fullmatch(name or ''):  # the name becomes the host: nothing else may reach the URL
         usage('api', f'{name!r} is not an app name (lowercase letters, digits and -)')
@@ -1203,10 +1256,14 @@ def cmd_api(a):
         error = None
     if not error and signin_redirect(status, got):
         error = 'signed_out'
-        print('magehand: the app did not accept your sign-in (it sent you to sign in); run `magehand login`',
+        print('magehand: ' + ("the dev host did not accept the agent's token (it sent it to sign in): the agent "
+                              'may be out of homelab-agents; tell the owner' if AGENT_TOKEN else
+                              'the app did not accept your sign-in (it sent you to sign in); run `magehand login`'),
               file=sys.stderr)
     elif not error and status == 403 and not data.strip().startswith((b'{', b'[')):
-        print(f'magehand: 403 from the platform: your user may not be allowed on {name}', file=sys.stderr)
+        print(f'magehand: 403 from the platform: your user may not be allowed on {name}'
+              + (' (an app admits lab agents on dev only if it lets homelab-agents in)' if AGENT_TOKEN else ''),
+              file=sys.stderr)
     ok = not error and 200 <= status < 400
     took = time.monotonic() - started
     if a.json:
@@ -2456,6 +2513,7 @@ def release_next(plan, refuse, created=False):
 
 
 def cmd_release(a):
+    agent_refuses('release', 'releasing to production')
     if sum(map(bool, (a.major, a.minor, a.patch))) > 1:
         usage('release', 'choose one of --major, --minor, --patch')
     forced = 'major' if a.major else 'minor' if a.minor else 'patch' if a.patch else None
@@ -9880,6 +9938,7 @@ def main(argv=None):
     if a.command not in ('upgrade', 'version', 'help'):
         update_notice()
     refuse_if_managed(a.command)
+    use_lab_address()
     try:
         a.func(a)
     except KeyboardInterrupt:
